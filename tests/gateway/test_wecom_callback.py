@@ -165,6 +165,32 @@ class TestWecomCallbackRouting:
         assert calls["json"]["agentid"] == 1001
 
 
+import logging
+
+
+def test_build_event_logs_agent_id_mismatch(caplog):
+    from gateway.config import PlatformConfig
+    from gateway.platforms.wecom_callback import WecomCallbackAdapter
+
+    config = PlatformConfig(
+        enabled=True,
+        extra={
+            "corp_id": "c1",
+            "corp_secret": "cs",
+            "agent_id": 100,
+            "token": "tok",
+            "encoding_aes_key": "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG",
+        },
+    )
+    adapter = WecomCallbackAdapter(config)
+    xml = """<xml><ToUserName>c1</ToUserName><FromUserName>user1</FromUserName><MsgType>text</MsgType><Content>hi</Content><MsgId>1</MsgId><AgentID>999</AgentID></xml>"""
+    account = adapter._accounts[0]
+    with caplog.at_level(logging.WARNING):
+        event = adapter._build_event(account, xml)
+        assert event is not None
+        assert "agent_id mismatch" in caplog.text
+
+
 class TestWecomCallbackPollLoop:
     @pytest.mark.asyncio
     async def test_poll_loop_dispatches_handle_message(self, monkeypatch):
@@ -195,3 +221,45 @@ class TestWecomCallbackPollLoop:
         with pytest.raises(asyncio.CancelledError):
             await task
         assert calls == ["test"]
+
+
+@pytest.mark.asyncio
+async def test_callback_adapter_send_document_flow():
+    from unittest.mock import AsyncMock, patch
+    from gateway.config import PlatformConfig
+    from gateway.platforms.wecom_callback import WecomCallbackAdapter
+    from gateway.platforms.base import SendResult
+
+    config = PlatformConfig(
+        enabled=True,
+        extra={
+            "corp_id": "c1",
+            "corp_secret": "cs1",
+            "agent_id": 100,
+            "token": "tok",
+            "encoding_aes_key": "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG",
+        }
+    )
+    adapter = WecomCallbackAdapter(config)
+    adapter._http_client = AsyncMock()
+
+    with patch("gateway.platforms.wecom_callback.MediaPreparer") as mock_prep_cls:
+        mock_prep = mock_prep_cls.return_value
+        mock_prep.prepare = AsyncMock(return_value={
+            "data": b"fakepdf",
+            "content_type": "application/pdf",
+            "file_name": "doc.pdf",
+            "detected_type": "file",
+            "final_type": "file",
+            "rejected": False,
+            "downgraded": False,
+            "downgrade_note": None,
+        })
+        with patch.object(adapter, "_upload_media_to_agent_api", new_callable=AsyncMock) as mock_upload:
+            mock_upload.return_value = "mid-1"
+            with patch.object(adapter, "send", new_callable=AsyncMock) as mock_send:
+                mock_send.return_value = SendResult(success=True, message_id="m1")
+                result = await adapter.send_document("c1:user-1", "/tmp/doc.pdf")
+                assert result.success is True
+                mock_upload.assert_awaited_once()
+                mock_prep.prepare.assert_awaited_once_with("/tmp/doc.pdf", None)

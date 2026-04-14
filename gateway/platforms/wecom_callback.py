@@ -16,6 +16,7 @@ import asyncio
 import logging
 import socket as _socket
 import time
+import uuid
 from typing import Any, Dict, List, Optional
 from xml.etree import ElementTree as ET
 
@@ -39,6 +40,7 @@ from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
 from gateway.platforms.wecom_accounts import resolve_wecom_accounts, WeComAccount
 from gateway.platforms.wecom_crypto import WXBizMsgCrypt, WeComCryptoError
+from gateway.platforms.wecom_media import MediaPreparer
 
 logger = logging.getLogger(__name__)
 
@@ -164,18 +166,26 @@ class WecomCallbackAdapter(BasePlatformAdapter):
         content: str,
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        **kwargs,
     ) -> SendResult:
         account = self._resolve_account_for_chat(chat_id)
         touser = chat_id.split(":", 1)[1] if ":" in chat_id else chat_id
+        media_type = kwargs.get("media_type")
+        media_id = kwargs.get("media_id")
         try:
             token = await self._get_access_token(account)
-            payload = {
+            payload: Dict[str, Any] = {
                 "touser": touser,
-                "msgtype": "text",
                 "agentid": int(account.agent_id or 0),
-                "text": {"content": content[:2048]},
                 "safe": 0,
             }
+            if media_type and media_id:
+                payload["msgtype"] = media_type
+                payload[media_type] = {"media_id": media_id}
+            else:
+                payload["msgtype"] = "text"
+                payload["text"] = {"content": content[:2048]}
+
             resp = await self._http_client.post(
                 f"https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token={token}",
                 json=payload,
@@ -201,6 +211,131 @@ class WecomCallbackAdapter(BasePlatformAdapter):
                 account_id = self._user_account_map.get(matching[0])
         account = self._get_account_by_id(account_id) if account_id else None
         return account or self._accounts[0]
+
+    async def _upload_media_to_agent_api(
+        self,
+        account: WeComAccount,
+        data: bytes,
+        media_type: str,
+        filename: str,
+    ) -> str:
+        token = await self._get_access_token(account)
+        boundary = f"----FormBoundary{uuid.uuid4().hex}"
+        header = (
+            f'--{boundary}\r\n'
+            f'Content-Disposition: form-data; name="media"; filename="{filename}"\r\n'
+            f'Content-Type: application/octet-stream\r\n\r\n'
+        ).encode("utf-8")
+        footer = f"\r\n--{boundary}--\r\n".encode("utf-8")
+        body = header + data + footer
+
+        resp = await self._http_client.post(
+            f"https://qyapi.weixin.qq.com/cgi-bin/media/upload?access_token={token}&type={media_type}",
+            content=body,
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        )
+        result = resp.json()
+        if result.get("errcode") != 0:
+            raise RuntimeError(f"media upload failed: {result}")
+        return str(result["media_id"])
+
+    async def _send_media_message(
+        self,
+        account: WeComAccount,
+        chat_id: str,
+        media_type: str,
+        media_id: str,
+    ) -> Dict[str, Any]:
+        token = await self._get_access_token(account)
+        touser = chat_id.split(":", 1)[1] if ":" in chat_id else chat_id
+        payload = {
+            "touser": touser,
+            "msgtype": media_type,
+            "agentid": int(account.agent_id or 0),
+            media_type: {"media_id": media_id},
+            "safe": 0,
+        }
+        resp = await self._http_client.post(
+            f"https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token={token}",
+            json=payload,
+        )
+        return resp.json()
+
+    async def send_image_file(
+        self,
+        chat_id: str,
+        image_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        **kwargs,
+    ) -> SendResult:
+        return await self._send_media_source(chat_id, image_path, caption=caption, reply_to=reply_to)
+
+    async def send_document(
+        self,
+        chat_id: str,
+        file_path: str,
+        caption: Optional[str] = None,
+        file_name: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        **kwargs,
+    ) -> SendResult:
+        return await self._send_media_source(chat_id, file_path, caption=caption, file_name=file_name, reply_to=reply_to)
+
+    async def send_voice(
+        self,
+        chat_id: str,
+        audio_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        **kwargs,
+    ) -> SendResult:
+        return await self._send_media_source(chat_id, audio_path, caption=caption, reply_to=reply_to)
+
+    async def send_video(
+        self,
+        chat_id: str,
+        video_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        **kwargs,
+    ) -> SendResult:
+        return await self._send_media_source(chat_id, video_path, caption=caption, reply_to=reply_to)
+
+    async def _send_media_source(
+        self,
+        chat_id: str,
+        media_source: str,
+        caption: Optional[str] = None,
+        file_name: Optional[str] = None,
+        reply_to: Optional[str] = None,
+    ) -> SendResult:
+        account = self._resolve_account_for_chat(chat_id)
+        try:
+            preparer = MediaPreparer(self._http_client, media_local_roots=[])
+            prepared = await preparer.prepare(media_source, file_name)
+        except FileNotFoundError as exc:
+            return SendResult(success=False, error=str(exc))
+        except Exception as exc:
+            return SendResult(success=False, error=str(exc))
+
+        if prepared["rejected"]:
+            return await self.send(chat_id, f"⚠️ {prepared['reject_reason']}")
+
+        try:
+            media_id = await self._upload_media_to_agent_api(
+                account, prepared["data"], prepared["final_type"], prepared["file_name"]
+            )
+            result = await self.send(
+                chat_id, caption or "", media_type=prepared["final_type"], media_id=media_id
+            )
+        except Exception as exc:
+            return SendResult(success=False, error=str(exc))
+
+        if prepared["downgraded"] and prepared["downgrade_note"]:
+            await self.send(chat_id, f"ℹ️ {prepared['downgrade_note']}")
+
+        return result
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         return {"name": chat_id, "type": "dm"}
@@ -285,6 +420,15 @@ class WecomCallbackAdapter(BasePlatformAdapter):
     def _build_event(self, account: WeComAccount, xml_text: str) -> Optional[MessageEvent]:
         root = ET.fromstring(xml_text)
         msg_type = (root.findtext("MsgType") or "").lower()
+        # AgentID consistency check
+        agent_id_in_xml = root.findtext("AgentID")
+        if agent_id_in_xml is not None:
+            configured_agent_id = str(account.agent_id or "")
+            if configured_agent_id and agent_id_in_xml != configured_agent_id:
+                logger.warning(
+                    "[WecomCallback] agent_id mismatch for account '%s': expected=%s actual=%s",
+                    account.account_id, configured_agent_id, agent_id_in_xml,
+                )
         # Silently acknowledge lifecycle events.
         if msg_type == "event":
             event_name = (root.findtext("Event") or "").lower()
