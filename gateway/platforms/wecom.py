@@ -43,6 +43,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import unquote, urlparse
 
+from gateway.platforms.wecom_media import MediaPreparer
+
 try:
     import aiohttp
     from aiohttp import web
@@ -173,6 +175,7 @@ class WeComAdapter(BasePlatformAdapter):
         self._pending_responses: Dict[str, asyncio.Future] = {}
         self._dedup = MessageDeduplicator(max_size=DEDUP_MAX_SIZE)
         self._reply_req_ids: Dict[str, str] = {}
+        self._pending_stream_acks: set[str] = set()
 
         # Webhook server (for bot webhook mode accounts)
         self._webhook_runner: Optional["web.AppRunner"] = None
@@ -599,6 +602,11 @@ class WeComAdapter(BasePlatformAdapter):
         """Route inbound websocket payloads."""
         req_id = self._payload_req_id(payload)
         cmd = str(payload.get("cmd") or "")
+        body = payload.get("body") if isinstance(payload.get("body"), dict) else {}
+
+        # Clear pending stream ack on successful response
+        if body.get("errcode") in (0, None):
+            self._pending_stream_acks.discard(req_id)
 
         if req_id and req_id in self._pending_responses and cmd not in NON_RESPONSE_COMMANDS:
             future = self._pending_responses.get(req_id)
@@ -1324,16 +1332,9 @@ class WeComAdapter(BasePlatformAdapter):
         media_source: str,
         file_name: Optional[str] = None,
     ) -> Dict[str, Any]:
-        data, content_type, resolved_name = await self._load_outbound_media(media_source, file_name=file_name)
-        detected_type = self._detect_wecom_media_type(content_type)
-        size_check = self._apply_file_size_limits(len(data), detected_type, content_type)
-        return {
-            "data": data,
-            "content_type": content_type,
-            "file_name": resolved_name,
-            "detected_type": detected_type,
-            **size_check,
-        }
+        roots = self._accounts[0].media_local_roots if self._accounts else []
+        preparer = MediaPreparer(self._http_client, media_local_roots=roots)
+        return await preparer.prepare(media_source, file_name=file_name)
 
     async def _upload_media_bytes(self, data: bytes, media_type: str, filename: str) -> Dict[str, Any]:
         if not data:
@@ -1419,6 +1420,33 @@ class WeComAdapter(BasePlatformAdapter):
         )
         self._raise_for_wecom_error(response, "send reply stream")
         return response
+
+    async def _send_reply_stream_nonblocking(
+        self,
+        reply_req_id: str,
+        stream_id: str,
+        content: str,
+        finish: bool = False,
+    ) -> str:
+        """Send a stream update, skipping if a prior frame is still pending (unless finish=True)."""
+        if not finish and stream_id in self._pending_stream_acks:
+            logger.debug("[%s] Skipping non-blocking stream %s (pending ack)", self.name, stream_id)
+            return "skipped"
+
+        self._pending_stream_acks.add(stream_id)
+        response = await self._send_reply_request(
+            reply_req_id,
+            {
+                "msgtype": "stream",
+                "stream": {
+                    "id": stream_id,
+                    "finish": finish,
+                    "content": content[:self.MAX_MESSAGE_LENGTH],
+                },
+            },
+        )
+        self._raise_for_wecom_error(response, "send reply stream non-blocking")
+        return stream_id
 
     async def _send_reply_media_message(
         self,

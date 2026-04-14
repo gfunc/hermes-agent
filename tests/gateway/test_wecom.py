@@ -713,6 +713,67 @@ class TestInboundMessages:
         adapter.handle_message.assert_not_awaited()
 
 
+class TestNonBlockingStream:
+    @pytest.mark.asyncio
+    async def test_nonblocking_stream_skips_when_pending(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.wecom import WeComAdapter
+
+        config = PlatformConfig(extra={"bot_id": "b", "secret": "s"})
+        adapter = WeComAdapter(config)
+        adapter._reply_req_ids["msg-1"] = "req-1"
+        adapter._pending_stream_acks.add("stream-1")
+
+        result = await adapter._send_reply_stream_nonblocking("req-1", "stream-1", "partial")
+        assert result == "skipped"
+
+    @pytest.mark.asyncio
+    async def test_nonblocking_stream_never_skips_finish(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.wecom import WeComAdapter
+
+        config = PlatformConfig(extra={"bot_id": "b", "secret": "s"})
+        adapter = WeComAdapter(config)
+        adapter._reply_req_ids["msg-1"] = "req-1"
+        adapter._pending_stream_acks.add("stream-1")
+
+        adapter._send_reply_request = AsyncMock(return_value={"headers": {"req_id": "r1"}, "body": {"errcode": 0}})
+
+        result = await adapter._send_reply_stream_nonblocking("req-1", "stream-1", "final", finish=True)
+        assert result == "stream-1"
+        adapter._send_reply_request.assert_awaited_once()
+
+
+class TestMediaPreparerIntegration:
+    @pytest.mark.asyncio
+    async def test_send_image_file_uses_media_preparer(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.wecom import WeComAdapter
+
+        config = PlatformConfig(extra={"bot_id": "b", "secret": "s"})
+        adapter = WeComAdapter(config)
+
+        with patch("gateway.platforms.wecom.MediaPreparer") as mock_prep_cls:
+            mock_prep = mock_prep_cls.return_value
+            mock_prep.prepare = AsyncMock(return_value={
+                "data": b"fakepng",
+                "content_type": "image/png",
+                "file_name": "img.png",
+                "detected_type": "image",
+                "final_type": "image",
+                "rejected": False,
+                "downgraded": False,
+                "downgrade_note": None,
+            })
+            with patch.object(adapter, "_upload_media_bytes", new_callable=AsyncMock) as mock_upload:
+                mock_upload.return_value = {"media_id": "mid-1", "type": "image"}
+                with patch.object(adapter, "_send_media_message", new_callable=AsyncMock) as mock_send_media:
+                    mock_send_media.return_value = {"headers": {"req_id": "r1"}}
+                    result = await adapter.send_image_file("chat-1", "/tmp/img.png")
+                    assert result.success is True
+                    mock_prep.prepare.assert_awaited_once_with("/tmp/img.png", None)
+
+
 class TestPlatformEnum:
     def test_wecom_in_platform_enum(self):
         assert Platform.WECOM.value == "wecom"
