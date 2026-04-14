@@ -802,9 +802,23 @@ class WeComAdapter(BasePlatformAdapter):
             if not self._is_group_allowed(chat_id, sender_id):
                 logger.debug("[%s] Group %s / sender %s blocked by policy", self.name, chat_id, sender_id)
                 return
-        elif not self._is_dm_allowed(sender_id):
-            logger.debug("[%s] DM sender %s blocked by policy", self.name, sender_id)
-            return
+        else:
+            dm_allowed, dm_reason = self._is_dm_allowed(sender_id)
+            if not dm_allowed:
+                logger.debug("[%s] DM sender %s blocked by policy (%s)", self.name, sender_id, dm_reason)
+                if dm_reason == "pairing":
+                    try:
+                        await self._send_request(
+                            APP_CMD_SEND,
+                            {
+                                "chatid": chat_id,
+                                "msgtype": "markdown",
+                                "markdown": {"content": "您尚未完成配对，请联系管理员进行配对后重试。"},
+                            },
+                        )
+                    except Exception as exc:
+                        logger.warning("[%s] Failed to send pairing rejection: %s", self.name, exc)
+                return
 
         text, reply_text = self._extract_text(body)
 
@@ -1079,12 +1093,15 @@ class WeComAdapter(BasePlatformAdapter):
     # Policy helpers
     # ------------------------------------------------------------------
 
-    def _is_dm_allowed(self, sender_id: str) -> bool:
+    def _is_dm_allowed(self, sender_id: str) -> Tuple[bool, Optional[str]]:
+        """Returns (allowed, block_reason)."""
         if self._dm_policy == "disabled":
-            return False
+            return False, "disabled"
         if self._dm_policy == "allowlist":
-            return _entry_matches(self._allow_from, sender_id)
-        return True
+            return _entry_matches(self._allow_from, sender_id), None
+        if self._dm_policy == "pairing":
+            return False, "pairing"
+        return True, None
 
     def _is_group_allowed(self, chat_id: str, sender_id: str) -> bool:
         if self._group_policy == "disabled":

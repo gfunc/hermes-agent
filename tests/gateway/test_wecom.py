@@ -269,8 +269,10 @@ class TestPolicyHelpers:
         adapter = WeComAdapter(
             PlatformConfig(enabled=True, extra={"dm_policy": "allowlist", "allow_from": ["user-1"]})
         )
-        assert adapter._is_dm_allowed("user-1") is True
-        assert adapter._is_dm_allowed("user-2") is False
+        allowed, _ = adapter._is_dm_allowed("user-1")
+        assert allowed is True
+        allowed, _ = adapter._is_dm_allowed("user-2")
+        assert allowed is False
 
     def test_group_allowlist_and_per_group_sender_allowlist(self):
         from gateway.platforms.wecom import WeComAdapter
@@ -839,3 +841,36 @@ class TestCommandAuthIntegration:
 class TestPlatformEnum:
     def test_wecom_in_platform_enum(self):
         assert Platform.WECOM.value == "wecom"
+
+
+@pytest.mark.asyncio
+async def test_dm_pairing_mode_blocks_and_sends_prompt():
+    from gateway.config import PlatformConfig
+    from gateway.platforms.wecom import WeComAdapter
+
+    config = PlatformConfig(extra={
+        "bot_id": "b",
+        "secret": "s",
+        "dm_policy": "pairing",
+        "allow_from": [],
+    })
+    adapter = WeComAdapter(config)
+    adapter.handle_message = AsyncMock()
+    adapter._send_request = AsyncMock(return_value={"headers": {"req_id": "r1"}, "body": {"errcode": 0}})
+
+    payload = {
+        "cmd": "aibot_msg_callback",
+        "headers": {"req_id": "r1"},
+        "body": {
+            "msgid": "m1",
+            "msgtype": "text",
+            "text": {"content": "hello"},
+            "from": {"userid": "bob"},
+            "chatid": "c1",
+        },
+    }
+    await adapter._on_message(payload)
+    adapter.handle_message.assert_not_awaited()
+    adapter._send_request.assert_awaited_once()
+    call_args = adapter._send_request.await_args.args[1]
+    assert call_args["markdown"]["content"] == "您尚未完成配对，请联系管理员进行配对后重试。"
