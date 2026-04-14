@@ -1180,6 +1180,28 @@ class WeComAdapter(BasePlatformAdapter):
             return MessageType.VOICE
         return MessageType.TEXT
 
+    async def _handle_template_card_event(self, body: Dict[str, Any]) -> None:
+        from gateway.platforms.wecom_template_cards import get_template_card_from_cache
+
+        event = body.get("event") if isinstance(body.get("event"), dict) else {}
+        response_code = str(event.get("response_code") or "").strip()
+        button_replace_name = str(event.get("button_replace_name") or "").strip()
+        selected_options = event.get("selected_options")
+        selected_option_ids = (
+            [str(opt.get("key") or "") for opt in selected_options if isinstance(opt, dict)]
+            if isinstance(selected_options, list)
+            else []
+        )
+
+        account = self._accounts[0] if self._accounts else None
+        if not account:
+            return
+
+        logger.debug(
+            "[%s] Template card event received: response_code=%s selected=%s",
+            self.name, response_code, selected_option_ids,
+        )
+
     # ------------------------------------------------------------------
     # Policy helpers
     # ------------------------------------------------------------------
