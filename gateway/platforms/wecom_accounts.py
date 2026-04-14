@@ -80,8 +80,12 @@ def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any
 
 def _account_from_dict(account_id: str, data: Dict[str, Any]) -> WeComAccount:
     """Build a WeComAccount from a raw dict, applying env fallbacks."""
-    bot_id = str(data.get("bot_id") or data.get("botId") or "").strip()
-    secret = str(data.get("secret") or data.get("corpSecret") or "").strip()
+    bot_id = str(
+        data.get("bot_id") or data.get("botId") or os.getenv("WECOM_BOT_ID", "")
+    ).strip()
+    secret = str(
+        data.get("secret") or data.get("corpSecret") or os.getenv("WECOM_SECRET", "")
+    ).strip()
 
     corp_id = str(data.get("corp_id") or data.get("corpId") or "").strip()
     corp_secret = str(data.get("corp_secret") or data.get("corpSecret") or "").strip()
@@ -102,7 +106,7 @@ def _account_from_dict(account_id: str, data: Dict[str, Any]) -> WeComAccount:
         websocket_url=str(
             data.get("websocket_url")
             or data.get("websocketUrl")
-            or DEFAULT_WS_URL
+            or os.getenv("WECOM_WEBSOCKET_URL", DEFAULT_WS_URL)
         ).strip() or DEFAULT_WS_URL,
         corp_id=corp_id,
         corp_secret=corp_secret,

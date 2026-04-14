@@ -507,9 +507,11 @@ class TestInboundMessages:
     async def test_on_message_builds_event(self):
         from gateway.platforms.wecom import WeComAdapter
 
+        from gateway.platforms.helpers import TextBatchAggregator
+
         adapter = WeComAdapter(PlatformConfig(enabled=True))
-        adapter._text_batch_delay_seconds = 0  # disable batching for tests
         adapter.handle_message = AsyncMock()
+        adapter._text_batcher = TextBatchAggregator(handler=adapter.handle_message, batch_delay=0)
         adapter._extract_media = AsyncMock(return_value=(["/tmp/test.png"], ["image/png"]))
 
         payload = {
@@ -537,11 +539,12 @@ class TestInboundMessages:
 
     @pytest.mark.asyncio
     async def test_on_message_preserves_quote_context(self):
+        from gateway.platforms.helpers import TextBatchAggregator
         from gateway.platforms.wecom import WeComAdapter
 
         adapter = WeComAdapter(PlatformConfig(enabled=True))
-        adapter._text_batch_delay_seconds = 0  # disable batching for tests
         adapter.handle_message = AsyncMock()
+        adapter._text_batcher = TextBatchAggregator(handler=adapter.handle_message, batch_delay=0)
         adapter._extract_media = AsyncMock(return_value=([], []))
 
         payload = {
