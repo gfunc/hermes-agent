@@ -6,32 +6,44 @@ from xml.etree import ElementTree as ET
 import pytest
 
 from gateway.config import PlatformConfig
+from gateway.platforms.wecom_accounts import WeComAccount
 from gateway.platforms.wecom_callback import WecomCallbackAdapter
 from gateway.platforms.wecom_crypto import WXBizMsgCrypt
 
 
-def _app(name="test-app", corp_id="ww1234567890", agent_id="1000002"):
-    return {
-        "name": name,
-        "corp_id": corp_id,
-        "corp_secret": "test-secret",
-        "agent_id": agent_id,
-        "token": "test-callback-token",
-        "encoding_aes_key": "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG",
-    }
+def _account(account_id="test-app", corp_id="ww1234567890", agent_id=1000002):
+    return WeComAccount(
+        account_id=account_id,
+        corp_id=corp_id,
+        corp_secret="test-secret",
+        agent_id=agent_id,
+        token="test-callback-token",
+        encoding_aes_key="abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG",
+        connection_mode="webhook",
+    )
 
 
-def _config(apps=None):
+def _config(accounts=None):
+    raw_accounts = []
+    for acct in (accounts or [_account()]):
+        raw_accounts.append({
+            "account_id": acct.account_id,
+            "corp_id": acct.corp_id,
+            "corp_secret": acct.corp_secret,
+            "agent_id": acct.agent_id,
+            "token": acct.token,
+            "encoding_aes_key": acct.encoding_aes_key,
+        })
     return PlatformConfig(
         enabled=True,
-        extra={"mode": "callback", "host": "127.0.0.1", "port": 0, "apps": apps or [_app()]},
+        extra={"mode": "callback", "host": "127.0.0.1", "port": 0, "accounts": raw_accounts},
     )
 
 
 class TestWecomCrypto:
     def test_roundtrip_encrypt_decrypt(self):
-        app = _app()
-        crypt = WXBizMsgCrypt(app["token"], app["encoding_aes_key"], app["corp_id"])
+        account = _account()
+        crypt = WXBizMsgCrypt(account.token, account.encoding_aes_key, account.corp_id)
         encrypted_xml = crypt.encrypt(
             "<xml><Content>hello</Content></xml>", nonce="nonce123", timestamp="123456",
         )
@@ -45,8 +57,8 @@ class TestWecomCrypto:
         assert b"<Content>hello</Content>" in decrypted
 
     def test_signature_mismatch_raises(self):
-        app = _app()
-        crypt = WXBizMsgCrypt(app["token"], app["encoding_aes_key"], app["corp_id"])
+        account = _account()
+        crypt = WXBizMsgCrypt(account.token, account.encoding_aes_key, account.corp_id)
         encrypted_xml = crypt.encrypt("<xml/>", nonce="n", timestamp="1")
         root = ET.fromstring(encrypted_xml)
         from gateway.platforms.wecom_crypto import SignatureError
@@ -67,7 +79,7 @@ class TestWecomCallbackEventConstruction:
           <MsgId>123456789</MsgId>
         </xml>
         """
-        event = adapter._build_event(_app(), xml_text)
+        event = adapter._build_event(_account(), xml_text)
         assert event is not None
         assert event.source is not None
         assert event.source.user_id == "zhangsan"
@@ -86,25 +98,25 @@ class TestWecomCallbackEventConstruction:
           <Event>subscribe</Event>
         </xml>
         """
-        event = adapter._build_event(_app(), xml_text)
+        event = adapter._build_event(_account(), xml_text)
         assert event is None
 
 
 class TestWecomCallbackRouting:
-    def test_user_app_key_scopes_across_corps(self):
+    def test_user_account_key_scopes_across_corps(self):
         adapter = WecomCallbackAdapter(_config())
-        assert adapter._user_app_key("corpA", "alice") == "corpA:alice"
-        assert adapter._user_app_key("corpB", "alice") == "corpB:alice"
-        assert adapter._user_app_key("corpA", "alice") != adapter._user_app_key("corpB", "alice")
+        assert adapter._user_account_key("corpA", "alice") == "corpA:alice"
+        assert adapter._user_account_key("corpB", "alice") == "corpB:alice"
+        assert adapter._user_account_key("corpA", "alice") != adapter._user_account_key("corpB", "alice")
 
     @pytest.mark.asyncio
-    async def test_send_selects_correct_app_for_scoped_chat_id(self):
-        apps = [
-            _app(name="corp-a", corp_id="corpA", agent_id="1001"),
-            _app(name="corp-b", corp_id="corpB", agent_id="2002"),
+    async def test_send_selects_correct_account_for_scoped_chat_id(self):
+        accounts = [
+            _account(account_id="corp-a", corp_id="corpA", agent_id=1001),
+            _account(account_id="corp-b", corp_id="corpB", agent_id=2002),
         ]
-        adapter = WecomCallbackAdapter(_config(apps=apps))
-        adapter._user_app_map["corpB:alice"] = "corp-b"
+        adapter = WecomCallbackAdapter(_config(accounts=accounts))
+        adapter._user_account_map["corpB:alice"] = "corp-b"
         adapter._access_tokens["corp-b"] = {"token": "tok-b", "expires_at": 9999999999}
 
         calls = {}
@@ -129,9 +141,9 @@ class TestWecomCallbackRouting:
 
     @pytest.mark.asyncio
     async def test_send_falls_back_from_bare_user_id_when_unique(self):
-        apps = [_app(name="corp-a", corp_id="corpA", agent_id="1001")]
-        adapter = WecomCallbackAdapter(_config(apps=apps))
-        adapter._user_app_map["corpA:alice"] = "corp-a"
+        accounts = [_account(account_id="corp-a", corp_id="corpA", agent_id=1001)]
+        adapter = WecomCallbackAdapter(_config(accounts=accounts))
+        adapter._user_account_map["corpA:alice"] = "corp-a"
         adapter._access_tokens["corp-a"] = {"token": "tok-a", "expires_at": 9999999999}
 
         calls = {}
@@ -164,7 +176,7 @@ class TestWecomCallbackPollLoop:
 
         monkeypatch.setattr(adapter, "handle_message", fake_handle_message)
         event = adapter._build_event(
-            _app(),
+            _account(),
             """
             <xml>
               <ToUserName>ww1234567890</ToUserName>
