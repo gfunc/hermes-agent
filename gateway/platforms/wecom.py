@@ -722,6 +722,20 @@ class WeComAdapter(BasePlatformAdapter):
             return
 
         if cmd in CALLBACK_COMMANDS or cmd == APP_CMD_EVENT_CALLBACK:
+            event_name = str(body.get("event") or "").lower()
+            if event_name == "enter_check_update":
+                try:
+                    await self._send_request(
+                        APP_CMD_SEND,
+                        {
+                            "chatid": str(body.get("chatid") or ""),
+                            "msgtype": "text",
+                            "text": {"content": f"HermesAgent version {getattr(self, '_version', '1.0')} ready"},
+                        },
+                    )
+                except Exception as exc:
+                    logger.debug("[%s] Version handshake reply failed: %s", self.name, exc)
+                return
             await self._on_message(payload)
             return
         if cmd == APP_CMD_PING:

@@ -894,3 +894,45 @@ async def test_extract_media_extracts_video_frame():
         assert "/tmp/frame.jpg" in urls
         assert "image/jpeg" in types
         assert "video/mp4" in types
+
+
+@pytest.mark.asyncio
+async def test_dispatch_payload_replies_to_enter_check_update():
+    from gateway.config import PlatformConfig
+    from gateway.platforms.wecom import WeComAdapter
+
+    config = PlatformConfig(extra={"bot_id": "b", "secret": "s"})
+    adapter = WeComAdapter(config)
+    adapter._send_request = AsyncMock(return_value={"headers": {"req_id": "r1"}, "body": {"errcode": 0}})
+
+    payload = {
+        "cmd": "aibot_msg_callback",
+        "headers": {"req_id": "req-1"},
+        "body": {
+            "msgtype": "event",
+            "event": "enter_check_update",
+            "chatid": "c1",
+        },
+    }
+    await adapter._dispatch_payload(payload)
+    adapter._send_request.assert_awaited_once()
+    call_args = adapter._send_request.await_args.args
+    assert call_args[0] == "aibot_send_msg"
+    assert "version" in call_args[1]["text"]["content"].lower()
+
+
+@pytest.mark.asyncio
+async def test_send_thinking_placeholder():
+    from gateway.config import PlatformConfig
+    from gateway.platforms.wecom import WeComAdapter
+
+    config = PlatformConfig(extra={"bot_id": "b", "secret": "s"})
+    adapter = WeComAdapter(config)
+    adapter._send_request = AsyncMock(return_value={"headers": {"req_id": "r1"}, "body": {"errcode": 0}})
+
+    result = await adapter.send_thinking("chat-1")
+    assert result.success is True
+    adapter._send_request.assert_awaited_once()
+    call_args = adapter._send_request.await_args.args[1]
+    assert call_args["msgtype"] == "markdown"
+    assert call_args["markdown"]["content"] == "<think></think>"
