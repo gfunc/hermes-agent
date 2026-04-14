@@ -936,3 +936,34 @@ async def test_send_thinking_placeholder():
     call_args = adapter._send_request.await_args.args[1]
     assert call_args["msgtype"] == "markdown"
     assert call_args["markdown"]["content"] == "<think></think>"
+
+
+@pytest.mark.asyncio
+async def test_on_message_respects_group_disabled_policy():
+    from gateway.config import PlatformConfig
+    from gateway.platforms.wecom import WeComAdapter
+
+    adapter = WeComAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={"group_policy": "disabled"},
+        )
+    )
+    adapter.handle_message = AsyncMock()
+    adapter._extract_media = AsyncMock(return_value=([], []))
+
+    payload = {
+        "cmd": "aibot_msg_callback",
+        "headers": {"req_id": "req-1"},
+        "body": {
+            "msgid": "msg-1",
+            "chatid": "group-1",
+            "chattype": "group",
+            "from": {"userid": "user-1"},
+            "msgtype": "text",
+            "text": {"content": "hello"},
+        },
+    }
+
+    await adapter._on_message(payload)
+    adapter.handle_message.assert_not_awaited()
