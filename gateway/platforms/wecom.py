@@ -999,6 +999,22 @@ class WeComAdapter(BasePlatformAdapter):
                     refs.append(("file", appmsg["file"]))
                 elif isinstance(appmsg.get("image"), dict):
                     refs.append(("image", appmsg["image"]))
+            # Handle video with first-frame extraction for LLM preview
+            if msgtype == "video" and isinstance(body.get("video"), dict):
+                video_info = body["video"]
+                video_url = str(video_info.get("url") or "").strip()
+                if video_url:
+                    media_paths.append(video_url)
+                    media_types.append("video/mp4")
+                    try:
+                        from gateway.platforms.wecom_video import extract_first_video_frame
+
+                        frame_path = extract_first_video_frame(video_url)
+                        if frame_path:
+                            media_paths.append(frame_path)
+                            media_types.append("image/jpeg")
+                    except Exception as exc:
+                        logger.debug("[%s] First-frame extraction failed: %s", self.name, exc)
 
         quote = body.get("quote") if isinstance(body.get("quote"), dict) else {}
         quote_type = str(quote.get("msgtype") or "").lower()

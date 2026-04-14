@@ -874,3 +874,23 @@ async def test_dm_pairing_mode_blocks_and_sends_prompt():
     adapter._send_request.assert_awaited_once()
     call_args = adapter._send_request.await_args.args[1]
     assert call_args["markdown"]["content"] == "您尚未完成配对，请联系管理员进行配对后重试。"
+
+
+@pytest.mark.asyncio
+async def test_extract_media_extracts_video_frame():
+    from gateway.config import PlatformConfig
+    from gateway.platforms.wecom import WeComAdapter
+
+    config = PlatformConfig(extra={"bot_id": "b", "secret": "s"})
+    adapter = WeComAdapter(config)
+
+    with patch("gateway.platforms.wecom_video.extract_first_video_frame", return_value="/tmp/frame.jpg") as mock_extract:
+        body = {
+            "msgtype": "video",
+            "video": {"url": "/tmp/video.mp4", "sdkfileid": "v1", "md5sum": "abc"},
+        }
+        urls, types = await adapter._extract_media(body)
+        mock_extract.assert_called_once()
+        assert "/tmp/frame.jpg" in urls
+        assert "image/jpeg" in types
+        assert "video/mp4" in types
