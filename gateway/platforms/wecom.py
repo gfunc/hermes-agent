@@ -45,10 +45,12 @@ from urllib.parse import unquote, urlparse
 
 try:
     import aiohttp
+    from aiohttp import web
     AIOHTTP_AVAILABLE = True
 except ImportError:
     AIOHTTP_AVAILABLE = False
     aiohttp = None  # type: ignore[assignment]
+    web = None  # type: ignore[assignment]
 
 try:
     import httpx
@@ -60,6 +62,7 @@ except ImportError:
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.helpers import MessageDeduplicator, TextBatchAggregator
 from gateway.platforms.wecom_accounts import resolve_wecom_accounts, WeComAccount
+from gateway.platforms.wecom_crypto import WXBizMsgCrypt, verify_signature
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
@@ -175,6 +178,7 @@ class WeComAdapter(BasePlatformAdapter):
         self._webhook_runner: Optional["web.AppRunner"] = None
         self._webhook_site: Optional["web.TCPSite"] = None
         self._webhook_app: Optional["web.Application"] = None
+        self._stream_states: Dict[str, Dict[str, Any]] = {}
 
         # Text batching via shared aggregator
         batch_delay = float(os.getenv("HERMES_WECOM_TEXT_BATCH_DELAY_SECONDS", "0.6"))
@@ -366,12 +370,121 @@ class WeComAdapter(BasePlatformAdapter):
         return web.json_response({"status": "ok", "platform": "wecom"})
 
     async def _handle_webhook_verify(self, request: "web.Request") -> "web.Response":
-        """Placeholder for Bot Webhook URL verification (GET)."""
-        return web.Response(text="success", content_type="text/plain")
+        """Bot Webhook URL verification (GET)."""
+        signature = request.query.get("msg_signature") or request.query.get("msgsignature") or request.query.get("signature", "")
+        timestamp = request.query.get("timestamp", "")
+        nonce = request.query.get("nonce", "")
+        echostr = request.query.get("echostr", "")
+
+        if not signature or not timestamp or not nonce or not echostr:
+            return web.Response(status=400, text="missing required query parameters")
+
+        account = self._match_webhook_account(signature, timestamp, nonce, echostr)
+        if account is None:
+            return web.Response(status=403, text="signature verification failed")
+
+        try:
+            crypt = WXBizMsgCrypt(account.token, account.encoding_aes_key, account.receive_id or account.corp_id or "")
+            plain = crypt.verify_url(signature, timestamp, nonce, echostr)
+            return web.Response(text=plain, content_type="text/plain")
+        except Exception as exc:
+            logger.warning("[%s] Webhook verify failed for account '%s': %s", self.name, account.account_id, exc)
+            return web.Response(status=403, text="decrypt failed")
 
     async def _handle_webhook_callback(self, request: "web.Request") -> "web.Response":
-        """Placeholder for Bot Webhook JSON callback (POST)."""
-        return web.Response(text="success", content_type="text/plain")
+        """Bot Webhook JSON callback (POST)."""
+        signature = request.query.get("msg_signature") or request.query.get("msgsignature") or request.query.get("signature", "")
+        timestamp = request.query.get("timestamp", "")
+        nonce = request.query.get("nonce", "")
+
+        if not signature or not timestamp or not nonce:
+            return web.Response(status=400, text="missing required query parameters")
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.Response(status=400, text="invalid json body")
+
+        encrypt = body.get("encrypt", "")
+        if not encrypt:
+            return web.Response(status=400, text="missing encrypt field")
+
+        account = self._match_webhook_account(signature, timestamp, nonce, encrypt)
+        if account is None:
+            return web.Response(status=403, text="signature verification failed")
+
+        try:
+            decrypted = self._decrypt_webhook_body(account, encrypt)
+        except Exception as exc:
+            logger.warning("[%s] Webhook decrypt failed for account '%s': %s", self.name, account.account_id, exc)
+            return web.Response(status=400, text="decrypt failed")
+
+        # Validate aibotid if present
+        aibotid = decrypted.get("aibotid")
+        if aibotid and aibotid != account.bot_id:
+            logger.warning(
+                "[%s] Webhook aibotid mismatch: expected=%s, got=%s",
+                self.name, account.bot_id, aibotid,
+            )
+            return web.Response(status=403, text="aibotid mismatch")
+
+        msgtype = str(decrypted.get("msgtype") or "").lower()
+
+        if msgtype == "stream_refresh":
+            stream_id = str(decrypted.get("stream_id") or "")
+            state = self._stream_states.get(stream_id, {"content": "", "finished": False})
+            return web.json_response({
+                "msgtype": "stream",
+                "stream": {
+                    "id": stream_id,
+                    "finish": state.get("finished", False),
+                    "content": state.get("content", ""),
+                },
+            })
+
+        if msgtype == "enter_chat":
+            welcome = account.welcome_text or ""
+            return web.json_response({
+                "msgtype": "markdown",
+                "markdown": {"content": welcome},
+            })
+
+        # Normal message: synthesize a WS-style payload and dispatch
+        payload = {
+            "cmd": APP_CMD_CALLBACK,
+            "headers": {"req_id": self._new_req_id("wh")},
+            "body": decrypted,
+        }
+        try:
+            await self._on_message(payload)
+        except Exception as exc:
+            logger.exception("[%s] Failed to dispatch webhook message: %s", self.name, exc)
+
+        return web.json_response({"errcode": 0, "errmsg": "ok"})
+
+    def _match_webhook_account(self, signature: str, timestamp: str, nonce: str, encrypt: str) -> Optional[WeComAccount]:
+        """Try all webhook accounts and return the one whose signature matches."""
+        wh_accounts = [a for a in self._accounts if a.connection_mode == "webhook" and a.is_webhook_configured]
+        matches: List[WeComAccount] = []
+        for account in wh_accounts:
+            if verify_signature(account.token, timestamp, nonce, encrypt, signature):
+                matches.append(account)
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            ids = ", ".join(a.account_id for a in matches)
+            logger.warning("[%s] Webhook signature conflict among accounts: %s", self.name, ids)
+        return None
+
+    def _decrypt_webhook_body(self, account: WeComAccount, encrypt: str) -> Dict[str, Any]:
+        """Decrypt a JSON webhook payload using the account's crypto credentials."""
+        crypt = WXBizMsgCrypt(
+            account.token,
+            account.encoding_aes_key,
+            account.receive_id or account.corp_id or "",
+        )
+        decrypted_bytes = crypt.decrypt_without_verify(encrypt)
+        return json.loads(decrypted_bytes.decode("utf-8"))
 
     async def _open_connection(self) -> None:
         """Open and authenticate a websocket connection."""
