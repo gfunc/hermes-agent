@@ -171,6 +171,11 @@ class WeComAdapter(BasePlatformAdapter):
         self._dedup = MessageDeduplicator(max_size=DEDUP_MAX_SIZE)
         self._reply_req_ids: Dict[str, str] = {}
 
+        # Webhook server (for bot webhook mode accounts)
+        self._webhook_runner: Optional["web.AppRunner"] = None
+        self._webhook_site: Optional["web.TCPSite"] = None
+        self._webhook_app: Optional["web.Application"] = None
+
         # Text batching via shared aggregator
         batch_delay = float(os.getenv("HERMES_WECOM_TEXT_BATCH_DELAY_SECONDS", "0.6"))
         split_delay = float(os.getenv("HERMES_WECOM_TEXT_BATCH_SPLIT_DELAY_SECONDS", "2.0"))
@@ -186,7 +191,12 @@ class WeComAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
 
     async def connect(self) -> bool:
-        """Connect to the WeCom AI Bot gateway."""
+        """Connect to the WeCom AI Bot gateway.
+
+        Supports multiple accounts with mixed transport modes:
+        - websocket: opens a persistent WebSocket connection
+        - webhook: registers an aiohttp route for encrypted JSON callbacks
+        """
         if not AIOHTTP_AVAILABLE:
             message = "WeCom startup failed: aiohttp not installed"
             self._set_fatal_error("wecom_missing_dependency", message, retryable=True)
@@ -197,25 +207,86 @@ class WeComAdapter(BasePlatformAdapter):
             self._set_fatal_error("wecom_missing_dependency", message, retryable=True)
             logger.warning("[%s] %s. Run: pip install httpx", self.name, message)
             return False
-        if not self._bot_id or not self._secret:
-            message = "WeCom startup failed: WECOM_BOT_ID and WECOM_SECRET are required"
+
+        if not self._accounts:
+            message = "WeCom startup failed: no accounts configured"
             self._set_fatal_error("wecom_missing_credentials", message, retryable=True)
             logger.warning("[%s] %s", self.name, message)
             return False
 
+        ws_accounts = [a for a in self._accounts if a.connection_mode == "websocket"]
+        wh_accounts = [a for a in self._accounts if a.connection_mode == "webhook"]
+        connected_any = False
+        errors: List[str] = []
+
         try:
             self._http_client = httpx.AsyncClient(timeout=30.0, follow_redirects=True)
-            await self._open_connection()
-            self._mark_connected()
-            self._listen_task = asyncio.create_task(self._listen_loop())
-            self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
-            logger.info("[%s] Connected to %s", self.name, self._ws_url)
-            return True
+
+            # ---- WebSocket mode (Bot WS) ----
+            if ws_accounts:
+                # For backward compat we drive the primary WS from the first
+                # websocket-mode account.
+                primary = ws_accounts[0]
+                if not primary.is_bot_configured:
+                    if len(self._accounts) == 1:
+                        message = "WeCom startup failed: WECOM_BOT_ID and WECOM_SECRET are required"
+                    else:
+                        message = (
+                            f"WeCom startup failed: account '{primary.account_id}' "
+                            "missing bot_id or secret"
+                        )
+                    self._set_fatal_error("wecom_missing_credentials", message, retryable=True)
+                    logger.warning("[%s] %s", self.name, message)
+                    return False
+
+                self._bot_id = primary.bot_id
+                self._secret = primary.secret
+                self._ws_url = primary.websocket_url
+                await self._open_connection()
+                self._listen_task = asyncio.create_task(self._listen_loop())
+                self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+                logger.info(
+                    "[%s] WebSocket connected for account '%s' to %s",
+                    self.name, primary.account_id, self._ws_url,
+                )
+                connected_any = True
+                if len(ws_accounts) > 1:
+                    logger.info(
+                        "[%s] Additional %d websocket account(s) configured but not yet connected",
+                        self.name, len(ws_accounts) - 1,
+                    )
+
+            # ---- Webhook mode (Bot Webhook) ----
+            if wh_accounts:
+                for account in wh_accounts:
+                    if not account.is_webhook_configured:
+                        errors.append(
+                            f"account '{account.account_id}' missing token or encoding_aes_key"
+                        )
+                        continue
+                if errors and not connected_any:
+                    message = f"WeCom startup failed: {', '.join(errors)}"
+                    self._set_fatal_error("wecom_missing_credentials", message, retryable=True)
+                    logger.warning("[%s] %s", self.name, message)
+                    return False
+                await self._start_webhook_server(wh_accounts)
+                connected_any = True
+
+            if connected_any:
+                self._mark_connected()
+                return True
+
+            message = "WeCom startup failed: no accounts could be connected"
+            self._set_fatal_error("wecom_connect_error", message, retryable=True)
+            logger.warning("[%s] %s", self.name, message)
+            return False
+
         except Exception as exc:
             message = f"WeCom startup failed: {exc}"
             self._set_fatal_error("wecom_connect_error", message, retryable=True)
             logger.error("[%s] Failed to connect: %s", self.name, exc, exc_info=True)
             await self._cleanup_ws()
+            await self._cleanup_webhook()
             if self._http_client:
                 await self._http_client.aclose()
                 self._http_client = None
@@ -244,6 +315,7 @@ class WeComAdapter(BasePlatformAdapter):
 
         self._fail_pending_responses(RuntimeError("WeCom adapter disconnected"))
         await self._cleanup_ws()
+        await self._cleanup_webhook()
 
         if self._http_client:
             await self._http_client.aclose()
@@ -261,6 +333,45 @@ class WeComAdapter(BasePlatformAdapter):
         if self._session and not self._session.closed:
             await self._session.close()
         self._session = None
+
+    async def _start_webhook_server(self, accounts: List[WeComAccount]) -> None:
+        """Start aiohttp server for bot webhook mode accounts."""
+        self._webhook_app = web.Application()
+        self._webhook_app.router.add_get("/health", self._handle_webhook_health)
+        for account in accounts:
+            path = f"/wecom/bot/{account.account_id}"
+            self._webhook_app.router.add_get(path, self._handle_webhook_verify)
+            self._webhook_app.router.add_post(path, self._handle_webhook_callback)
+            logger.info("[%s] Registered webhook route %s for account '%s'", self.name, path, account.account_id)
+        # Also register a catch-all default route
+        self._webhook_app.router.add_get("/wecom/bot", self._handle_webhook_verify)
+        self._webhook_app.router.add_post("/wecom/bot", self._handle_webhook_callback)
+        self._webhook_runner = web.AppRunner(self._webhook_app)
+        await self._webhook_runner.setup()
+        host = str(self.config.extra.get("host") or "0.0.0.0")
+        port = int(self.config.extra.get("port") or 8644)
+        self._webhook_site = web.TCPSite(self._webhook_runner, host, port)
+        await self._webhook_site.start()
+        logger.info("[%s] Webhook server listening on %s:%s", self.name, host, port)
+
+    async def _cleanup_webhook(self) -> None:
+        """Close the webhook server, if any."""
+        self._webhook_site = None
+        if self._webhook_runner:
+            await self._webhook_runner.cleanup()
+            self._webhook_runner = None
+        self._webhook_app = None
+
+    async def _handle_webhook_health(self, request: "web.Request") -> "web.Response":
+        return web.json_response({"status": "ok", "platform": "wecom"})
+
+    async def _handle_webhook_verify(self, request: "web.Request") -> "web.Response":
+        """Placeholder for Bot Webhook URL verification (GET)."""
+        return web.Response(text="success", content_type="text/plain")
+
+    async def _handle_webhook_callback(self, request: "web.Request") -> "web.Response":
+        """Placeholder for Bot Webhook JSON callback (POST)."""
+        return web.Response(text="success", content_type="text/plain")
 
     async def _open_connection(self) -> None:
         """Open and authenticate a websocket connection."""
