@@ -65,6 +65,11 @@ from gateway.config import Platform, PlatformConfig
 from gateway.platforms.helpers import MessageDeduplicator, TextBatchAggregator
 from gateway.platforms.wecom_accounts import resolve_wecom_accounts, WeComAccount
 from gateway.platforms.wecom_crypto import WXBizMsgCrypt, verify_signature
+from gateway.platforms.wecom_command_auth import (
+    resolve_command_auth,
+    build_unauthorized_command_prompt,
+)
+from gateway.platforms.wecom_stream_store import StreamStore, PendingInbound
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
@@ -182,6 +187,7 @@ class WeComAdapter(BasePlatformAdapter):
         self._webhook_site: Optional["web.TCPSite"] = None
         self._webhook_app: Optional["web.Application"] = None
         self._stream_states: Dict[str, Dict[str, Any]] = {}
+        self._stream_store: Optional[StreamStore] = None
 
         # Text batching via shared aggregator
         batch_delay = float(os.getenv("HERMES_WECOM_TEXT_BATCH_DELAY_SECONDS", "0.6"))
@@ -343,6 +349,8 @@ class WeComAdapter(BasePlatformAdapter):
 
     async def _start_webhook_server(self, accounts: List[WeComAccount]) -> None:
         """Start aiohttp server for bot webhook mode accounts."""
+        self._stream_store = StreamStore(flush_handler=self._on_webhook_flush)
+        self._stream_store.start_pruning(30000)
         self._webhook_app = web.Application()
         self._webhook_app.router.add_get("/health", self._handle_webhook_health)
         for account in accounts:
@@ -363,11 +371,44 @@ class WeComAdapter(BasePlatformAdapter):
 
     async def _cleanup_webhook(self) -> None:
         """Close the webhook server, if any."""
+        if self._stream_store:
+            self._stream_store.stop_pruning()
+            self._stream_store = None
         self._webhook_site = None
         if self._webhook_runner:
             await self._webhook_runner.cleanup()
             self._webhook_runner = None
         self._webhook_app = None
+
+    async def _on_webhook_flush(self, pending: PendingInbound) -> None:
+        if not self._stream_store:
+            return
+        self._stream_store.mark_started(pending.stream_id)
+        account = pending.target
+        msg = pending.msg
+        sender_id = str(msg.get("from", {}).get("userid") or "").strip()
+        chat_id = str(msg.get("chatid") or sender_id).strip()
+        raw_body = str(pending.contents[0]) if pending.contents else ""
+
+        auth = resolve_command_auth(account, raw_body, sender_id)
+        if auth.should_compute_auth and not auth.command_authorized:
+            prompt = build_unauthorized_command_prompt(sender_id, auth.dm_policy)
+            self._stream_store.update_stream(
+                pending.stream_id,
+                lambda s: setattr(s, "content", prompt) or setattr(s, "finished", True),
+            )
+            return
+
+        # Build synthetic WS-style payload and dispatch
+        synthetic_payload = {
+            "cmd": APP_CMD_CALLBACK,
+            "headers": {"req_id": f"wh-{uuid.uuid4().hex}"},
+            "body": msg,
+        }
+        try:
+            await self._on_message(synthetic_payload)
+        except Exception:
+            logger.exception("[%s] Failed to dispatch webhook message", self.name)
 
     async def _handle_webhook_health(self, request: "web.Request") -> "web.Response":
         return web.json_response({"status": "ok", "platform": "wecom"})
@@ -432,36 +473,70 @@ class WeComAdapter(BasePlatformAdapter):
             return web.Response(status=403, text="aibotid mismatch")
 
         msgtype = str(decrypted.get("msgtype") or "").lower()
+        if msgtype in {"text", "image", "file", "voice", "video", "mixed"}:
+            sender_id = str(decrypted.get("from", {}).get("userid") or "").strip()
+            chat_id = str(decrypted.get("chatid") or sender_id).strip()
+            content = ""
+            text_block = decrypted.get("text") if isinstance(decrypted.get("text"), dict) else {}
+            content = str(text_block.get("content") or "").strip()
 
-        if msgtype == "stream_refresh":
-            stream_id = str(decrypted.get("stream_id") or "")
-            state = self._stream_states.get(stream_id, {"content": "", "finished": False})
-            return web.json_response({
-                "msgtype": "stream",
-                "stream": {
-                    "id": stream_id,
-                    "finish": state.get("finished", False),
-                    "content": state.get("content", ""),
-                },
-            })
+            # Command authorization check (inline for immediate rejection)
+            auth = resolve_command_auth(account, content, sender_id)
+            if auth.should_compute_auth and not auth.command_authorized:
+                prompt = build_unauthorized_command_prompt(sender_id, auth.dm_policy)
+                return web.json_response({
+                    "msgtype": "text",
+                    "text": {"content": prompt},
+                })
 
-        if msgtype == "enter_chat":
-            welcome = account.welcome_text or ""
+            if self._stream_store:
+                stream_id, status = self._stream_store.add_pending_message(
+                    conversation_key=f"wecom:{account.account_id}:{sender_id}:{chat_id}",
+                    target=account,
+                    msg=decrypted,
+                    msg_content=content,
+                    nonce=nonce,
+                    timestamp=timestamp,
+                    debounce_ms=300,
+                )
+                return web.json_response({"errcode": 0, "errmsg": "ok"})
+
+            # Fallback direct dispatch when stream store is not available
+            payload = {
+                "cmd": APP_CMD_CALLBACK,
+                "headers": {"req_id": self._new_req_id("wh")},
+                "body": decrypted,
+            }
+            try:
+                await self._on_message(payload)
+            except Exception as exc:
+                logger.exception("[%s] Failed to dispatch webhook message: %s", self.name, exc)
+            return web.json_response({"errcode": 0, "errmsg": "ok"})
+
+        elif msgtype == "stream_refresh":
+            if self._stream_store:
+                stream_id = str(decrypted.get("stream_id") or "")
+                stream = self._stream_store.get_stream(stream_id) or self._stream_store.get_stream_by_msgid(stream_id)
+                if stream:
+                    return web.json_response({
+                        "msgtype": "stream",
+                        "stream": {
+                            "id": stream_id,
+                            "finish": stream.finished,
+                            "content": stream.content,
+                        },
+                    })
+                return web.json_response({
+                    "msgtype": "stream",
+                    "stream": {"id": stream_id, "finish": True, "content": ""},
+                })
+
+        elif msgtype == "enter_chat":
+            welcome = account.welcome_text or "你好，有什么可以帮你的？"
             return web.json_response({
                 "msgtype": "markdown",
                 "markdown": {"content": welcome},
             })
-
-        # Normal message: synthesize a WS-style payload and dispatch
-        payload = {
-            "cmd": APP_CMD_CALLBACK,
-            "headers": {"req_id": self._new_req_id("wh")},
-            "body": decrypted,
-        }
-        try:
-            await self._on_message(payload)
-        except Exception as exc:
-            logger.exception("[%s] Failed to dispatch webhook message: %s", self.name, exc)
 
         return web.json_response({"errcode": 0, "errmsg": "ok"})
 
@@ -732,6 +807,24 @@ class WeComAdapter(BasePlatformAdapter):
             return
 
         text, reply_text = self._extract_text(body)
+
+        # Command authorization check
+        account = self._accounts[0] if self._accounts else WeComAccount(account_id="default")
+        auth = resolve_command_auth(account, text, sender_id)
+        if auth.should_compute_auth and not auth.command_authorized:
+            prompt = build_unauthorized_command_prompt(sender_id, auth.dm_policy)
+            try:
+                await self._send_request(
+                    APP_CMD_SEND,
+                    {
+                        "chatid": chat_id,
+                        "msgtype": "markdown",
+                        "markdown": {"content": prompt},
+                    },
+                )
+            except Exception as exc:
+                logger.warning("[%s] Failed to send command rejection: %s", self.name, exc)
+            return
         media_urls, media_types = await self._extract_media(body)
         message_type = self._derive_message_type(body, text, media_types)
         has_reply_context = bool(reply_text and (text or media_urls))

@@ -1,5 +1,6 @@
 """Tests for WeCom Bot Webhook mode."""
 
+import asyncio
 import json
 from unittest.mock import AsyncMock
 from xml.etree import ElementTree as ET
@@ -178,15 +179,22 @@ class TestWebhookCallback:
     async def test_stream_refresh_returns_state(self):
         account = _webhook_account()
         crypt = WXBizMsgCrypt(account.token, account.encoding_aes_key, account.corp_id)
-        payload = {"msgtype": "stream_refresh", "stream_id": "s1"}
-        enc = _encrypt_json(crypt, payload)
 
         adapter = WeComAdapter(PlatformConfig(enabled=True, extra={
             "accounts": [{"account_id": account.account_id, "token": account.token,
                           "encoding_aes_key": account.encoding_aes_key, "corp_id": account.corp_id,
-                          "connection_mode": "webhook"}]
+                          "bot_id": account.bot_id, "connection_mode": "webhook"}]
         }))
-        adapter._stream_states["s1"] = {"content": "partial", "finished": True}
+        # Initialize stream store and create a stream
+        from gateway.platforms.wecom_stream_store import StreamStore
+        adapter._stream_store = StreamStore(flush_handler=lambda p: None)
+        stream_id = adapter._stream_store.create_stream()
+        stream = adapter._stream_store.get_stream(stream_id)
+        stream.content = "partial"
+        stream.finished = True
+
+        payload = {"msgtype": "stream_refresh", "stream_id": stream_id}
+        enc = _encrypt_json(crypt, payload)
 
         class FakeRequest:
             query = {"msg_signature": enc["signature"], "timestamp": enc["timestamp"], "nonce": enc["nonce"]}
@@ -234,3 +242,54 @@ class TestWebhookCallback:
         body = json.loads(response.text)
         assert body["msgtype"] == "markdown"
         assert body["markdown"]["content"] == "Welcome!"
+
+    @pytest.mark.asyncio
+    async def test_webhook_callback_blocks_unauthorized_command(self):
+        account = _webhook_account()
+        account = WeComAccount(
+            account_id=account.account_id,
+            bot_id=account.bot_id,
+            token=account.token,
+            encoding_aes_key=account.encoding_aes_key,
+            corp_id=account.corp_id,
+            connection_mode="webhook",
+            dm_policy="allowlist",
+            allow_from=["alice"],
+        )
+        crypt = WXBizMsgCrypt(account.token, account.encoding_aes_key, account.corp_id)
+        payload = {
+            "aibotid": account.bot_id,
+            "msgtype": "text",
+            "text": {"content": "/reset"},
+            "chatid": "c1",
+            "from": {"userid": "bob"},
+            "msgid": "m1",
+        }
+        enc = _encrypt_json(crypt, payload)
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True, extra={
+            "accounts": [{
+                "account_id": account.account_id,
+                "token": account.token,
+                "encoding_aes_key": account.encoding_aes_key,
+                "corp_id": account.corp_id,
+                "bot_id": account.bot_id,
+                "connection_mode": "webhook",
+                "dm_policy": "allowlist",
+                "allow_from": ["alice"],
+            }]
+        }))
+        adapter._on_message = AsyncMock()
+
+        class FakeRequest:
+            query = {"msg_signature": enc["signature"], "timestamp": enc["timestamp"], "nonce": enc["nonce"]}
+            async def json(self):
+                return {"encrypt": enc["encrypt"]}
+
+        response = await adapter._handle_webhook_callback(FakeRequest())
+        assert response.status == 200
+        # Command should be rejected; on_message should NOT be called for agent dispatch
+        adapter._on_message.assert_not_awaited()
+        body = json.loads(response.text)
+        assert body["msgtype"] == "text"
+        assert "没有权限" in body["text"]["content"]
