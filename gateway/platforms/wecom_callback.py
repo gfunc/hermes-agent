@@ -37,6 +37,7 @@ except ImportError:
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
+from gateway.platforms.wecom_accounts import resolve_wecom_accounts, WeComAccount
 from gateway.platforms.wecom_crypto import WXBizMsgCrypt, WeComCryptoError
 
 logger = logging.getLogger(__name__)
@@ -59,7 +60,7 @@ class WecomCallbackAdapter(BasePlatformAdapter):
         self._host = str(extra.get("host") or DEFAULT_HOST)
         self._port = int(extra.get("port") or DEFAULT_PORT)
         self._path = str(extra.get("path") or DEFAULT_PATH)
-        self._apps: List[Dict[str, Any]] = self._normalize_apps(extra)
+        self._accounts: List[WeComAccount] = resolve_wecom_accounts(config)
         self._runner: Optional[web.AppRunner] = None
         self._site: Optional[web.TCPSite] = None
         self._app: Optional[web.Application] = None
@@ -67,42 +68,24 @@ class WecomCallbackAdapter(BasePlatformAdapter):
         self._message_queue: asyncio.Queue[MessageEvent] = asyncio.Queue()
         self._poll_task: Optional[asyncio.Task] = None
         self._seen_messages: Dict[str, float] = {}
-        self._user_app_map: Dict[str, str] = {}
+        self._user_account_map: Dict[str, str] = {}
         self._access_tokens: Dict[str, Dict[str, Any]] = {}
 
     # ------------------------------------------------------------------
-    # App normalisation
+    # Account helpers
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _user_app_key(corp_id: str, user_id: str) -> str:
+    def _user_account_key(corp_id: str, user_id: str) -> str:
         return f"{corp_id}:{user_id}" if corp_id else user_id
-
-    @staticmethod
-    def _normalize_apps(extra: Dict[str, Any]) -> List[Dict[str, Any]]:
-        apps = extra.get("apps")
-        if isinstance(apps, list) and apps:
-            return [dict(app) for app in apps if isinstance(app, dict)]
-        if extra.get("corp_id"):
-            return [
-                {
-                    "name": extra.get("name") or "default",
-                    "corp_id": extra.get("corp_id", ""),
-                    "corp_secret": extra.get("corp_secret", ""),
-                    "agent_id": str(extra.get("agent_id", "")),
-                    "token": extra.get("token", ""),
-                    "encoding_aes_key": extra.get("encoding_aes_key", ""),
-                }
-            ]
-        return []
 
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
     async def connect(self) -> bool:
-        if not self._apps:
-            logger.warning("[WecomCallback] No callback apps configured")
+        if not self._accounts:
+            logger.warning("[WecomCallback] No callback accounts configured")
             return False
         if not check_wecom_callback_requirements():
             logger.warning("[WecomCallback] aiohttp/httpx not installed")
@@ -134,13 +117,13 @@ class WecomCallbackAdapter(BasePlatformAdapter):
                 "[WecomCallback] HTTP server listening on %s:%s%s",
                 self._host, self._port, self._path,
             )
-            for app in self._apps:
+            for account in self._accounts:
                 try:
-                    await self._refresh_access_token(app)
+                    await self._refresh_access_token(account)
                 except Exception as exc:
                     logger.warning(
-                        "[WecomCallback] Initial token refresh failed for app '%s': %s",
-                        app.get("name", "default"), exc,
+                        "[WecomCallback] Initial token refresh failed for account '%s': %s",
+                        account.account_id, exc,
                     )
             return True
         except Exception:
@@ -182,14 +165,14 @@ class WecomCallbackAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        app = self._resolve_app_for_chat(chat_id)
+        account = self._resolve_account_for_chat(chat_id)
         touser = chat_id.split(":", 1)[1] if ":" in chat_id else chat_id
         try:
-            token = await self._get_access_token(app)
+            token = await self._get_access_token(account)
             payload = {
                 "touser": touser,
                 "msgtype": "text",
-                "agentid": int(str(app.get("agent_id") or 0)),
+                "agentid": int(account.agent_id or 0),
                 "text": {"content": content[:2048]},
                 "safe": 0,
             }
@@ -208,16 +191,16 @@ class WecomCallbackAdapter(BasePlatformAdapter):
         except Exception as exc:
             return SendResult(success=False, error=str(exc))
 
-    def _resolve_app_for_chat(self, chat_id: str) -> Dict[str, Any]:
-        """Pick the app associated with *chat_id*, falling back sensibly."""
-        app_name = self._user_app_map.get(chat_id)
-        if not app_name and ":" not in chat_id:
+    def _resolve_account_for_chat(self, chat_id: str) -> WeComAccount:
+        """Pick the account associated with *chat_id*, falling back sensibly."""
+        account_id = self._user_account_map.get(chat_id)
+        if not account_id and ":" not in chat_id:
             # Legacy bare user_id — try to find a unique match.
-            matching = [k for k in self._user_app_map if k.endswith(f":{chat_id}")]
+            matching = [k for k in self._user_account_map if k.endswith(f":{chat_id}")]
             if len(matching) == 1:
-                app_name = self._user_app_map.get(matching[0])
-        app = self._get_app_by_name(app_name) if app_name else None
-        return app or self._apps[0]
+                account_id = self._user_account_map.get(matching[0])
+        account = self._get_account_by_id(account_id) if account_id else None
+        return account or self._accounts[0]
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         return {"name": chat_id, "type": "dm"}
@@ -235,9 +218,9 @@ class WecomCallbackAdapter(BasePlatformAdapter):
         timestamp = request.query.get("timestamp", "")
         nonce = request.query.get("nonce", "")
         echostr = request.query.get("echostr", "")
-        for app in self._apps:
+        for account in self._accounts:
             try:
-                crypt = self._crypt_for_app(app)
+                crypt = self._crypt_for_account(account)
                 plain = crypt.verify_url(msg_signature, timestamp, nonce, echostr)
                 return web.Response(text=plain, content_type="text/plain")
             except Exception:
@@ -251,19 +234,19 @@ class WecomCallbackAdapter(BasePlatformAdapter):
         nonce = request.query.get("nonce", "")
         body = await request.text()
 
-        for app in self._apps:
+        for account in self._accounts:
             try:
                 decrypted = self._decrypt_request(
-                    app, body, msg_signature, timestamp, nonce,
+                    account, body, msg_signature, timestamp, nonce,
                 )
-                event = self._build_event(app, decrypted)
+                event = self._build_event(account, decrypted)
                 if event is not None:
-                    # Record which app this user belongs to.
+                    # Record which account this user belongs to.
                     if event.source and event.source.user_id:
-                        map_key = self._user_app_key(
-                            str(app.get("corp_id") or ""), event.source.user_id,
+                        map_key = self._user_account_key(
+                            account.corp_id or "", event.source.user_id,
                         )
-                        self._user_app_map[map_key] = app["name"]
+                        self._user_account_map[map_key] = account.account_id
                     await self._message_queue.put(event)
                 # Immediately acknowledge — the agent's reply will arrive
                 # later via the proactive message/send API.
@@ -291,15 +274,15 @@ class WecomCallbackAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
 
     def _decrypt_request(
-        self, app: Dict[str, Any], body: str,
+        self, account: WeComAccount, body: str,
         msg_signature: str, timestamp: str, nonce: str,
     ) -> str:
         root = ET.fromstring(body)
         encrypt = root.findtext("Encrypt", default="")
-        crypt = self._crypt_for_app(app)
+        crypt = self._crypt_for_account(account)
         return crypt.decrypt(msg_signature, timestamp, nonce, encrypt).decode("utf-8")
 
-    def _build_event(self, app: Dict[str, Any], xml_text: str) -> Optional[MessageEvent]:
+    def _build_event(self, account: WeComAccount, xml_text: str) -> Optional[MessageEvent]:
         root = ET.fromstring(xml_text)
         msg_type = (root.findtext("MsgType") or "").lower()
         # Silently acknowledge lifecycle events.
@@ -311,8 +294,8 @@ class WecomCallbackAdapter(BasePlatformAdapter):
             return None
 
         user_id = root.findtext("FromUserName", default="")
-        corp_id = root.findtext("ToUserName", default=app.get("corp_id", ""))
-        scoped_chat_id = self._user_app_key(corp_id, user_id)
+        corp_id = root.findtext("ToUserName", default=account.corp_id or "")
+        scoped_chat_id = self._user_account_key(corp_id, user_id)
         content = root.findtext("Content", default="").strip()
         if not content and msg_type == "event":
             content = "/start"
@@ -335,38 +318,38 @@ class WecomCallbackAdapter(BasePlatformAdapter):
             message_id=msg_id,
         )
 
-    def _crypt_for_app(self, app: Dict[str, Any]) -> WXBizMsgCrypt:
+    def _crypt_for_account(self, account: WeComAccount) -> WXBizMsgCrypt:
         return WXBizMsgCrypt(
-            token=str(app.get("token") or ""),
-            encoding_aes_key=str(app.get("encoding_aes_key") or ""),
-            receive_id=str(app.get("corp_id") or ""),
+            token=account.token or "",
+            encoding_aes_key=account.encoding_aes_key or "",
+            receive_id=account.receive_id or account.corp_id or "",
         )
 
-    def _get_app_by_name(self, name: Optional[str]) -> Optional[Dict[str, Any]]:
-        if not name:
+    def _get_account_by_id(self, account_id: Optional[str]) -> Optional[WeComAccount]:
+        if not account_id:
             return None
-        for app in self._apps:
-            if app.get("name") == name:
-                return app
+        for account in self._accounts:
+            if account.account_id == account_id:
+                return account
         return None
 
     # ------------------------------------------------------------------
     # Access-token management
     # ------------------------------------------------------------------
 
-    async def _get_access_token(self, app: Dict[str, Any]) -> str:
-        cached = self._access_tokens.get(app["name"])
+    async def _get_access_token(self, account: WeComAccount) -> str:
+        cached = self._access_tokens.get(account.account_id)
         now = time.time()
         if cached and cached.get("expires_at", 0) > now + 60:
             return cached["token"]
-        return await self._refresh_access_token(app)
+        return await self._refresh_access_token(account)
 
-    async def _refresh_access_token(self, app: Dict[str, Any]) -> str:
+    async def _refresh_access_token(self, account: WeComAccount) -> str:
         resp = await self._http_client.get(
             "https://qyapi.weixin.qq.com/cgi-bin/gettoken",
             params={
-                "corpid": app.get("corp_id"),
-                "corpsecret": app.get("corp_secret"),
+                "corpid": account.corp_id,
+                "corpsecret": account.corp_secret,
             },
         )
         data = resp.json()
@@ -374,14 +357,14 @@ class WecomCallbackAdapter(BasePlatformAdapter):
             raise RuntimeError(f"WeCom token refresh failed: {data}")
         token = data["access_token"]
         expires_in = int(data.get("expires_in", ACCESS_TOKEN_TTL_SECONDS))
-        self._access_tokens[app["name"]] = {
+        self._access_tokens[account.account_id] = {
             "token": token,
             "expires_at": time.time() + expires_in,
         }
         logger.info(
-            "[WecomCallback] Token refreshed for app '%s' (corp=%s), expires in %ss",
-            app.get("name", "default"),
-            app.get("corp_id", ""),
+            "[WecomCallback] Token refreshed for account '%s' (corp=%s), expires in %ss",
+            account.account_id,
+            account.corp_id,
             expires_in,
         )
         return token

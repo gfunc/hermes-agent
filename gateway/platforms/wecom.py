@@ -45,10 +45,12 @@ from urllib.parse import unquote, urlparse
 
 try:
     import aiohttp
+    from aiohttp import web
     AIOHTTP_AVAILABLE = True
 except ImportError:
     AIOHTTP_AVAILABLE = False
     aiohttp = None  # type: ignore[assignment]
+    web = None  # type: ignore[assignment]
 
 try:
     import httpx
@@ -58,7 +60,9 @@ except ImportError:
     httpx = None  # type: ignore[assignment]
 
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.helpers import MessageDeduplicator
+from gateway.platforms.helpers import MessageDeduplicator, TextBatchAggregator
+from gateway.platforms.wecom_accounts import resolve_wecom_accounts, WeComAccount
+from gateway.platforms.wecom_crypto import WXBizMsgCrypt, verify_signature
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
@@ -149,21 +153,17 @@ class WeComAdapter(BasePlatformAdapter):
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.WECOM)
 
-        extra = config.extra or {}
-        self._bot_id = str(extra.get("bot_id") or os.getenv("WECOM_BOT_ID", "")).strip()
-        self._secret = str(extra.get("secret") or os.getenv("WECOM_SECRET", "")).strip()
-        self._ws_url = str(
-            extra.get("websocket_url")
-            or extra.get("websocketUrl")
-            or os.getenv("WECOM_WEBSOCKET_URL", DEFAULT_WS_URL)
-        ).strip() or DEFAULT_WS_URL
-
-        self._dm_policy = str(extra.get("dm_policy") or os.getenv("WECOM_DM_POLICY", "open")).strip().lower()
-        self._allow_from = _coerce_list(extra.get("allow_from") or extra.get("allowFrom"))
-
-        self._group_policy = str(extra.get("group_policy") or os.getenv("WECOM_GROUP_POLICY", "open")).strip().lower()
-        self._group_allow_from = _coerce_list(extra.get("group_allow_from") or extra.get("groupAllowFrom"))
-        self._groups = extra.get("groups") if isinstance(extra.get("groups"), dict) else {}
+        self._accounts: List[WeComAccount] = resolve_wecom_accounts(config)
+        # Backwards-compat: expose default account attrs at top level for single-account users
+        default_account = self._accounts[0] if self._accounts else WeComAccount(account_id="default")
+        self._bot_id = default_account.bot_id
+        self._secret = default_account.secret
+        self._ws_url = default_account.websocket_url
+        self._dm_policy = default_account.dm_policy
+        self._allow_from = default_account.allow_from
+        self._group_policy = default_account.group_policy
+        self._group_allow_from = default_account.group_allow_from
+        self._groups = default_account.groups
 
         self._session: Optional["aiohttp.ClientSession"] = None
         self._ws: Optional["aiohttp.ClientWebSocketResponse"] = None
@@ -174,19 +174,33 @@ class WeComAdapter(BasePlatformAdapter):
         self._dedup = MessageDeduplicator(max_size=DEDUP_MAX_SIZE)
         self._reply_req_ids: Dict[str, str] = {}
 
-        # Text batching: merge rapid successive messages (Telegram-style).
-        # WeCom clients split long messages around 4000 chars.
-        self._text_batch_delay_seconds = float(os.getenv("HERMES_WECOM_TEXT_BATCH_DELAY_SECONDS", "0.6"))
-        self._text_batch_split_delay_seconds = float(os.getenv("HERMES_WECOM_TEXT_BATCH_SPLIT_DELAY_SECONDS", "2.0"))
-        self._pending_text_batches: Dict[str, MessageEvent] = {}
-        self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
+        # Webhook server (for bot webhook mode accounts)
+        self._webhook_runner: Optional["web.AppRunner"] = None
+        self._webhook_site: Optional["web.TCPSite"] = None
+        self._webhook_app: Optional["web.Application"] = None
+        self._stream_states: Dict[str, Dict[str, Any]] = {}
+
+        # Text batching via shared aggregator
+        batch_delay = float(os.getenv("HERMES_WECOM_TEXT_BATCH_DELAY_SECONDS", "0.6"))
+        split_delay = float(os.getenv("HERMES_WECOM_TEXT_BATCH_SPLIT_DELAY_SECONDS", "2.0"))
+        self._text_batcher = TextBatchAggregator(
+            handler=self.handle_message,
+            batch_delay=batch_delay,
+            split_delay=split_delay,
+            split_threshold=self._SPLIT_THRESHOLD,
+        )
 
     # ------------------------------------------------------------------
     # Connection lifecycle
     # ------------------------------------------------------------------
 
     async def connect(self) -> bool:
-        """Connect to the WeCom AI Bot gateway."""
+        """Connect to the WeCom AI Bot gateway.
+
+        Supports multiple accounts with mixed transport modes:
+        - websocket: opens a persistent WebSocket connection
+        - webhook: registers an aiohttp route for encrypted JSON callbacks
+        """
         if not AIOHTTP_AVAILABLE:
             message = "WeCom startup failed: aiohttp not installed"
             self._set_fatal_error("wecom_missing_dependency", message, retryable=True)
@@ -197,25 +211,86 @@ class WeComAdapter(BasePlatformAdapter):
             self._set_fatal_error("wecom_missing_dependency", message, retryable=True)
             logger.warning("[%s] %s. Run: pip install httpx", self.name, message)
             return False
-        if not self._bot_id or not self._secret:
-            message = "WeCom startup failed: WECOM_BOT_ID and WECOM_SECRET are required"
+
+        if not self._accounts:
+            message = "WeCom startup failed: no accounts configured"
             self._set_fatal_error("wecom_missing_credentials", message, retryable=True)
             logger.warning("[%s] %s", self.name, message)
             return False
 
+        ws_accounts = [a for a in self._accounts if a.connection_mode == "websocket"]
+        wh_accounts = [a for a in self._accounts if a.connection_mode == "webhook"]
+        connected_any = False
+        errors: List[str] = []
+
         try:
             self._http_client = httpx.AsyncClient(timeout=30.0, follow_redirects=True)
-            await self._open_connection()
-            self._mark_connected()
-            self._listen_task = asyncio.create_task(self._listen_loop())
-            self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
-            logger.info("[%s] Connected to %s", self.name, self._ws_url)
-            return True
+
+            # ---- WebSocket mode (Bot WS) ----
+            if ws_accounts:
+                # For backward compat we drive the primary WS from the first
+                # websocket-mode account.
+                primary = ws_accounts[0]
+                if not primary.is_bot_configured:
+                    if len(self._accounts) == 1:
+                        message = "WeCom startup failed: WECOM_BOT_ID and WECOM_SECRET are required"
+                    else:
+                        message = (
+                            f"WeCom startup failed: account '{primary.account_id}' "
+                            "missing bot_id or secret"
+                        )
+                    self._set_fatal_error("wecom_missing_credentials", message, retryable=True)
+                    logger.warning("[%s] %s", self.name, message)
+                    return False
+
+                self._bot_id = primary.bot_id
+                self._secret = primary.secret
+                self._ws_url = primary.websocket_url
+                await self._open_connection()
+                self._listen_task = asyncio.create_task(self._listen_loop())
+                self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+                logger.info(
+                    "[%s] WebSocket connected for account '%s' to %s",
+                    self.name, primary.account_id, self._ws_url,
+                )
+                connected_any = True
+                if len(ws_accounts) > 1:
+                    logger.info(
+                        "[%s] Additional %d websocket account(s) configured but not yet connected",
+                        self.name, len(ws_accounts) - 1,
+                    )
+
+            # ---- Webhook mode (Bot Webhook) ----
+            if wh_accounts:
+                for account in wh_accounts:
+                    if not account.is_webhook_configured:
+                        errors.append(
+                            f"account '{account.account_id}' missing token or encoding_aes_key"
+                        )
+                        continue
+                if errors and not connected_any:
+                    message = f"WeCom startup failed: {', '.join(errors)}"
+                    self._set_fatal_error("wecom_missing_credentials", message, retryable=True)
+                    logger.warning("[%s] %s", self.name, message)
+                    return False
+                await self._start_webhook_server(wh_accounts)
+                connected_any = True
+
+            if connected_any:
+                self._mark_connected()
+                return True
+
+            message = "WeCom startup failed: no accounts could be connected"
+            self._set_fatal_error("wecom_connect_error", message, retryable=True)
+            logger.warning("[%s] %s", self.name, message)
+            return False
+
         except Exception as exc:
             message = f"WeCom startup failed: {exc}"
             self._set_fatal_error("wecom_connect_error", message, retryable=True)
             logger.error("[%s] Failed to connect: %s", self.name, exc, exc_info=True)
             await self._cleanup_ws()
+            await self._cleanup_webhook()
             if self._http_client:
                 await self._http_client.aclose()
                 self._http_client = None
@@ -244,6 +319,7 @@ class WeComAdapter(BasePlatformAdapter):
 
         self._fail_pending_responses(RuntimeError("WeCom adapter disconnected"))
         await self._cleanup_ws()
+        await self._cleanup_webhook()
 
         if self._http_client:
             await self._http_client.aclose()
@@ -261,6 +337,154 @@ class WeComAdapter(BasePlatformAdapter):
         if self._session and not self._session.closed:
             await self._session.close()
         self._session = None
+
+    async def _start_webhook_server(self, accounts: List[WeComAccount]) -> None:
+        """Start aiohttp server for bot webhook mode accounts."""
+        self._webhook_app = web.Application()
+        self._webhook_app.router.add_get("/health", self._handle_webhook_health)
+        for account in accounts:
+            path = f"/wecom/bot/{account.account_id}"
+            self._webhook_app.router.add_get(path, self._handle_webhook_verify)
+            self._webhook_app.router.add_post(path, self._handle_webhook_callback)
+            logger.info("[%s] Registered webhook route %s for account '%s'", self.name, path, account.account_id)
+        # Also register a catch-all default route
+        self._webhook_app.router.add_get("/wecom/bot", self._handle_webhook_verify)
+        self._webhook_app.router.add_post("/wecom/bot", self._handle_webhook_callback)
+        self._webhook_runner = web.AppRunner(self._webhook_app)
+        await self._webhook_runner.setup()
+        host = str(self.config.extra.get("host") or "0.0.0.0")
+        port = int(self.config.extra.get("port") or 8644)
+        self._webhook_site = web.TCPSite(self._webhook_runner, host, port)
+        await self._webhook_site.start()
+        logger.info("[%s] Webhook server listening on %s:%s", self.name, host, port)
+
+    async def _cleanup_webhook(self) -> None:
+        """Close the webhook server, if any."""
+        self._webhook_site = None
+        if self._webhook_runner:
+            await self._webhook_runner.cleanup()
+            self._webhook_runner = None
+        self._webhook_app = None
+
+    async def _handle_webhook_health(self, request: "web.Request") -> "web.Response":
+        return web.json_response({"status": "ok", "platform": "wecom"})
+
+    async def _handle_webhook_verify(self, request: "web.Request") -> "web.Response":
+        """Bot Webhook URL verification (GET)."""
+        signature = request.query.get("msg_signature") or request.query.get("msgsignature") or request.query.get("signature", "")
+        timestamp = request.query.get("timestamp", "")
+        nonce = request.query.get("nonce", "")
+        echostr = request.query.get("echostr", "")
+
+        if not signature or not timestamp or not nonce or not echostr:
+            return web.Response(status=400, text="missing required query parameters")
+
+        account = self._match_webhook_account(signature, timestamp, nonce, echostr)
+        if account is None:
+            return web.Response(status=403, text="signature verification failed")
+
+        try:
+            crypt = WXBizMsgCrypt(account.token, account.encoding_aes_key, account.receive_id or account.corp_id or "")
+            plain = crypt.verify_url(signature, timestamp, nonce, echostr)
+            return web.Response(text=plain, content_type="text/plain")
+        except Exception as exc:
+            logger.warning("[%s] Webhook verify failed for account '%s': %s", self.name, account.account_id, exc)
+            return web.Response(status=403, text="decrypt failed")
+
+    async def _handle_webhook_callback(self, request: "web.Request") -> "web.Response":
+        """Bot Webhook JSON callback (POST)."""
+        signature = request.query.get("msg_signature") or request.query.get("msgsignature") or request.query.get("signature", "")
+        timestamp = request.query.get("timestamp", "")
+        nonce = request.query.get("nonce", "")
+
+        if not signature or not timestamp or not nonce:
+            return web.Response(status=400, text="missing required query parameters")
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.Response(status=400, text="invalid json body")
+
+        encrypt = body.get("encrypt", "")
+        if not encrypt:
+            return web.Response(status=400, text="missing encrypt field")
+
+        account = self._match_webhook_account(signature, timestamp, nonce, encrypt)
+        if account is None:
+            return web.Response(status=403, text="signature verification failed")
+
+        try:
+            decrypted = self._decrypt_webhook_body(account, encrypt)
+        except Exception as exc:
+            logger.warning("[%s] Webhook decrypt failed for account '%s': %s", self.name, account.account_id, exc)
+            return web.Response(status=400, text="decrypt failed")
+
+        # Validate aibotid if present
+        aibotid = decrypted.get("aibotid")
+        if aibotid and aibotid != account.bot_id:
+            logger.warning(
+                "[%s] Webhook aibotid mismatch: expected=%s, got=%s",
+                self.name, account.bot_id, aibotid,
+            )
+            return web.Response(status=403, text="aibotid mismatch")
+
+        msgtype = str(decrypted.get("msgtype") or "").lower()
+
+        if msgtype == "stream_refresh":
+            stream_id = str(decrypted.get("stream_id") or "")
+            state = self._stream_states.get(stream_id, {"content": "", "finished": False})
+            return web.json_response({
+                "msgtype": "stream",
+                "stream": {
+                    "id": stream_id,
+                    "finish": state.get("finished", False),
+                    "content": state.get("content", ""),
+                },
+            })
+
+        if msgtype == "enter_chat":
+            welcome = account.welcome_text or ""
+            return web.json_response({
+                "msgtype": "markdown",
+                "markdown": {"content": welcome},
+            })
+
+        # Normal message: synthesize a WS-style payload and dispatch
+        payload = {
+            "cmd": APP_CMD_CALLBACK,
+            "headers": {"req_id": self._new_req_id("wh")},
+            "body": decrypted,
+        }
+        try:
+            await self._on_message(payload)
+        except Exception as exc:
+            logger.exception("[%s] Failed to dispatch webhook message: %s", self.name, exc)
+
+        return web.json_response({"errcode": 0, "errmsg": "ok"})
+
+    def _match_webhook_account(self, signature: str, timestamp: str, nonce: str, encrypt: str) -> Optional[WeComAccount]:
+        """Try all webhook accounts and return the one whose signature matches."""
+        wh_accounts = [a for a in self._accounts if a.connection_mode == "webhook" and a.is_webhook_configured]
+        matches: List[WeComAccount] = []
+        for account in wh_accounts:
+            if verify_signature(account.token, timestamp, nonce, encrypt, signature):
+                matches.append(account)
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            ids = ", ".join(a.account_id for a in matches)
+            logger.warning("[%s] Webhook signature conflict among accounts: %s", self.name, ids)
+        return None
+
+    def _decrypt_webhook_body(self, account: WeComAccount, encrypt: str) -> Dict[str, Any]:
+        """Decrypt a JSON webhook payload using the account's crypto credentials."""
+        crypt = WXBizMsgCrypt(
+            account.token,
+            account.encoding_aes_key,
+            account.receive_id or account.corp_id or "",
+        )
+        decrypted_bytes = crypt.decrypt_without_verify(encrypt)
+        return json.loads(decrypted_bytes.decode("utf-8"))
 
     async def _open_connection(self) -> None:
         """Open and authenticate a websocket connection."""
@@ -382,10 +606,10 @@ class WeComAdapter(BasePlatformAdapter):
                 future.set_result(payload)
             return
 
-        if cmd in CALLBACK_COMMANDS:
+        if cmd in CALLBACK_COMMANDS or cmd == APP_CMD_EVENT_CALLBACK:
             await self._on_message(payload)
             return
-        if cmd in {APP_CMD_PING, APP_CMD_EVENT_CALLBACK}:
+        if cmd == APP_CMD_PING:
             return
 
         logger.debug("[%s] Ignoring websocket payload: %s", self.name, cmd or payload)
@@ -478,7 +702,10 @@ class WeComAdapter(BasePlatformAdapter):
         if self._dedup.is_duplicate(msg_id):
             logger.debug("[%s] Duplicate message %s ignored", self.name, msg_id)
             return
-        self._remember_reply_req_id(msg_id, self._payload_req_id(payload))
+
+        # Event callbacks (e.g. template_card_event) don't have a valid req_id for passive reply.
+        if str(body.get("msgtype") or "").lower() != "event":
+            self._remember_reply_req_id(msg_id, self._payload_req_id(payload))
 
         sender = body.get("from") if isinstance(body.get("from"), dict) else {}
         sender_id = str(sender.get("userid") or "").strip()
@@ -530,8 +757,9 @@ class WeComAdapter(BasePlatformAdapter):
 
         # Only batch plain text messages — commands, media, etc. dispatch
         # immediately since they won't be split by the WeCom client.
-        if message_type == MessageType.TEXT and self._text_batch_delay_seconds > 0:
-            self._enqueue_text_event(event)
+        if message_type == MessageType.TEXT and self._text_batcher.is_enabled():
+            key = self._text_batch_key(event)
+            self._text_batcher.enqueue(event, key)
         else:
             await self.handle_message(event)
 
@@ -547,63 +775,6 @@ class WeComAdapter(BasePlatformAdapter):
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
         )
-
-    def _enqueue_text_event(self, event: MessageEvent) -> None:
-        """Buffer a text event and reset the flush timer.
-
-        When WeCom splits a long user message at 4000 chars, the chunks
-        arrive within a few hundred milliseconds.  This merges them into
-        a single event before dispatching.
-        """
-        key = self._text_batch_key(event)
-        existing = self._pending_text_batches.get(key)
-        chunk_len = len(event.text or "")
-        if existing is None:
-            event._last_chunk_len = chunk_len  # type: ignore[attr-defined]
-            self._pending_text_batches[key] = event
-        else:
-            if event.text:
-                existing.text = f"{existing.text}\n{event.text}" if existing.text else event.text
-            existing._last_chunk_len = chunk_len  # type: ignore[attr-defined]
-            # Merge any media that might be attached
-            if event.media_urls:
-                existing.media_urls.extend(event.media_urls)
-                existing.media_types.extend(event.media_types)
-
-        # Cancel any pending flush and restart the timer
-        prior_task = self._pending_text_batch_tasks.get(key)
-        if prior_task and not prior_task.done():
-            prior_task.cancel()
-        self._pending_text_batch_tasks[key] = asyncio.create_task(
-            self._flush_text_batch(key)
-        )
-
-    async def _flush_text_batch(self, key: str) -> None:
-        """Wait for the quiet period then dispatch the aggregated text.
-
-        Uses a longer delay when the latest chunk is near WeCom's 4000-char
-        split point, since a continuation chunk is almost certain.
-        """
-        current_task = asyncio.current_task()
-        try:
-            pending = self._pending_text_batches.get(key)
-            last_len = getattr(pending, "_last_chunk_len", 0) if pending else 0
-            if last_len >= self._SPLIT_THRESHOLD:
-                delay = self._text_batch_split_delay_seconds
-            else:
-                delay = self._text_batch_delay_seconds
-            await asyncio.sleep(delay)
-            event = self._pending_text_batches.pop(key, None)
-            if not event:
-                return
-            logger.info(
-                "[WeCom] Flushing text batch %s (%d chars)",
-                key, len(event.text or ""),
-            )
-            await self.handle_message(event)
-        finally:
-            if self._pending_text_batch_tasks.get(key) is current_task:
-                self._pending_text_batch_tasks.pop(key, None)
 
     @staticmethod
     def _extract_text(body: Dict[str, Any]) -> Tuple[str, Optional[str]]:
@@ -867,14 +1038,75 @@ class WeComAdapter(BasePlatformAdapter):
         return "application/octet-stream"
 
     @staticmethod
-    def _normalize_content_type(content_type: str, filename: str) -> str:
+    def _detect_mime_from_bytes(data: bytes) -> Optional[str]:
+        """Detect MIME type from file magic bytes (aligned with OpenClaw detectMimeFromBufferSync)."""
+        if not data or len(data) < 3:
+            return None
+
+        # PNG
+        if (
+            len(data) >= 8
+            and data[0] == 0x89
+            and data[1] == 0x50
+            and data[2] == 0x4E
+            and data[3] == 0x47
+            and data[4] == 0x0D
+            and data[5] == 0x0A
+            and data[6] == 0x1A
+            and data[7] == 0x0A
+        ):
+            return "image/png"
+
+        # JPEG
+        if data[0] == 0xFF and data[1] == 0xD8 and data[2] == 0xFF:
+            return "image/jpeg"
+
+        # GIF
+        if data[:6] == b"GIF87a" or data[:6] == b"GIF89a":
+            return "image/gif"
+
+        # WEBP
+        if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+            return "image/webp"
+
+        # BMP
+        if data[0] == 0x42 and data[1] == 0x4D:
+            return "image/bmp"
+
+        # PDF
+        if data[:5] == b"%PDF-":
+            return "application/pdf"
+
+        # OGG
+        if data[:4] == b"OggS":
+            return "audio/ogg"
+
+        # WAV
+        if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WAVE":
+            return "audio/wav"
+
+        # MP3
+        if data[:3] == b"ID3" or (data[0] == 0xFF and len(data) > 1 and (data[1] & 0xE0) == 0xE0):
+            return "audio/mpeg"
+
+        # MP4/MOV
+        if len(data) >= 12 and data[4:8] == b"ftyp":
+            return "video/mp4"
+
+        return None
+
+    @staticmethod
+    def _normalize_content_type(content_type: str, filename: str, data: Optional[bytes] = None) -> str:
         normalized = str(content_type or "").split(";", 1)[0].strip().lower()
         guessed = WeComAdapter._guess_mime_type(filename)
-        if not normalized:
-            return guessed
-        if normalized in {"application/octet-stream", "text/plain"}:
-            return guessed
-        return normalized
+        magic = WeComAdapter._detect_mime_from_bytes(data) if data else None
+
+        # Priority: magic bytes > explicit content type > filename guess
+        if magic:
+            return magic
+        if normalized and normalized not in {"application/octet-stream", "text/plain"}:
+            return normalized
+        return guessed
 
     @staticmethod
     def _detect_wecom_media_type(content_type: str) -> str:
@@ -1058,7 +1290,7 @@ class WeComAdapter(BasePlatformAdapter):
             data, headers = await self._download_remote_bytes(source, max_bytes=ABSOLUTE_MAX_BYTES)
             content_disposition = headers.get("content-disposition")
             resolved_name = file_name or self._guess_filename(source, content_disposition, headers.get("content-type", ""))
-            content_type = self._normalize_content_type(headers.get("content-type", ""), resolved_name)
+            content_type = self._normalize_content_type(headers.get("content-type", ""), resolved_name, data)
             return data, content_type, resolved_name
 
         if parsed.scheme == "file":
@@ -1072,9 +1304,19 @@ class WeComAdapter(BasePlatformAdapter):
         if not local_path.exists() or not local_path.is_file():
             raise FileNotFoundError(f"Media file not found: {local_path}")
 
+        # Enforce media_local_roots whitelist if configured
+        allowed_roots = set()
+        for account in self._accounts:
+            for root in account.media_local_roots:
+                allowed_roots.add(Path(root).expanduser().resolve())
+        if allowed_roots:
+            resolved_local = local_path.resolve()
+            if not any(str(resolved_local).startswith(str(root)) for root in allowed_roots):
+                raise PermissionError(f"Media file {local_path} is outside allowed roots: {allowed_roots}")
+
         data = local_path.read_bytes()
         resolved_name = file_name or local_path.name
-        content_type = self._normalize_content_type("", resolved_name)
+        content_type = self._normalize_content_type("", resolved_name, data)
         return data, content_type, resolved_name
 
     async def _prepare_outbound_media(
@@ -1303,7 +1545,25 @@ class WeComAdapter(BasePlatformAdapter):
         try:
             reply_req_id = self._reply_req_id_for_message(reply_to)
             if reply_req_id:
-                response = await self._send_reply_stream(reply_req_id, content)
+                try:
+                    response = await self._send_reply_stream(reply_req_id, content)
+                except RuntimeError as exc:
+                    err_text = str(exc)
+                    if "846608" in err_text:
+                        logger.warning(
+                            "[%s] Stream reply expired (846608) for req_id=%s, falling back to proactive send",
+                            self.name, reply_req_id,
+                        )
+                        response = await self._send_request(
+                            APP_CMD_SEND,
+                            {
+                                "chatid": chat_id,
+                                "msgtype": "markdown",
+                                "markdown": {"content": content[:self.MAX_MESSAGE_LENGTH]},
+                            },
+                        )
+                    else:
+                        raise
             else:
                 response = await self._send_request(
                     APP_CMD_SEND,

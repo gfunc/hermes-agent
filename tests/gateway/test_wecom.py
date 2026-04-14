@@ -225,6 +225,42 @@ class TestCallbackDispatch:
 
         adapter._on_message.assert_awaited_once()
 
+    @pytest.mark.asyncio
+    async def test_dispatch_routes_event_callback(self):
+        from gateway.platforms.wecom import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._on_message = AsyncMock()
+
+        await adapter._dispatch_payload(
+            {"cmd": "aibot_event_callback", "headers": {"req_id": "req-event"}, "body": {"msgtype": "event"}}
+        )
+
+        adapter._on_message.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_event_callback_does_not_store_reply_req_id(self):
+        from gateway.platforms.wecom import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter.handle_message = AsyncMock()
+
+        payload = {
+            "cmd": "aibot_event_callback",
+            "headers": {"req_id": "req-event"},
+            "body": {
+                "msgid": "msg-event",
+                "msgtype": "event",
+                "chatid": "group-1",
+                "chattype": "group",
+                "from": {"userid": "user-1"},
+            },
+        }
+
+        await adapter._on_message(payload)
+
+        assert adapter._reply_req_ids.get("msg-event") is None
+
 
 class TestPolicyHelpers:
     def test_dm_allowlist(self):
@@ -263,6 +299,62 @@ class TestMediaHelpers:
         assert WeComAdapter._detect_wecom_media_type("video/mp4") == "video"
         assert WeComAdapter._detect_wecom_media_type("audio/amr") == "voice"
         assert WeComAdapter._detect_wecom_media_type("application/pdf") == "file"
+
+    def test_detect_mime_from_bytes_png(self):
+        from gateway.platforms.wecom import WeComAdapter
+
+        png_header = b"\x89PNG\r\n\x1a\n" + b"\x00" * 10
+        assert WeComAdapter._detect_mime_from_bytes(png_header) == "image/png"
+
+    def test_detect_mime_from_bytes_jpeg(self):
+        from gateway.platforms.wecom import WeComAdapter
+
+        assert WeComAdapter._detect_mime_from_bytes(b"\xff\xd8\xff") == "image/jpeg"
+
+    def test_detect_mime_from_bytes_pdf(self):
+        from gateway.platforms.wecom import WeComAdapter
+
+        assert WeComAdapter._detect_mime_from_bytes(b"%PDF-1.4") == "application/pdf"
+
+    def test_detect_mime_from_bytes_mp4(self):
+        from gateway.platforms.wecom import WeComAdapter
+
+        mp4_header = b"\x00\x00\x00\x20ftypisom"
+        assert WeComAdapter._detect_mime_from_bytes(mp4_header) == "video/mp4"
+
+    def test_normalize_content_type_prefers_magic_bytes_over_guess(self):
+        from gateway.platforms.wecom import WeComAdapter
+
+        # A PNG file with a .txt extension should still be detected as image/png
+        result = WeComAdapter._normalize_content_type("", "fake.txt", b"\x89PNG\r\n\x1a\n")
+        assert result == "image/png"
+
+    @pytest.mark.asyncio
+    async def test_load_outbound_media_enforces_local_roots(self, tmp_path):
+        from gateway.platforms.wecom import WeComAdapter
+
+        allowed = tmp_path / "allowed"
+        allowed.mkdir()
+        file_path = allowed / "test.txt"
+        file_path.write_text("hello")
+
+        blocked = tmp_path / "blocked"
+        blocked.mkdir()
+        blocked_file = blocked / "secret.txt"
+        blocked_file.write_text("secret")
+
+        adapter = WeComAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={"media_local_roots": [str(allowed)]},
+            )
+        )
+
+        data, ct, name = await adapter._load_outbound_media(str(file_path))
+        assert name == "test.txt"
+
+        with pytest.raises(PermissionError):
+            await adapter._load_outbound_media(str(blocked_file))
 
     def test_voice_non_amr_downgrades_to_file(self):
         from gateway.platforms.wecom import WeComAdapter
@@ -455,6 +547,30 @@ class TestSend:
         assert "40001" in (result.error or "")
 
     @pytest.mark.asyncio
+    async def test_send_falls_back_to_proactive_on_846608(self):
+        from gateway.platforms.wecom import APP_CMD_SEND, WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._reply_req_ids["msg-1"] = "req-1"
+        adapter._send_reply_stream = AsyncMock(
+            side_effect=RuntimeError("send reply stream failed: errcode=846608")
+        )
+        adapter._send_request = AsyncMock(return_value={"headers": {"req_id": "req-2"}, "errcode": 0})
+
+        result = await adapter.send("chat-123", "stream expired", reply_to="msg-1")
+
+        assert result.success is True
+        adapter._send_reply_stream.assert_awaited_once()
+        adapter._send_request.assert_awaited_once_with(
+            APP_CMD_SEND,
+            {
+                "chatid": "chat-123",
+                "msgtype": "markdown",
+                "markdown": {"content": "stream expired"},
+            },
+        )
+
+    @pytest.mark.asyncio
     async def test_send_image_falls_back_to_text_for_remote_url(self):
         from gateway.platforms.wecom import WeComAdapter
 
@@ -507,9 +623,11 @@ class TestInboundMessages:
     async def test_on_message_builds_event(self):
         from gateway.platforms.wecom import WeComAdapter
 
+        from gateway.platforms.helpers import TextBatchAggregator
+
         adapter = WeComAdapter(PlatformConfig(enabled=True))
-        adapter._text_batch_delay_seconds = 0  # disable batching for tests
         adapter.handle_message = AsyncMock()
+        adapter._text_batcher = TextBatchAggregator(handler=adapter.handle_message, batch_delay=0)
         adapter._extract_media = AsyncMock(return_value=(["/tmp/test.png"], ["image/png"]))
 
         payload = {
@@ -537,11 +655,12 @@ class TestInboundMessages:
 
     @pytest.mark.asyncio
     async def test_on_message_preserves_quote_context(self):
+        from gateway.platforms.helpers import TextBatchAggregator
         from gateway.platforms.wecom import WeComAdapter
 
         adapter = WeComAdapter(PlatformConfig(enabled=True))
-        adapter._text_batch_delay_seconds = 0  # disable batching for tests
         adapter.handle_message = AsyncMock()
+        adapter._text_batcher = TextBatchAggregator(handler=adapter.handle_message, batch_delay=0)
         adapter._extract_media = AsyncMock(return_value=([], []))
 
         payload = {

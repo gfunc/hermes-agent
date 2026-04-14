@@ -1,0 +1,236 @@
+"""Tests for WeCom Bot Webhook mode."""
+
+import json
+from unittest.mock import AsyncMock
+from xml.etree import ElementTree as ET
+
+import pytest
+
+from gateway.config import PlatformConfig
+from gateway.platforms.wecom import WeComAdapter
+from gateway.platforms.wecom_accounts import WeComAccount
+from gateway.platforms.wecom_crypto import WXBizMsgCrypt
+
+
+def _webhook_account(account_id="wh-acct", token="tok", aes_key="abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG"):
+    return WeComAccount(
+        account_id=account_id,
+        bot_id=f"bot-{account_id}",
+        token=token,
+        encoding_aes_key=aes_key,
+        corp_id="corp-1",
+        connection_mode="webhook",
+    )
+
+
+def _encrypt_json(crypt: WXBizMsgCrypt, data: dict) -> dict:
+    """Encrypt a JSON payload and return {encrypt, signature, timestamp, nonce}."""
+    xml = crypt.encrypt(json.dumps(data), nonce="nonce123", timestamp="123456")
+    root = ET.fromstring(xml)
+    return {
+        "encrypt": root.findtext("Encrypt", default=""),
+        "signature": root.findtext("MsgSignature", default=""),
+        "timestamp": root.findtext("TimeStamp", default=""),
+        "nonce": root.findtext("Nonce", default=""),
+    }
+
+
+class TestWebhookSignatureMatch:
+    def test_no_match_returns_none(self):
+        adapter = WeComAdapter(PlatformConfig(enabled=True, extra={
+            "accounts": [{"account_id": "a", "token": "t1", "encoding_aes_key": "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG", "connection_mode": "webhook"}]
+        }))
+        result = adapter._match_webhook_account("bad-sig", "1", "n", "enc")
+        assert result is None
+
+    def test_single_match_returns_account(self):
+        account = _webhook_account()
+        crypt = WXBizMsgCrypt(account.token, account.encoding_aes_key, account.corp_id)
+        xml = crypt.encrypt("hello", nonce="n1", timestamp="t1")
+        root = ET.fromstring(xml)
+        encrypt = root.findtext("Encrypt", default="")
+        sig = root.findtext("MsgSignature", default="")
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True, extra={
+            "accounts": [{"account_id": account.account_id, "token": account.token,
+                          "encoding_aes_key": account.encoding_aes_key, "corp_id": account.corp_id,
+                          "connection_mode": "webhook"}]
+        }))
+        result = adapter._match_webhook_account(sig, "t1", "n1", encrypt)
+        assert result is not None
+        assert result.account_id == account.account_id
+
+    def test_conflict_with_multiple_matches_returns_none(self):
+        # Two accounts with same token/aes key will both match
+        shared_token = "sharedtok"
+        shared_aes = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG"
+        corp_id = "corp-same"
+        crypt = WXBizMsgCrypt(shared_token, shared_aes, corp_id)
+        xml = crypt.encrypt("hello", nonce="n1", timestamp="t1")
+        root = ET.fromstring(xml)
+        encrypt = root.findtext("Encrypt", default="")
+        sig = root.findtext("MsgSignature", default="")
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True, extra={
+            "accounts": [
+                {"account_id": "a1", "token": shared_token, "encoding_aes_key": shared_aes,
+                 "corp_id": corp_id, "connection_mode": "webhook"},
+                {"account_id": "a2", "token": shared_token, "encoding_aes_key": shared_aes,
+                 "corp_id": corp_id, "connection_mode": "webhook"},
+            ]
+        }))
+        result = adapter._match_webhook_account(sig, "t1", "n1", encrypt)
+        assert result is None
+
+
+class TestWebhookVerify:
+    @pytest.mark.asyncio
+    async def test_verify_returns_echostr_for_valid_signature(self):
+        account = _webhook_account()
+        crypt = WXBizMsgCrypt(account.token, account.encoding_aes_key, account.corp_id)
+        xml = crypt.encrypt("test-echostr", nonce="n1", timestamp="t1")
+        root = ET.fromstring(xml)
+        encrypt = root.findtext("Encrypt", default="")
+        sig = root.findtext("MsgSignature", default="")
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True, extra={
+            "accounts": [{"account_id": account.account_id, "token": account.token,
+                          "encoding_aes_key": account.encoding_aes_key, "corp_id": account.corp_id,
+                          "connection_mode": "webhook"}]
+        }))
+
+        class FakeRequest:
+            query = {
+                "msg_signature": sig,
+                "timestamp": "t1",
+                "nonce": "n1",
+                "echostr": encrypt,
+            }
+
+        response = await adapter._handle_webhook_verify(FakeRequest())
+        assert response.text == "test-echostr"
+
+    @pytest.mark.asyncio
+    async def test_verify_rejects_invalid_signature(self):
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+
+        class FakeRequest:
+            query = {
+                "msg_signature": "bad-sig",
+                "timestamp": "1",
+                "nonce": "n",
+                "echostr": "enc",
+            }
+
+        response = await adapter._handle_webhook_verify(FakeRequest())
+        assert response.status == 403
+
+
+class TestWebhookCallback:
+    @pytest.mark.asyncio
+    async def test_callback_dispatches_text_message(self):
+        account = _webhook_account()
+        crypt = WXBizMsgCrypt(account.token, account.encoding_aes_key, account.corp_id)
+        payload = {"aibotid": account.bot_id, "msgtype": "text", "text": {"content": "hello"},
+                   "chatid": "c1", "from": {"userid": "u1"}, "msgid": "m1"}
+        enc = _encrypt_json(crypt, payload)
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True, extra={
+            "accounts": [{"account_id": account.account_id, "token": account.token,
+                          "encoding_aes_key": account.encoding_aes_key, "corp_id": account.corp_id,
+                          "bot_id": account.bot_id, "connection_mode": "webhook"}]
+        }))
+        adapter._on_message = AsyncMock()
+
+        class FakeRequest:
+            query = {"msg_signature": enc["signature"], "timestamp": enc["timestamp"], "nonce": enc["nonce"]}
+
+            async def json(self):
+                return {"encrypt": enc["encrypt"]}
+
+        response = await adapter._handle_webhook_callback(FakeRequest())
+        assert response.status == 200
+        adapter._on_message.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_callback_rejects_aibotid_mismatch(self):
+        account = _webhook_account()
+        crypt = WXBizMsgCrypt(account.token, account.encoding_aes_key, account.corp_id)
+        payload = {"aibotid": "wrong-bot", "msgtype": "text", "text": {"content": "hello"}}
+        enc = _encrypt_json(crypt, payload)
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True, extra={
+            "accounts": [{"account_id": account.account_id, "token": account.token,
+                          "encoding_aes_key": account.encoding_aes_key, "corp_id": account.corp_id,
+                          "bot_id": account.bot_id, "connection_mode": "webhook"}]
+        }))
+
+        class FakeRequest:
+            query = {"msg_signature": enc["signature"], "timestamp": enc["timestamp"], "nonce": enc["nonce"]}
+
+            async def json(self):
+                return {"encrypt": enc["encrypt"]}
+
+        response = await adapter._handle_webhook_callback(FakeRequest())
+        assert response.status == 403
+
+    @pytest.mark.asyncio
+    async def test_stream_refresh_returns_state(self):
+        account = _webhook_account()
+        crypt = WXBizMsgCrypt(account.token, account.encoding_aes_key, account.corp_id)
+        payload = {"msgtype": "stream_refresh", "stream_id": "s1"}
+        enc = _encrypt_json(crypt, payload)
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True, extra={
+            "accounts": [{"account_id": account.account_id, "token": account.token,
+                          "encoding_aes_key": account.encoding_aes_key, "corp_id": account.corp_id,
+                          "connection_mode": "webhook"}]
+        }))
+        adapter._stream_states["s1"] = {"content": "partial", "finished": True}
+
+        class FakeRequest:
+            query = {"msg_signature": enc["signature"], "timestamp": enc["timestamp"], "nonce": enc["nonce"]}
+
+            async def json(self):
+                return {"encrypt": enc["encrypt"]}
+
+        response = await adapter._handle_webhook_callback(FakeRequest())
+        assert response.status == 200
+        body = json.loads(response.text)
+        assert body["msgtype"] == "stream"
+        assert body["stream"]["finish"] is True
+        assert body["stream"]["content"] == "partial"
+
+    @pytest.mark.asyncio
+    async def test_enter_chat_returns_welcome_text(self):
+        account = _webhook_account()
+        account = WeComAccount(
+            account_id=account.account_id,
+            bot_id=account.bot_id,
+            token=account.token,
+            encoding_aes_key=account.encoding_aes_key,
+            corp_id=account.corp_id,
+            connection_mode="webhook",
+            welcome_text="Welcome!",
+        )
+        crypt = WXBizMsgCrypt(account.token, account.encoding_aes_key, account.corp_id)
+        payload = {"msgtype": "enter_chat"}
+        enc = _encrypt_json(crypt, payload)
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True, extra={
+            "accounts": [{"account_id": account.account_id, "token": account.token,
+                          "encoding_aes_key": account.encoding_aes_key, "corp_id": account.corp_id,
+                          "welcome_text": "Welcome!", "connection_mode": "webhook"}]
+        }))
+
+        class FakeRequest:
+            query = {"msg_signature": enc["signature"], "timestamp": enc["timestamp"], "nonce": enc["nonce"]}
+
+            async def json(self):
+                return {"encrypt": enc["encrypt"]}
+
+        response = await adapter._handle_webhook_callback(FakeRequest())
+        assert response.status == 200
+        body = json.loads(response.text)
+        assert body["msgtype"] == "markdown"
+        assert body["markdown"]["content"] == "Welcome!"

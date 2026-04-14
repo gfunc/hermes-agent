@@ -63,6 +63,14 @@ def _sha1_signature(token: str, timestamp: str, nonce: str, encrypt: str) -> str
     return hashlib.sha1("".join(parts).encode("utf-8")).hexdigest()
 
 
+def verify_signature(token: str, timestamp: str, nonce: str, encrypt: str, signature: str) -> bool:
+    """Verify a WeCom callback signature (used for both XML and JSON webhooks)."""
+    try:
+        return _sha1_signature(token, timestamp, nonce, encrypt) == signature
+    except Exception:
+        return False
+
+
 class WXBizMsgCrypt:
     """Minimal WeCom callback crypto helper compatible with BizMsgCrypt semantics."""
 
@@ -89,6 +97,13 @@ class WXBizMsgCrypt:
         expected = _sha1_signature(self.token, timestamp, nonce, encrypt)
         if expected != msg_signature:
             raise SignatureError("signature mismatch")
+        return self._decrypt_bytes(encrypt)
+
+    def decrypt_without_verify(self, encrypt: str) -> bytes:
+        """Decrypt payload without verifying signature (for pre-verified webhooks)."""
+        return self._decrypt_bytes(encrypt)
+
+    def _decrypt_bytes(self, encrypt: str) -> bytes:
         try:
             cipher_text = base64.b64decode(encrypt)
         except Exception as exc:
