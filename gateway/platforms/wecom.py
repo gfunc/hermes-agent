@@ -868,6 +868,13 @@ class WeComAdapter(BasePlatformAdapter):
 
         text, reply_text = self._extract_text(body)
 
+        # Template card event: handle gracefully without dispatching as normal message
+        msgtype = str(body.get("msgtype") or "").lower()
+        event_name = str(body.get("event") or "").lower() if msgtype == "event" else ""
+        if event_name == "template_card_event":
+            await self._handle_template_card_event(body)
+            return
+
         # Command authorization check
         account = self._accounts[0] if self._accounts else WeComAccount(account_id="default")
         auth = resolve_command_auth(account, text, sender_id)
@@ -923,6 +930,28 @@ class WeComAdapter(BasePlatformAdapter):
             self._text_batcher.enqueue(event, key)
         else:
             await self.handle_message(event)
+
+    async def _handle_template_card_event(self, body: Dict[str, Any]) -> None:
+        from gateway.platforms.wecom_template_cards import get_template_card_from_cache
+
+        event = body.get("event") if isinstance(body.get("event"), dict) else {}
+        response_code = str(event.get("response_code") or "").strip()
+        button_replace_name = str(event.get("button_replace_name") or "").strip()
+        selected_options = event.get("selected_options")
+        selected_option_ids = (
+            [str(opt.get("key") or "") for opt in selected_options if isinstance(opt, dict)]
+            if isinstance(selected_options, list)
+            else []
+        )
+
+        account = self._accounts[0] if self._accounts else None
+        if not account:
+            return
+
+        logger.debug(
+            "[%s] Template card event received: response_code=%s selected=%s",
+            self.name, response_code, selected_option_ids,
+        )
 
     # ------------------------------------------------------------------
     # Text message aggregation (handles WeCom client-side splits)
@@ -1216,6 +1245,58 @@ class WeComAdapter(BasePlatformAdapter):
         if Path(filename).suffix.lower() == ".amr":
             return "audio/amr"
         return "application/octet-stream"
+
+    @staticmethod
+    def _chunk_markdown_text(text: str, chunk_limit: int = MAX_MESSAGE_LENGTH) -> List[str]:
+        """Split markdown text into chunks that fit within WeCom's message limit.
+
+        Prefers splitting on paragraph boundaries (double newlines) to keep formatting
+        readable. Falls back to sentence and then character boundaries.
+        """
+        if not text:
+            return []
+        if len(text) <= chunk_limit:
+            return [text]
+
+        chunks: List[str] = []
+        remaining = text.strip()
+
+        while remaining:
+            if len(remaining) <= chunk_limit:
+                chunks.append(remaining)
+                break
+
+            # Try paragraph boundary first
+            candidate = remaining[:chunk_limit]
+            para_break = candidate.rfind("\n\n")
+            if para_break > chunk_limit // 4:
+                split_at = para_break
+                chunks.append(remaining[:split_at].strip())
+                remaining = remaining[split_at + 2 :].strip()
+                continue
+
+            # Try single newline
+            line_break = candidate.rfind("\n")
+            if line_break > chunk_limit // 4:
+                split_at = line_break
+                chunks.append(remaining[:split_at].strip())
+                remaining = remaining[split_at + 1 :].strip()
+                continue
+
+            # Try sentence boundary
+            sentence_break = candidate.rfind("。")
+            if sentence_break > chunk_limit // 4:
+                split_at = sentence_break + 1
+                chunks.append(remaining[:split_at].strip())
+                remaining = remaining[split_at:].strip()
+                continue
+
+            # Fallback: hard split at limit with ellipsis if mid-word
+            split_at = chunk_limit
+            chunks.append(remaining[:split_at].strip())
+            remaining = remaining[split_at:].strip()
+
+        return chunks
 
     @staticmethod
     def _detect_mime_from_bytes(data: bytes) -> Optional[str]:
@@ -1742,52 +1823,95 @@ class WeComAdapter(BasePlatformAdapter):
         if not chat_id:
             return SendResult(success=False, error="chat_id is required")
 
+        # Extract template cards if present
+        from gateway.platforms.wecom_template_cards import extract_template_cards, save_template_card_to_cache
+
+        card_result = extract_template_cards(content)
+        content = card_result.remaining_text or content
+
         try:
             reply_req_id = self._reply_req_id_for_message(reply_to)
-            if reply_req_id:
+            chunks = self._chunk_markdown_text(content, chunk_limit=self.MAX_MESSAGE_LENGTH)
+            if not chunks:
+                return SendResult(success=False, error="empty content")
+
+            last_response: Optional[Dict[str, Any]] = None
+            last_error: Optional[str] = None
+
+            for idx, chunk in enumerate(chunks):
+                is_last = idx == len(chunks) - 1
+                if reply_req_id and is_last:
+                    try:
+                        response = await self._send_reply_stream(reply_req_id, chunk)
+                    except RuntimeError as exc:
+                        err_text = str(exc)
+                        if "846608" in err_text:
+                            logger.warning(
+                                "[%s] Stream reply expired (846608) for req_id=%s, falling back to proactive send",
+                                self.name, reply_req_id,
+                            )
+                            response = await self._send_request(
+                                APP_CMD_SEND,
+                                {
+                                    "chatid": chat_id,
+                                    "msgtype": "markdown",
+                                    "markdown": {"content": chunk},
+                                },
+                            )
+                        else:
+                            raise
+                else:
+                    response = await self._send_request(
+                        APP_CMD_SEND,
+                        {
+                            "chatid": chat_id,
+                            "msgtype": "markdown",
+                            "markdown": {"content": chunk},
+                        },
+                    )
+                last_response = response
+                error = self._response_error(response)
+                if error:
+                    last_error = error
+                    break
+
+            if last_error:
+                return SendResult(success=False, error=last_error)
+
+            # Send extracted template cards after text chunks
+            account = self._accounts[0] if self._accounts else None
+            for card in card_result.cards:
+                if account:
+                    save_template_card_to_cache(account.account_id, card)
                 try:
-                    response = await self._send_reply_stream(reply_req_id, content)
-                except RuntimeError as exc:
-                    err_text = str(exc)
-                    if "846608" in err_text:
-                        logger.warning(
-                            "[%s] Stream reply expired (846608) for req_id=%s, falling back to proactive send",
-                            self.name, reply_req_id,
-                        )
-                        response = await self._send_request(
-                            APP_CMD_SEND,
-                            {
-                                "chatid": chat_id,
-                                "msgtype": "markdown",
-                                "markdown": {"content": content[:self.MAX_MESSAGE_LENGTH]},
-                            },
-                        )
-                    else:
-                        raise
-            else:
-                response = await self._send_request(
-                    APP_CMD_SEND,
-                    {
-                        "chatid": chat_id,
-                        "msgtype": "markdown",
-                        "markdown": {"content": content[:self.MAX_MESSAGE_LENGTH]},
-                    },
-                )
+                    card_response = await self._send_request(
+                        APP_CMD_SEND,
+                        {
+                            "chatid": chat_id,
+                            "msgtype": "template_card",
+                            "template_card": card,
+                        },
+                    )
+                    last_response = card_response
+                    error = self._response_error(card_response)
+                    if error:
+                        last_error = error
+                        break
+                except Exception as exc:
+                    logger.warning("[%s] Failed to send template card: %s", self.name, exc)
+
+            if last_error:
+                return SendResult(success=False, error=last_error)
+            return SendResult(
+                success=True,
+                message_id=self._payload_req_id(last_response) if last_response else uuid.uuid4().hex[:12],
+                raw_response=last_response,
+            )
         except asyncio.TimeoutError:
             return SendResult(success=False, error="Timeout sending message to WeCom")
         except Exception as exc:
             logger.error("[%s] Send failed: %s", self.name, exc)
             return SendResult(success=False, error=str(exc))
-
-        error = self._response_error(response)
-        if error:
-            return SendResult(success=False, error=error)
-
-        return SendResult(
-            success=True,
-            message_id=self._payload_req_id(response) or uuid.uuid4().hex[:12],
-            raw_response=response,
-        )
 
     async def send_thinking(
         self,

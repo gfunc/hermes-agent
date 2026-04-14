@@ -967,3 +967,73 @@ async def test_on_message_respects_group_disabled_policy():
 
     await adapter._on_message(payload)
     adapter.handle_message.assert_not_awaited()
+
+
+def test_chunk_markdown_splits_at_limit():
+    from gateway.platforms.wecom import WeComAdapter
+
+    long_text = "A" * 5000 + "\n\n" + "B" * 5000
+    chunks = WeComAdapter._chunk_markdown_text(long_text, chunk_limit=4000)
+    assert len(chunks) >= 2
+    assert all(len(c) <= 4000 for c in chunks)
+    assert chunks[0].startswith("A" * 100)
+    assert chunks[-1].startswith("B" * 100)
+
+
+@pytest.mark.asyncio
+async def test_send_chunks_long_text():
+    from gateway.config import PlatformConfig
+    from gateway.platforms.wecom import WeComAdapter
+
+    config = PlatformConfig(extra={"bot_id": "b", "secret": "s"})
+    adapter = WeComAdapter(config)
+    adapter._send_request = AsyncMock(return_value={"headers": {"req_id": "r1"}, "body": {"errcode": 0}})
+
+    long_text = "A" * 5000 + "\n\n" + "B" * 5000
+    result = await adapter.send("chat-1", long_text)
+    assert result.success is True
+    assert adapter._send_request.await_count >= 2
+
+
+@pytest.mark.asyncio
+async def test_send_extracts_and_sends_template_card():
+    from gateway.config import PlatformConfig
+    from gateway.platforms.wecom import WeComAdapter
+
+    config = PlatformConfig(extra={"bot_id": "b", "secret": "s"})
+    adapter = WeComAdapter(config)
+    adapter._send_request = AsyncMock(return_value={"headers": {"req_id": "r1"}, "body": {"errcode": 0}})
+
+    content = 'hello\n```json\n{"card_type":"text_notice","task_id":"t1"}\n```'
+    result = await adapter.send("chat-1", content)
+    assert result.success is True
+    # Should send markdown text first, then template card
+    assert adapter._send_request.await_count == 2
+    second_call = adapter._send_request.await_args_list[-1].args[1]
+    assert second_call["msgtype"] == "template_card"
+    assert second_call["template_card"]["card_type"] == "text_notice"
+
+
+@pytest.mark.asyncio
+async def test_template_card_event_is_handled_gracefully():
+    from gateway.config import PlatformConfig
+    from gateway.platforms.wecom import WeComAdapter
+
+    config = PlatformConfig(extra={"bot_id": "b", "secret": "s"})
+    adapter = WeComAdapter(config)
+    adapter.handle_message = AsyncMock()
+
+    payload = {
+        "cmd": "aibot_event_callback",
+        "headers": {"req_id": "req-1"},
+        "body": {
+            "msgid": "m1",
+            "msgtype": "event",
+            "event": "template_card_event",
+            "chatid": "c1",
+            "from": {"userid": "u1"},
+        },
+    }
+    await adapter._on_message(payload)
+    # Should not crash and should not dispatch as normal message
+    adapter.handle_message.assert_not_awaited()
