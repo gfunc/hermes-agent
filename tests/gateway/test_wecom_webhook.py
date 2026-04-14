@@ -293,3 +293,32 @@ class TestWebhookCallback:
         body = json.loads(response.text)
         assert body["msgtype"] == "text"
         assert "没有权限" in body["text"]["content"]
+
+
+
+@pytest.mark.asyncio
+async def test_stream_refresh_near_timeout_triggers_fallback():
+    import time
+    from gateway.platforms.wecom_stream_store import StreamStore
+
+    adapter = WeComAdapter(PlatformConfig(enabled=True, extra={
+        "accounts": [{"account_id": "a1", "bot_id": "b1", "token": "t", "encoding_aes_key": "k", "corp_id": "c1", "connection_mode": "webhook"}]
+    }))
+    adapter._send_request = AsyncMock(return_value={"headers": {"req_id": "r1"}, "body": {"errcode": 0}})
+
+    store = StreamStore(flush_handler=adapter._on_webhook_flush)
+    adapter._stream_store = store
+    stream_id = store.create_stream()
+    store.mark_started(stream_id)
+    stream = store.get_stream(stream_id)
+    stream.started_at = time.time() - 310
+    stream.content = "near timeout result"
+    stream.finished = True
+
+    from gateway.platforms.wecom_accounts import WeComAccount
+    account = WeComAccount(account_id="a1", bot_id="b1")
+    response = await adapter._handle_stream_refresh(account, "c1", stream_id)
+    assert response.status == 200
+    body = json.loads(response.text)
+    assert body["stream"]["content"] == "near timeout result"
+    adapter._send_request.assert_awaited_once()

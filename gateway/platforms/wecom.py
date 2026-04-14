@@ -37,6 +37,7 @@ import logging
 import mimetypes
 import os
 import re
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -514,22 +515,10 @@ class WeComAdapter(BasePlatformAdapter):
             return web.json_response({"errcode": 0, "errmsg": "ok"})
 
         elif msgtype == "stream_refresh":
-            if self._stream_store:
-                stream_id = str(decrypted.get("stream_id") or "")
-                stream = self._stream_store.get_stream(stream_id) or self._stream_store.get_stream_by_msgid(stream_id)
-                if stream:
-                    return web.json_response({
-                        "msgtype": "stream",
-                        "stream": {
-                            "id": stream_id,
-                            "finish": stream.finished,
-                            "content": stream.content,
-                        },
-                    })
-                return web.json_response({
-                    "msgtype": "stream",
-                    "stream": {"id": stream_id, "finish": True, "content": ""},
-                })
+            sender_id = str(decrypted.get("from", {}).get("userid") or "").strip()
+            chat_id = str(decrypted.get("chatid") or sender_id).strip()
+            stream_id = str(decrypted.get("stream_id") or "")
+            return await self._handle_stream_refresh(account, chat_id, stream_id)
 
         elif msgtype == "enter_chat":
             welcome = account.welcome_text or "你好，有什么可以帮你的？"
@@ -539,6 +528,49 @@ class WeComAdapter(BasePlatformAdapter):
             })
 
         return web.json_response({"errcode": 0, "errmsg": "ok"})
+
+    async def _handle_stream_refresh(
+        self,
+        account: WeComAccount,
+        chat_id: str,
+        stream_id: str,
+    ) -> "web.Response":
+        if not self._stream_store:
+            return web.json_response({
+                "msgtype": "stream",
+                "stream": {"id": stream_id, "finish": True, "content": ""},
+            })
+        stream = self._stream_store.get_stream(stream_id) or self._stream_store.get_stream_by_msgid(stream_id)
+        if not stream:
+            return web.json_response({
+                "msgtype": "stream",
+                "stream": {"id": stream_id, "finish": True, "content": ""},
+            })
+
+        # Near-timeout fallback: if we're close to WeCom's 6-minute limit, proactively send
+        if stream.finished and self._stream_store.is_near_timeout(stream_id, timeout_seconds=360, margin_seconds=60):
+            if not stream.fallback_prompt_sent_at:
+                stream.fallback_prompt_sent_at = time.time()
+                try:
+                    await self._send_request(
+                        APP_CMD_SEND,
+                        {
+                            "chatid": chat_id,
+                            "msgtype": "text",
+                            "text": {"content": stream.content},
+                        },
+                    )
+                except Exception as exc:
+                    logger.warning("[%s] Failed to send near-timeout fallback: %s", self.name, exc)
+
+        return web.json_response({
+            "msgtype": "stream",
+            "stream": {
+                "id": stream_id,
+                "finish": stream.finished,
+                "content": stream.content,
+            },
+        })
 
     def _match_webhook_account(self, signature: str, timestamp: str, nonce: str, encrypt: str) -> Optional[WeComAccount]:
         """Try all webhook accounts and return the one whose signature matches."""

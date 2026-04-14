@@ -49,3 +49,17 @@ def test_ack_streams_for_batch():
     store.add_ack_stream_for_batch("batch-1", "ack-2")
     assert store.drain_ack_streams_for_batch("batch-1") == ["ack-1", "ack-2"]
     assert store.drain_ack_streams_for_batch("batch-1") == []
+
+
+def test_stream_is_near_timeout():
+    import time
+    from gateway.platforms.wecom_stream_store import StreamState
+
+    async def flush_handler(pending):
+        pass
+
+    store = StreamStore(flush_handler=flush_handler)
+    stream = StreamState(stream_id="s1", started=True, started_at=time.time() - 310)
+    store._streams["s1"] = stream
+    assert store.is_near_timeout("s1", timeout_seconds=360, margin_seconds=60) is True
+    assert store.is_near_timeout("s2", timeout_seconds=360, margin_seconds=60) is False

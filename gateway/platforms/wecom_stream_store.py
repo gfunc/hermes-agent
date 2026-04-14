@@ -17,6 +17,7 @@ class StreamState:
     finished: bool = False
     started: bool = False
     created_at: float = field(default_factory=time.time)
+    started_at: Optional[float] = None
     user_id: str = ""
     chat_type: str = "direct"
     chat_id: str = ""
@@ -94,11 +95,26 @@ class StreamStore:
         stream = self._streams.get(stream_id)
         if stream:
             stream.started = True
+            if stream.started_at is None:
+                stream.started_at = time.time()
 
     def mark_finished(self, stream_id: str) -> None:
         stream = self._streams.get(stream_id)
         if stream:
             stream.finished = True
+
+    def is_near_timeout(
+        self,
+        stream_id: str,
+        timeout_seconds: float = 360,
+        margin_seconds: float = 60,
+    ) -> bool:
+        stream = self._streams.get(stream_id)
+        if not stream or not stream.started:
+            return False
+        started_at = stream.started_at or stream.created_at
+        elapsed = time.time() - started_at
+        return elapsed >= (timeout_seconds - margin_seconds)
 
     def get_stream_by_msgid(self, msgid: str) -> Optional[str]:
         return self._msgid_to_stream.get(msgid)
