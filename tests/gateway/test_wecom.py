@@ -771,7 +771,7 @@ class TestMediaPreparerIntegration:
                     mock_send_media.return_value = {"headers": {"req_id": "r1"}}
                     result = await adapter.send_image_file("chat-1", "/tmp/img.png")
                     assert result.success is True
-                    mock_prep.prepare.assert_awaited_once_with("/tmp/img.png", None)
+                    mock_prep.prepare.assert_awaited_once_with("/tmp/img.png", file_name=None)
 
 
 class TestPlatformEnum:
