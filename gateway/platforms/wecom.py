@@ -1789,6 +1789,16 @@ class WeComAdapter(BasePlatformAdapter):
             raw_response=response,
         )
 
+    async def send_thinking(
+        self,
+        chat_id: str,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send a thinking placeholder to indicate the bot is processing."""
+        del metadata
+        return await self.send(chat_id, "<think></think>", reply_to=reply_to)
+
     async def send_image(
         self,
         chat_id: str,
