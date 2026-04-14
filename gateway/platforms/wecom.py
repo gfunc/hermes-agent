@@ -1038,14 +1038,75 @@ class WeComAdapter(BasePlatformAdapter):
         return "application/octet-stream"
 
     @staticmethod
-    def _normalize_content_type(content_type: str, filename: str) -> str:
+    def _detect_mime_from_bytes(data: bytes) -> Optional[str]:
+        """Detect MIME type from file magic bytes (aligned with OpenClaw detectMimeFromBufferSync)."""
+        if not data or len(data) < 3:
+            return None
+
+        # PNG
+        if (
+            len(data) >= 8
+            and data[0] == 0x89
+            and data[1] == 0x50
+            and data[2] == 0x4E
+            and data[3] == 0x47
+            and data[4] == 0x0D
+            and data[5] == 0x0A
+            and data[6] == 0x1A
+            and data[7] == 0x0A
+        ):
+            return "image/png"
+
+        # JPEG
+        if data[0] == 0xFF and data[1] == 0xD8 and data[2] == 0xFF:
+            return "image/jpeg"
+
+        # GIF
+        if data[:6] == b"GIF87a" or data[:6] == b"GIF89a":
+            return "image/gif"
+
+        # WEBP
+        if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+            return "image/webp"
+
+        # BMP
+        if data[0] == 0x42 and data[1] == 0x4D:
+            return "image/bmp"
+
+        # PDF
+        if data[:5] == b"%PDF-":
+            return "application/pdf"
+
+        # OGG
+        if data[:4] == b"OggS":
+            return "audio/ogg"
+
+        # WAV
+        if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WAVE":
+            return "audio/wav"
+
+        # MP3
+        if data[:3] == b"ID3" or (data[0] == 0xFF and len(data) > 1 and (data[1] & 0xE0) == 0xE0):
+            return "audio/mpeg"
+
+        # MP4/MOV
+        if len(data) >= 12 and data[4:8] == b"ftyp":
+            return "video/mp4"
+
+        return None
+
+    @staticmethod
+    def _normalize_content_type(content_type: str, filename: str, data: Optional[bytes] = None) -> str:
         normalized = str(content_type or "").split(";", 1)[0].strip().lower()
         guessed = WeComAdapter._guess_mime_type(filename)
-        if not normalized:
-            return guessed
-        if normalized in {"application/octet-stream", "text/plain"}:
-            return guessed
-        return normalized
+        magic = WeComAdapter._detect_mime_from_bytes(data) if data else None
+
+        # Priority: magic bytes > explicit content type > filename guess
+        if magic:
+            return magic
+        if normalized and normalized not in {"application/octet-stream", "text/plain"}:
+            return normalized
+        return guessed
 
     @staticmethod
     def _detect_wecom_media_type(content_type: str) -> str:
@@ -1229,7 +1290,7 @@ class WeComAdapter(BasePlatformAdapter):
             data, headers = await self._download_remote_bytes(source, max_bytes=ABSOLUTE_MAX_BYTES)
             content_disposition = headers.get("content-disposition")
             resolved_name = file_name or self._guess_filename(source, content_disposition, headers.get("content-type", ""))
-            content_type = self._normalize_content_type(headers.get("content-type", ""), resolved_name)
+            content_type = self._normalize_content_type(headers.get("content-type", ""), resolved_name, data)
             return data, content_type, resolved_name
 
         if parsed.scheme == "file":
@@ -1243,9 +1304,19 @@ class WeComAdapter(BasePlatformAdapter):
         if not local_path.exists() or not local_path.is_file():
             raise FileNotFoundError(f"Media file not found: {local_path}")
 
+        # Enforce media_local_roots whitelist if configured
+        allowed_roots = set()
+        for account in self._accounts:
+            for root in account.media_local_roots:
+                allowed_roots.add(Path(root).expanduser().resolve())
+        if allowed_roots:
+            resolved_local = local_path.resolve()
+            if not any(str(resolved_local).startswith(str(root)) for root in allowed_roots):
+                raise PermissionError(f"Media file {local_path} is outside allowed roots: {allowed_roots}")
+
         data = local_path.read_bytes()
         resolved_name = file_name or local_path.name
-        content_type = self._normalize_content_type("", resolved_name)
+        content_type = self._normalize_content_type("", resolved_name, data)
         return data, content_type, resolved_name
 
     async def _prepare_outbound_media(

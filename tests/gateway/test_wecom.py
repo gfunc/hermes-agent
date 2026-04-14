@@ -300,6 +300,62 @@ class TestMediaHelpers:
         assert WeComAdapter._detect_wecom_media_type("audio/amr") == "voice"
         assert WeComAdapter._detect_wecom_media_type("application/pdf") == "file"
 
+    def test_detect_mime_from_bytes_png(self):
+        from gateway.platforms.wecom import WeComAdapter
+
+        png_header = b"\x89PNG\r\n\x1a\n" + b"\x00" * 10
+        assert WeComAdapter._detect_mime_from_bytes(png_header) == "image/png"
+
+    def test_detect_mime_from_bytes_jpeg(self):
+        from gateway.platforms.wecom import WeComAdapter
+
+        assert WeComAdapter._detect_mime_from_bytes(b"\xff\xd8\xff") == "image/jpeg"
+
+    def test_detect_mime_from_bytes_pdf(self):
+        from gateway.platforms.wecom import WeComAdapter
+
+        assert WeComAdapter._detect_mime_from_bytes(b"%PDF-1.4") == "application/pdf"
+
+    def test_detect_mime_from_bytes_mp4(self):
+        from gateway.platforms.wecom import WeComAdapter
+
+        mp4_header = b"\x00\x00\x00\x20ftypisom"
+        assert WeComAdapter._detect_mime_from_bytes(mp4_header) == "video/mp4"
+
+    def test_normalize_content_type_prefers_magic_bytes_over_guess(self):
+        from gateway.platforms.wecom import WeComAdapter
+
+        # A PNG file with a .txt extension should still be detected as image/png
+        result = WeComAdapter._normalize_content_type("", "fake.txt", b"\x89PNG\r\n\x1a\n")
+        assert result == "image/png"
+
+    @pytest.mark.asyncio
+    async def test_load_outbound_media_enforces_local_roots(self, tmp_path):
+        from gateway.platforms.wecom import WeComAdapter
+
+        allowed = tmp_path / "allowed"
+        allowed.mkdir()
+        file_path = allowed / "test.txt"
+        file_path.write_text("hello")
+
+        blocked = tmp_path / "blocked"
+        blocked.mkdir()
+        blocked_file = blocked / "secret.txt"
+        blocked_file.write_text("secret")
+
+        adapter = WeComAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={"media_local_roots": [str(allowed)]},
+            )
+        )
+
+        data, ct, name = await adapter._load_outbound_media(str(file_path))
+        assert name == "test.txt"
+
+        with pytest.raises(PermissionError):
+            await adapter._load_outbound_media(str(blocked_file))
+
     def test_voice_non_amr_downgrades_to_file(self):
         from gateway.platforms.wecom import WeComAdapter
 
