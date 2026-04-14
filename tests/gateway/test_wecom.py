@@ -225,6 +225,42 @@ class TestCallbackDispatch:
 
         adapter._on_message.assert_awaited_once()
 
+    @pytest.mark.asyncio
+    async def test_dispatch_routes_event_callback(self):
+        from gateway.platforms.wecom import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._on_message = AsyncMock()
+
+        await adapter._dispatch_payload(
+            {"cmd": "aibot_event_callback", "headers": {"req_id": "req-event"}, "body": {"msgtype": "event"}}
+        )
+
+        adapter._on_message.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_event_callback_does_not_store_reply_req_id(self):
+        from gateway.platforms.wecom import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter.handle_message = AsyncMock()
+
+        payload = {
+            "cmd": "aibot_event_callback",
+            "headers": {"req_id": "req-event"},
+            "body": {
+                "msgid": "msg-event",
+                "msgtype": "event",
+                "chatid": "group-1",
+                "chattype": "group",
+                "from": {"userid": "user-1"},
+            },
+        }
+
+        await adapter._on_message(payload)
+
+        assert adapter._reply_req_ids.get("msg-event") is None
+
 
 class TestPolicyHelpers:
     def test_dm_allowlist(self):
@@ -453,6 +489,30 @@ class TestSend:
 
         assert result.success is False
         assert "40001" in (result.error or "")
+
+    @pytest.mark.asyncio
+    async def test_send_falls_back_to_proactive_on_846608(self):
+        from gateway.platforms.wecom import APP_CMD_SEND, WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._reply_req_ids["msg-1"] = "req-1"
+        adapter._send_reply_stream = AsyncMock(
+            side_effect=RuntimeError("send reply stream failed: errcode=846608")
+        )
+        adapter._send_request = AsyncMock(return_value={"headers": {"req_id": "req-2"}, "errcode": 0})
+
+        result = await adapter.send("chat-123", "stream expired", reply_to="msg-1")
+
+        assert result.success is True
+        adapter._send_reply_stream.assert_awaited_once()
+        adapter._send_request.assert_awaited_once_with(
+            APP_CMD_SEND,
+            {
+                "chatid": "chat-123",
+                "msgtype": "markdown",
+                "markdown": {"content": "stream expired"},
+            },
+        )
 
     @pytest.mark.asyncio
     async def test_send_image_falls_back_to_text_for_remote_url(self):

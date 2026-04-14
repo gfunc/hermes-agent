@@ -493,10 +493,10 @@ class WeComAdapter(BasePlatformAdapter):
                 future.set_result(payload)
             return
 
-        if cmd in CALLBACK_COMMANDS:
+        if cmd in CALLBACK_COMMANDS or cmd == APP_CMD_EVENT_CALLBACK:
             await self._on_message(payload)
             return
-        if cmd in {APP_CMD_PING, APP_CMD_EVENT_CALLBACK}:
+        if cmd == APP_CMD_PING:
             return
 
         logger.debug("[%s] Ignoring websocket payload: %s", self.name, cmd or payload)
@@ -589,7 +589,10 @@ class WeComAdapter(BasePlatformAdapter):
         if self._dedup.is_duplicate(msg_id):
             logger.debug("[%s] Duplicate message %s ignored", self.name, msg_id)
             return
-        self._remember_reply_req_id(msg_id, self._payload_req_id(payload))
+
+        # Event callbacks (e.g. template_card_event) don't have a valid req_id for passive reply.
+        if str(body.get("msgtype") or "").lower() != "event":
+            self._remember_reply_req_id(msg_id, self._payload_req_id(payload))
 
         sender = body.get("from") if isinstance(body.get("from"), dict) else {}
         sender_id = str(sender.get("userid") or "").strip()
@@ -1358,7 +1361,25 @@ class WeComAdapter(BasePlatformAdapter):
         try:
             reply_req_id = self._reply_req_id_for_message(reply_to)
             if reply_req_id:
-                response = await self._send_reply_stream(reply_req_id, content)
+                try:
+                    response = await self._send_reply_stream(reply_req_id, content)
+                except RuntimeError as exc:
+                    err_text = str(exc)
+                    if "846608" in err_text:
+                        logger.warning(
+                            "[%s] Stream reply expired (846608) for req_id=%s, falling back to proactive send",
+                            self.name, reply_req_id,
+                        )
+                        response = await self._send_request(
+                            APP_CMD_SEND,
+                            {
+                                "chatid": chat_id,
+                                "msgtype": "markdown",
+                                "markdown": {"content": content[:self.MAX_MESSAGE_LENGTH]},
+                            },
+                        )
+                    else:
+                        raise
             else:
                 response = await self._send_request(
                     APP_CMD_SEND,
