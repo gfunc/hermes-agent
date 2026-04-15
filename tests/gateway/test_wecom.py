@@ -1102,8 +1102,8 @@ async def test_send_typing_emits_thinking_placeholder():
 
 
 @pytest.mark.asyncio
-async def test_stop_typing_clears_state_without_sending():
-    """stop_typing only clears state — the response send closes the stream."""
+async def test_stop_typing_finishes_stream():
+    """stop_typing sends finish=True to close the typing animation."""
     from gateway.config import PlatformConfig
     from gateway.platforms.wecom import WeComAdapter
 
@@ -1116,8 +1116,13 @@ async def test_stop_typing_clears_state_without_sending():
     assert adapter._send_reply_request.await_count == 1
 
     await adapter.stop_typing("chat-typing")
-    # stop_typing should NOT send another frame
-    assert adapter._send_reply_request.await_count == 1
+    assert adapter._send_reply_request.await_count == 2
+    stop_call = adapter._send_reply_request.await_args_list[1]
+    assert stop_call.args[0] == "req-typing"
+    stop_body = stop_call.args[1]
+    assert stop_body["msgtype"] == "stream"
+    assert stop_body["stream"]["finish"] is True
+    assert stop_body["stream"]["content"] == ""
     # State should be cleared
     assert "chat-typing" not in adapter._typing_stream_state_by_chat
 
@@ -1147,6 +1152,8 @@ async def test_send_reply_stream_reuses_typing_stream_id():
     assert response_body["stream"]["content"] == "Hello!"
     # Typing state should be consumed
     assert "chat-typing" not in adapter._typing_stream_state_by_chat
+    # Typing should be paused to prevent _keep_typing from reopening
+    assert "chat-typing" in adapter._typing_paused
 
 
 @pytest.mark.asyncio

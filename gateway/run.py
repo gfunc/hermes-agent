@@ -3845,14 +3845,6 @@ class GatewayRunner:
                 event_message_id=event.message_id,
             )
 
-            # Stop persistent typing indicator now that the agent is done
-            try:
-                _typing_adapter = self.adapters.get(source.platform)
-                if _typing_adapter and hasattr(_typing_adapter, "stop_typing"):
-                    await _typing_adapter.stop_typing(source.chat_id)
-            except Exception:
-                pass
-
             response = agent_result.get("final_response") or ""
             agent_messages = agent_result.get("messages", [])
             _response_time = time.time() - _msg_start_time

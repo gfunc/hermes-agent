@@ -1721,6 +1721,10 @@ class WeComAdapter(BasePlatformAdapter):
             state = self._typing_stream_state_by_chat.pop(chat_id, None)
             if state and state[0] == reply_req_id:
                 stream_id = state[1]
+            # Prevent _keep_typing from opening a new stream after this
+            # response closes the current one.  The typing_paused set is
+            # cleared by _keep_typing's finally block.
+            self._typing_paused.add(chat_id)
         if not stream_id:
             stream_id = self._new_req_id("stream")
 
@@ -2123,14 +2127,36 @@ class WeComAdapter(BasePlatformAdapter):
             logger.debug("[%s] Failed to send typing placeholder to %s: %s", self.name, chat_id, exc)
 
     async def stop_typing(self, chat_id: str) -> None:
-        """Clear WeCom typing stream state for this chat.
+        """Close any active WeCom typing stream for this chat.
 
-        Does NOT send a finish frame — the final response's
-        ``_send_reply_stream`` reuses the typing stream_id and closes it
-        with ``finish=True`` + real content (matching the plugin pattern).
-        If no response is sent, WeCom's 6-minute stream TTL cleans up.
+        Sends ``finish=True`` with empty content so the three-dot animation
+        disappears.  Called from ``_keep_typing``'s finally block and from
+        ``_process_message_background``'s finally block as a safety net.
+
+        When the response is delivered via ``_send_reply_stream``, that method
+        pauses typing and pops the state *before* this runs, so this becomes
+        a harmless no-op in the normal success path.
         """
-        self._typing_stream_state_by_chat.pop(chat_id, None)
+        state = self._typing_stream_state_by_chat.pop(chat_id, None)
+        if not state:
+            return
+
+        reply_req_id, stream_id = state
+        try:
+            response = await self._send_reply_request(
+                reply_req_id,
+                {
+                    "msgtype": "stream",
+                    "stream": {
+                        "id": stream_id,
+                        "finish": True,
+                        "content": "",
+                    },
+                },
+            )
+            self._raise_for_wecom_error(response, "stop typing stream")
+        except Exception as exc:
+            logger.debug("[%s] Failed to stop typing placeholder for %s: %s", self.name, chat_id, exc)
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Return minimal chat info."""
