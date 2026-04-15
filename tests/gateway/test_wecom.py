@@ -1082,6 +1082,23 @@ async def test_send_thinking_placeholder():
 
 
 @pytest.mark.asyncio
+async def test_send_typing_emits_thinking_placeholder():
+    from gateway.config import PlatformConfig
+    from gateway.platforms.wecom import WeComAdapter
+
+    config = PlatformConfig(extra={"bot_id": "b", "secret": "s"})
+    adapter = WeComAdapter(config)
+    adapter._send_request = AsyncMock(return_value={"headers": {"req_id": "r1"}, "body": {"errcode": 0}})
+
+    await adapter.send_typing("chat-typing")
+
+    adapter._send_request.assert_awaited_once()
+    call_args = adapter._send_request.await_args.args[1]
+    assert call_args["msgtype"] == "markdown"
+    assert call_args["markdown"]["content"] == "<think></think>"
+
+
+@pytest.mark.asyncio
 async def test_on_message_respects_group_disabled_policy():
     from gateway.config import PlatformConfig
     from gateway.platforms.wecom import WeComAdapter

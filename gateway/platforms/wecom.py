@@ -2064,8 +2064,14 @@ class WeComAdapter(BasePlatformAdapter):
         )
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
-        """WeCom does not expose typing indicators in this adapter."""
-        del chat_id, metadata
+        """Emit WeCom's thinking placeholder so clients show waiting animation."""
+        del metadata
+        if not chat_id:
+            return
+        try:
+            await self.send_thinking(chat_id)
+        except Exception as exc:
+            logger.debug("[%s] Failed to send typing placeholder to %s: %s", self.name, chat_id, exc)
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Return minimal chat info."""
