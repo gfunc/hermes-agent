@@ -7820,8 +7820,12 @@ class GatewayRunner:
             else bool(_plat_streaming)
         )
 
-        if source.thread_id:
-            _thread_metadata: Optional[Dict[str, Any]] = {"thread_id": source.thread_id}
+        if source.thread_id or event_message_id:
+            _thread_metadata = {}
+            if source.thread_id:
+                _thread_metadata["thread_id"] = source.thread_id
+            if event_message_id:
+                _thread_metadata["message_id"] = event_message_id
         else:
             _thread_metadata = None
 
@@ -8125,7 +8129,14 @@ class GatewayRunner:
             _progress_thread_id = source.thread_id or event_message_id
         else:
             _progress_thread_id = source.thread_id
-        _progress_metadata = {"thread_id": _progress_thread_id} if _progress_thread_id else None
+        if _progress_thread_id or event_message_id:
+            _progress_metadata = {}
+            if _progress_thread_id:
+                _progress_metadata["thread_id"] = _progress_thread_id
+            if event_message_id:
+                _progress_metadata["message_id"] = event_message_id
+        else:
+            _progress_metadata = None
 
         async def send_progress_messages():
             if not progress_queue:

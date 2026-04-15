@@ -1088,14 +1088,53 @@ async def test_send_typing_emits_thinking_placeholder():
 
     config = PlatformConfig(extra={"bot_id": "b", "secret": "s"})
     adapter = WeComAdapter(config)
-    adapter._send_request = AsyncMock(return_value={"headers": {"req_id": "r1"}, "body": {"errcode": 0}})
+    adapter._send_reply_request = AsyncMock(return_value={"headers": {"req_id": "r1"}, "body": {"errcode": 0}})
+    adapter._remember_reply_req_id("msg-typing", "req-typing")
 
-    await adapter.send_typing("chat-typing")
+    await adapter.send_typing("chat-typing", metadata={"message_id": "msg-typing"})
 
-    adapter._send_request.assert_awaited_once()
-    call_args = adapter._send_request.await_args.args[1]
-    assert call_args["msgtype"] == "markdown"
-    assert call_args["markdown"]["content"] == "<think></think>"
+    adapter._send_reply_request.assert_awaited_once()
+    assert adapter._send_reply_request.await_args.args[0] == "req-typing"
+    call_args = adapter._send_reply_request.await_args.args[1]
+    assert call_args["msgtype"] == "stream"
+    assert call_args["stream"]["finish"] is False
+    assert call_args["stream"]["content"] == "<think></think>"
+
+
+@pytest.mark.asyncio
+async def test_stop_typing_finishes_stream():
+    from gateway.config import PlatformConfig
+    from gateway.platforms.wecom import WeComAdapter
+
+    config = PlatformConfig(extra={"bot_id": "b", "secret": "s"})
+    adapter = WeComAdapter(config)
+    adapter._send_reply_request = AsyncMock(return_value={"headers": {"req_id": "r1"}, "body": {"errcode": 0}})
+    adapter._remember_reply_req_id("msg-typing", "req-typing")
+
+    await adapter.send_typing("chat-typing", metadata={"message_id": "msg-typing"})
+    await adapter.stop_typing("chat-typing")
+
+    assert adapter._send_reply_request.await_count == 2
+    stop_call = adapter._send_reply_request.await_args_list[1]
+    assert stop_call.args[0] == "req-typing"
+    stop_body = stop_call.args[1]
+    assert stop_body["msgtype"] == "stream"
+    assert stop_body["stream"]["finish"] is True
+    assert stop_body["stream"]["content"] == ""
+
+
+@pytest.mark.asyncio
+async def test_send_typing_without_message_id_is_noop():
+    from gateway.config import PlatformConfig
+    from gateway.platforms.wecom import WeComAdapter
+
+    config = PlatformConfig(extra={"bot_id": "b", "secret": "s"})
+    adapter = WeComAdapter(config)
+    adapter._send_reply_request = AsyncMock(return_value={"headers": {"req_id": "r1"}, "body": {"errcode": 0}})
+
+    await adapter.send_typing("chat-typing", metadata=None)
+
+    adapter._send_reply_request.assert_not_awaited()
 
 
 @pytest.mark.asyncio

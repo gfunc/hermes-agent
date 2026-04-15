@@ -191,6 +191,7 @@ class WeComAdapter(BasePlatformAdapter):
         self._stream_states: Dict[str, Dict[str, Any]] = {}
         self._stream_store: Optional[StreamStore] = None
         self._mcp_configs: Dict[str, str] = {}
+        self._typing_stream_state_by_chat: Dict[str, Tuple[str, str]] = {}
 
         # Text batching via shared aggregator
         batch_delay = float(os.getenv("HERMES_WECOM_TEXT_BATCH_DELAY_SECONDS", "0.6"))
@@ -339,6 +340,7 @@ class WeComAdapter(BasePlatformAdapter):
             self._http_client = None
 
         self._dedup.clear()
+        self._typing_stream_state_by_chat.clear()
         logger.info("[%s] Disconnected", self.name)
 
     async def _cleanup_ws(self) -> None:
@@ -2064,14 +2066,64 @@ class WeComAdapter(BasePlatformAdapter):
         )
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
-        """Emit WeCom's thinking placeholder so clients show waiting animation."""
-        del metadata
+        """Emit WeCom's stream placeholder so clients show waiting animation."""
         if not chat_id:
             return
+
+        metadata = metadata if isinstance(metadata, dict) else {}
+        message_id = str(metadata.get("message_id") or "").strip()
+        if not message_id:
+            return
+
+        reply_req_id = self._reply_req_id_for_message(message_id)
+        if not reply_req_id:
+            return
+
+        current_state = self._typing_stream_state_by_chat.get(chat_id)
+        if current_state and current_state[0] == reply_req_id:
+            stream_id = current_state[1]
+        else:
+            stream_id = self._new_req_id("stream")
+            self._typing_stream_state_by_chat[chat_id] = (reply_req_id, stream_id)
+
         try:
-            await self.send_thinking(chat_id)
+            response = await self._send_reply_request(
+                reply_req_id,
+                {
+                    "msgtype": "stream",
+                    "stream": {
+                        "id": stream_id,
+                        "finish": False,
+                        "content": "<think></think>",
+                    },
+                },
+            )
+            self._raise_for_wecom_error(response, "send typing stream")
         except Exception as exc:
             logger.debug("[%s] Failed to send typing placeholder to %s: %s", self.name, chat_id, exc)
+
+    async def stop_typing(self, chat_id: str) -> None:
+        """Close any active WeCom typing stream for this chat."""
+        state = self._typing_stream_state_by_chat.pop(chat_id, None)
+        if not state:
+            return
+
+        reply_req_id, stream_id = state
+        try:
+            response = await self._send_reply_request(
+                reply_req_id,
+                {
+                    "msgtype": "stream",
+                    "stream": {
+                        "id": stream_id,
+                        "finish": True,
+                        "content": "",
+                    },
+                },
+            )
+            self._raise_for_wecom_error(response, "stop typing stream")
+        except Exception as exc:
+            logger.debug("[%s] Failed to stop typing placeholder for %s: %s", self.name, chat_id, exc)
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Return minimal chat info."""
