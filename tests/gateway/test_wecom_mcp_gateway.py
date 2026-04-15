@@ -210,3 +210,145 @@ async def test_run_agent_skips_mcp_registration_for_non_wecom_platform(monkeypat
 
     assert result["final_response"] == "ok"
     assert registered_configs == []
+
+
+@pytest.mark.asyncio
+async def test_run_agent_handles_empty_mcp_configs(monkeypatch):
+    """WeCom adapter with empty MCP configs should not attempt registration."""
+    _install_fake_agent(monkeypatch)
+    runner = _make_runner()
+
+    registered_configs = []
+
+    def fake_register_mcp_servers(config_map):
+        registered_configs.append(config_map)
+
+    wecom_adapter = SimpleNamespace(
+        get_mcp_configs=lambda: {},
+        get_pending_message=lambda session_key: None,
+    )
+    runner.adapters[Platform.WECOM] = wecom_adapter
+
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+    monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda config=None: "gpt-5.4")
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {
+            "provider": "openrouter",
+            "api_mode": "chat_completions",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_key": "***",
+        },
+    )
+
+    import hermes_cli.tools_config as tools_config
+    monkeypatch.setattr(tools_config, "_get_platform_tools", lambda user_config, platform_key: {"core"})
+
+    fake_mcp_module = types.ModuleType("tools.mcp_tool")
+    fake_mcp_module.register_mcp_servers = fake_register_mcp_servers
+    monkeypatch.setitem(sys.modules, "tools.mcp_tool", fake_mcp_module)
+
+    result = await runner._run_agent(
+        message="hi",
+        context_prompt="",
+        history=[],
+        source=_make_wecom_source(),
+        session_id="session-1",
+        session_key="agent:main:wecom:dm:chat-1",
+    )
+
+    assert result["final_response"] == "ok"
+    assert registered_configs == []
+
+
+@pytest.mark.asyncio
+async def test_run_agent_mcp_registration_failure_is_non_fatal(monkeypatch):
+    """If register_mcp_servers raises, the agent should still run normally."""
+    _install_fake_agent(monkeypatch)
+    runner = _make_runner()
+
+    wecom_adapter = SimpleNamespace(
+        get_mcp_configs=lambda: {
+            "contact": "https://mcp.example/contact",
+        },
+        get_pending_message=lambda session_key: None,
+    )
+    runner.adapters[Platform.WECOM] = wecom_adapter
+
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+    monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda config=None: "gpt-5.4")
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {
+            "provider": "openrouter",
+            "api_mode": "chat_completions",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_key": "***",
+        },
+    )
+
+    import hermes_cli.tools_config as tools_config
+    monkeypatch.setattr(tools_config, "_get_platform_tools", lambda user_config, platform_key: {"core"})
+
+    def fake_register_mcp_servers(config_map):
+        raise RuntimeError("MCP registration failed")
+
+    fake_mcp_module = types.ModuleType("tools.mcp_tool")
+    fake_mcp_module.register_mcp_servers = fake_register_mcp_servers
+    monkeypatch.setitem(sys.modules, "tools.mcp_tool", fake_mcp_module)
+
+    result = await runner._run_agent(
+        message="hi",
+        context_prompt="",
+        history=[],
+        source=_make_wecom_source(),
+        session_id="session-1",
+        session_key="agent:main:wecom:dm:chat-1",
+    )
+
+    assert result["final_response"] == "ok"
+    # Agent should retain original tools since registration failed before refresh
+    cached_agent = runner._agent_cache["agent:main:wecom:dm:chat-1"][0]
+    assert cached_agent.tools == [{"function": {"name": "existing_tool"}}]
+
+
+@pytest.mark.asyncio
+async def test_run_agent_skips_mcp_when_adapter_missing_get_mcp_configs(monkeypatch):
+    """Backward compatibility: adapters without get_mcp_configs should be skipped gracefully."""
+    _install_fake_agent(monkeypatch)
+    runner = _make_runner()
+
+    # Adapter without get_mcp_configs method
+    wecom_adapter = SimpleNamespace(
+        get_pending_message=lambda session_key: None,
+    )
+    runner.adapters[Platform.WECOM] = wecom_adapter
+
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+    monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda config=None: "gpt-5.4")
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {
+            "provider": "openrouter",
+            "api_mode": "chat_completions",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_key": "***",
+        },
+    )
+
+    import hermes_cli.tools_config as tools_config
+    monkeypatch.setattr(tools_config, "_get_platform_tools", lambda user_config, platform_key: {"core"})
+
+    result = await runner._run_agent(
+        message="hi",
+        context_prompt="",
+        history=[],
+        source=_make_wecom_source(),
+        session_id="session-1",
+        session_key="agent:main:wecom:dm:chat-1",
+    )
+
+    assert result["final_response"] == "ok"
