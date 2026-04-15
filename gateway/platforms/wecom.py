@@ -94,6 +94,7 @@ APP_CMD_PING = "ping"
 APP_CMD_UPLOAD_MEDIA_INIT = "aibot_upload_media_init"
 APP_CMD_UPLOAD_MEDIA_CHUNK = "aibot_upload_media_chunk"
 APP_CMD_UPLOAD_MEDIA_FINISH = "aibot_upload_media_finish"
+APP_CMD_MCP_GET_CONFIG = "mcp_get_config"
 
 CALLBACK_COMMANDS = {APP_CMD_CALLBACK, APP_CMD_LEGACY_CALLBACK}
 NON_RESPONSE_COMMANDS = CALLBACK_COMMANDS | {APP_CMD_EVENT_CALLBACK}
@@ -189,6 +190,7 @@ class WeComAdapter(BasePlatformAdapter):
         self._webhook_app: Optional["web.Application"] = None
         self._stream_states: Dict[str, Dict[str, Any]] = {}
         self._stream_store: Optional[StreamStore] = None
+        self._mcp_configs: Dict[str, str] = {}
 
         # Text batching via shared aggregator
         batch_delay = float(os.getenv("HERMES_WECOM_TEXT_BATCH_DELAY_SECONDS", "0.6"))
@@ -257,6 +259,7 @@ class WeComAdapter(BasePlatformAdapter):
                 self._secret = primary.secret
                 self._ws_url = primary.websocket_url
                 await self._open_connection()
+                await self._discover_mcp_configs()
                 self._listen_task = asyncio.create_task(self._listen_loop())
                 self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
                 logger.info(
@@ -620,6 +623,32 @@ class WeComAdapter(BasePlatformAdapter):
         if errcode not in (0, None):
             errmsg = auth_payload.get("errmsg", "authentication failed")
             raise RuntimeError(f"{errmsg} (errcode={errcode})")
+
+    async def _discover_mcp_configs(self) -> None:
+        """Fetch MCP server URLs for known categories after WS connect."""
+        categories = ["contact", "meeting", "todo", "schedule", "doc", "msg"]
+        configs: Dict[str, str] = {}
+        for category in categories:
+            try:
+                response = await self._send_request(
+                    APP_CMD_MCP_GET_CONFIG,
+                    {"category": category},
+                    timeout=REQUEST_TIMEOUT_SECONDS,
+                )
+                if response.get("errcode") in (0, None):
+                    body = response.get("body") or {}
+                    url = body.get("url")
+                    if url:
+                        configs[category] = url
+            except Exception as exc:
+                logger.debug("[%s] MCP config discovery failed for %s: %s", self.name, category, exc)
+        self._mcp_configs = configs
+        if configs:
+            logger.info("[%s] Discovered MCP configs for categories: %s", self.name, list(configs.keys()))
+
+    def get_mcp_configs(self) -> Dict[str, str]:
+        """Return the discovered {category: url} MCP config map."""
+        return dict(self._mcp_configs)
 
     async def _wait_for_handshake(self, req_id: str) -> Dict[str, Any]:
         """Wait for the subscribe acknowledgement."""

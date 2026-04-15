@@ -116,6 +116,86 @@ class TestWeComConnect:
         assert adapter.fatal_error_code == "wecom_connect_error"
         assert "invalid secret" in (adapter.fatal_error_message or "")
 
+    @pytest.mark.asyncio
+    async def test_connect_discovers_mcp_configs_after_websocket_success(self, monkeypatch):
+        import gateway.platforms.wecom as wecom_module
+        from gateway.platforms.wecom import WeComAdapter
+
+        class DummyClient:
+            async def aclose(self):
+                return None
+
+        monkeypatch.setattr(wecom_module, "AIOHTTP_AVAILABLE", True)
+        monkeypatch.setattr(wecom_module, "HTTPX_AVAILABLE", True)
+        monkeypatch.setattr(
+            wecom_module,
+            "httpx",
+            SimpleNamespace(AsyncClient=lambda **kwargs: DummyClient()),
+        )
+
+        adapter = WeComAdapter(
+            PlatformConfig(enabled=True, extra={"bot_id": "bot-1", "secret": "secret-1"})
+        )
+        adapter._open_connection = AsyncMock()
+
+        async def fake_send_request(cmd, body, timeout=0):
+            category = body.get("category")
+            return {"errcode": 0, "body": {"url": f"https://mcp.example/{category}"}}
+
+        adapter._send_request = AsyncMock(side_effect=fake_send_request)
+
+        success = await adapter.connect()
+
+        assert success is True
+        assert adapter.get_mcp_configs() == {
+            "contact": "https://mcp.example/contact",
+            "meeting": "https://mcp.example/meeting",
+            "todo": "https://mcp.example/todo",
+            "schedule": "https://mcp.example/schedule",
+            "doc": "https://mcp.example/doc",
+            "msg": "https://mcp.example/msg",
+        }
+        # Verify _send_request was called for each category with mcp_get_config
+        assert adapter._send_request.await_count == 6
+        calls = adapter._send_request.await_args_list
+        categories = [c.args[1]["category"] for c in calls]
+        assert categories == ["contact", "meeting", "todo", "schedule", "doc", "msg"]
+        assert all(c.args[0] == "mcp_get_config" for c in calls)
+
+    @pytest.mark.asyncio
+    async def test_connect_mcp_config_failure_is_non_fatal(self, monkeypatch):
+        import gateway.platforms.wecom as wecom_module
+        from gateway.platforms.wecom import WeComAdapter
+
+        class DummyClient:
+            async def aclose(self):
+                return None
+
+        monkeypatch.setattr(wecom_module, "AIOHTTP_AVAILABLE", True)
+        monkeypatch.setattr(wecom_module, "HTTPX_AVAILABLE", True)
+        monkeypatch.setattr(
+            wecom_module,
+            "httpx",
+            SimpleNamespace(AsyncClient=lambda **kwargs: DummyClient()),
+        )
+
+        adapter = WeComAdapter(
+            PlatformConfig(enabled=True, extra={"bot_id": "bot-1", "secret": "secret-1"})
+        )
+        adapter._open_connection = AsyncMock()
+
+        async def fake_send_request(cmd, body, timeout=0):
+            if body.get("category") == "contact":
+                return {"errcode": 0, "body": {"url": "https://mcp.example/contact"}}
+            return {"errcode": 50001, "errmsg": "internal error"}
+
+        adapter._send_request = AsyncMock(side_effect=fake_send_request)
+
+        success = await adapter.connect()
+
+        assert success is True
+        assert adapter.get_mcp_configs() == {"contact": "https://mcp.example/contact"}
+
 
 class TestWeComReplyMode:
     @pytest.mark.asyncio
