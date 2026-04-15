@@ -196,6 +196,69 @@ class TestWeComConnect:
         assert success is True
         assert adapter.get_mcp_configs() == {"contact": "https://mcp.example/contact"}
 
+    @pytest.mark.asyncio
+    async def test_connect_mcp_config_missing_url_is_skipped(self, monkeypatch):
+        import gateway.platforms.wecom as wecom_module
+        from gateway.platforms.wecom import WeComAdapter
+
+        class DummyClient:
+            async def aclose(self):
+                return None
+
+        monkeypatch.setattr(wecom_module, "AIOHTTP_AVAILABLE", True)
+        monkeypatch.setattr(wecom_module, "HTTPX_AVAILABLE", True)
+        monkeypatch.setattr(
+            wecom_module,
+            "httpx",
+            SimpleNamespace(AsyncClient=lambda **kwargs: DummyClient()),
+        )
+
+        adapter = WeComAdapter(
+            PlatformConfig(enabled=True, extra={"bot_id": "bot-1", "secret": "secret-1"})
+        )
+        adapter._open_connection = AsyncMock()
+
+        async def fake_send_request(cmd, body, timeout=0):
+            if body.get("category") == "contact":
+                return {"errcode": 0, "body": {"url": "https://mcp.example/contact"}}
+            # Missing url field
+            return {"errcode": 0, "body": {}}
+
+        adapter._send_request = AsyncMock(side_effect=fake_send_request)
+
+        success = await adapter.connect()
+
+        assert success is True
+        assert adapter.get_mcp_configs() == {"contact": "https://mcp.example/contact"}
+
+    @pytest.mark.asyncio
+    async def test_connect_mcp_config_exception_is_non_fatal(self, monkeypatch):
+        import gateway.platforms.wecom as wecom_module
+        from gateway.platforms.wecom import WeComAdapter
+
+        class DummyClient:
+            async def aclose(self):
+                return None
+
+        monkeypatch.setattr(wecom_module, "AIOHTTP_AVAILABLE", True)
+        monkeypatch.setattr(wecom_module, "HTTPX_AVAILABLE", True)
+        monkeypatch.setattr(
+            wecom_module,
+            "httpx",
+            SimpleNamespace(AsyncClient=lambda **kwargs: DummyClient()),
+        )
+
+        adapter = WeComAdapter(
+            PlatformConfig(enabled=True, extra={"bot_id": "bot-1", "secret": "secret-1"})
+        )
+        adapter._open_connection = AsyncMock()
+        adapter._send_request = AsyncMock(side_effect=RuntimeError("websocket timeout"))
+
+        success = await adapter.connect()
+
+        assert success is True
+        assert adapter.get_mcp_configs() == {}
+
 
 class TestWeComReplyMode:
     @pytest.mark.asyncio
