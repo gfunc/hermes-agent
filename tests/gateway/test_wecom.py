@@ -1102,7 +1102,8 @@ async def test_send_typing_emits_thinking_placeholder():
 
 
 @pytest.mark.asyncio
-async def test_stop_typing_finishes_stream():
+async def test_stop_typing_clears_state_without_sending():
+    """stop_typing only clears state — the response send closes the stream."""
     from gateway.config import PlatformConfig
     from gateway.platforms.wecom import WeComAdapter
 
@@ -1112,15 +1113,40 @@ async def test_stop_typing_finishes_stream():
     adapter._remember_reply_req_id("msg-typing", "req-typing")
 
     await adapter.send_typing("chat-typing", metadata={"message_id": "msg-typing"})
-    await adapter.stop_typing("chat-typing")
+    assert adapter._send_reply_request.await_count == 1
 
-    assert adapter._send_reply_request.await_count == 2
-    stop_call = adapter._send_reply_request.await_args_list[1]
-    assert stop_call.args[0] == "req-typing"
-    stop_body = stop_call.args[1]
-    assert stop_body["msgtype"] == "stream"
-    assert stop_body["stream"]["finish"] is True
-    assert stop_body["stream"]["content"] == ""
+    await adapter.stop_typing("chat-typing")
+    # stop_typing should NOT send another frame
+    assert adapter._send_reply_request.await_count == 1
+    # State should be cleared
+    assert "chat-typing" not in adapter._typing_stream_state_by_chat
+
+
+@pytest.mark.asyncio
+async def test_send_reply_stream_reuses_typing_stream_id():
+    """_send_reply_stream should reuse the typing stream_id for the response."""
+    from gateway.config import PlatformConfig
+    from gateway.platforms.wecom import WeComAdapter
+
+    config = PlatformConfig(extra={"bot_id": "b", "secret": "s"})
+    adapter = WeComAdapter(config)
+    adapter._send_reply_request = AsyncMock(return_value={"headers": {"req_id": "r1"}, "body": {"errcode": 0}})
+    adapter._remember_reply_req_id("msg-typing", "req-typing")
+
+    # Open typing stream
+    await adapter.send_typing("chat-typing", metadata={"message_id": "msg-typing"})
+    typing_call = adapter._send_reply_request.await_args_list[0]
+    typing_stream_id = typing_call.args[1]["stream"]["id"]
+
+    # Send response reusing the typing stream_id
+    await adapter._send_reply_stream("req-typing", "Hello!", chat_id="chat-typing")
+    response_call = adapter._send_reply_request.await_args_list[1]
+    response_body = response_call.args[1]
+    assert response_body["stream"]["id"] == typing_stream_id
+    assert response_body["stream"]["finish"] is True
+    assert response_body["stream"]["content"] == "Hello!"
+    # Typing state should be consumed
+    assert "chat-typing" not in adapter._typing_stream_state_by_chat
 
 
 @pytest.mark.asyncio
