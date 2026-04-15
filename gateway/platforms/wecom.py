@@ -2081,10 +2081,11 @@ class WeComAdapter(BasePlatformAdapter):
 
         current_state = self._typing_stream_state_by_chat.get(chat_id)
         if current_state and current_state[0] == reply_req_id:
-            stream_id = current_state[1]
-        else:
-            stream_id = self._new_req_id("stream")
-            self._typing_stream_state_by_chat[chat_id] = (reply_req_id, stream_id)
+            # Stream already open for this reply — no need to resend.
+            return
+
+        stream_id = self._new_req_id("stream")
+        self._typing_stream_state_by_chat[chat_id] = (reply_req_id, stream_id)
 
         try:
             response = await self._send_reply_request(

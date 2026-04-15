@@ -1611,8 +1611,12 @@ class BasePlatformAdapter(ABC):
         self._active_sessions[session_key] = interrupt_event
         
         # Start continuous typing indicator (refreshes every 2 seconds)
-        _thread_metadata = {"thread_id": event.source.thread_id} if event.source.thread_id else None
-        typing_task = asyncio.create_task(self._keep_typing(event.source.chat_id, metadata=_thread_metadata))
+        _thread_metadata = {}
+        if event.source.thread_id:
+            _thread_metadata["thread_id"] = event.source.thread_id
+        if event.message_id:
+            _thread_metadata["message_id"] = event.message_id
+        typing_task = asyncio.create_task(self._keep_typing(event.source.chat_id, metadata=_thread_metadata or None))
         
         try:
             await self._run_processing_hook("on_processing_start", event)
