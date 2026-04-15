@@ -2065,6 +2065,14 @@ class WeComAdapter(BasePlatformAdapter):
             reply_to=reply_to,
         )
 
+    def pause_typing_for_chat(self, chat_id: str) -> None:
+        """Pause typing and clear WeCom stream state so it reopens on resume."""
+        super().pause_typing_for_chat(chat_id)
+        # Drop the cached stream — WeCom dismisses the dots when we send
+        # a proactive message (e.g. the approval prompt).  Clearing the
+        # state ensures send_typing opens a fresh stream after resume.
+        self._typing_stream_state_by_chat.pop(chat_id, None)
+
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """Emit WeCom's stream placeholder so clients show waiting animation."""
         if not chat_id:

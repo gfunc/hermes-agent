@@ -1138,6 +1138,34 @@ async def test_send_typing_without_message_id_is_noop():
 
 
 @pytest.mark.asyncio
+async def test_pause_typing_clears_stream_state_so_resume_reopens():
+    """After pause_typing_for_chat, send_typing should open a fresh stream."""
+    from gateway.config import PlatformConfig
+    from gateway.platforms.wecom import WeComAdapter
+
+    config = PlatformConfig(extra={"bot_id": "b", "secret": "s"})
+    adapter = WeComAdapter(config)
+    adapter._send_reply_request = AsyncMock(return_value={"headers": {"req_id": "r1"}, "body": {"errcode": 0}})
+    adapter._remember_reply_req_id("msg-typing", "req-typing")
+
+    # Initial typing opens a stream
+    await adapter.send_typing("chat-typing", metadata={"message_id": "msg-typing"})
+    assert adapter._send_reply_request.await_count == 1
+
+    # Second call is a no-op (stream already open)
+    await adapter.send_typing("chat-typing", metadata={"message_id": "msg-typing"})
+    assert adapter._send_reply_request.await_count == 1
+
+    # Pause clears the state
+    adapter.pause_typing_for_chat("chat-typing")
+    assert "chat-typing" not in adapter._typing_stream_state_by_chat
+
+    # After pause, send_typing opens a fresh stream
+    await adapter.send_typing("chat-typing", metadata={"message_id": "msg-typing"})
+    assert adapter._send_reply_request.await_count == 2
+
+
+@pytest.mark.asyncio
 async def test_on_message_respects_group_disabled_policy():
     from gateway.config import PlatformConfig
     from gateway.platforms.wecom import WeComAdapter
