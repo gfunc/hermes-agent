@@ -192,6 +192,9 @@ class WeComAdapter(BasePlatformAdapter):
         self._stream_store: Optional[StreamStore] = None
         self._mcp_configs: Dict[str, str] = {}
         self._typing_stream_state_by_chat: Dict[str, Tuple[str, str]] = {}
+        # Streams that need a finish=True frame (set by sync pause_typing_for_chat,
+        # drained by async send_typing on the next _keep_typing iteration).
+        self._streams_pending_close: Dict[str, Tuple[str, str]] = {}
 
         # Text batching via shared aggregator
         batch_delay = float(os.getenv("HERMES_WECOM_TEXT_BATCH_DELAY_SECONDS", "0.6"))
@@ -2081,15 +2084,23 @@ class WeComAdapter(BasePlatformAdapter):
         )
 
     def pause_typing_for_chat(self, chat_id: str) -> None:
-        """Pause typing and clear WeCom stream state so it reopens on resume."""
+        """Pause typing and schedule the active WeCom stream for closing.
+
+        This is a sync method (called from the agent thread), so it cannot
+        send the ``finish=True`` frame directly.  Instead it moves the stream
+        state into ``_streams_pending_close`` which is drained on the next
+        async ``send_typing`` / ``stop_typing`` call from ``_keep_typing``.
+        """
         super().pause_typing_for_chat(chat_id)
-        # Drop the cached stream — WeCom dismisses the dots when we send
-        # a proactive message (e.g. the approval prompt).  Clearing the
-        # state ensures send_typing opens a fresh stream after resume.
-        self._typing_stream_state_by_chat.pop(chat_id, None)
+        state = self._typing_stream_state_by_chat.pop(chat_id, None)
+        if state:
+            self._streams_pending_close[chat_id] = state
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """Emit WeCom's stream placeholder so clients show waiting animation."""
+        # Drain any streams that were orphaned by pause_typing_for_chat.
+        await self._close_pending_streams()
+
         if not chat_id:
             return
 
@@ -2137,6 +2148,9 @@ class WeComAdapter(BasePlatformAdapter):
         pauses typing and pops the state *before* this runs, so this becomes
         a harmless no-op in the normal success path.
         """
+        # Also drain any streams orphaned by pause_typing_for_chat.
+        await self._close_pending_streams()
+
         state = self._typing_stream_state_by_chat.pop(chat_id, None)
         if not state:
             return
@@ -2157,6 +2171,22 @@ class WeComAdapter(BasePlatformAdapter):
             self._raise_for_wecom_error(response, "stop typing stream")
         except Exception as exc:
             logger.debug("[%s] Failed to stop typing placeholder for %s: %s", self.name, chat_id, exc)
+
+    async def _close_pending_streams(self) -> None:
+        """Send ``finish=True`` for streams orphaned by ``pause_typing_for_chat``."""
+        while self._streams_pending_close:
+            _chat_id, (req_id, stream_id) = self._streams_pending_close.popitem()
+            try:
+                resp = await self._send_reply_request(
+                    req_id,
+                    {
+                        "msgtype": "stream",
+                        "stream": {"id": stream_id, "finish": True, "content": ""},
+                    },
+                )
+                self._raise_for_wecom_error(resp, "close pending typing stream")
+            except Exception as exc:
+                logger.debug("[%s] Failed to close pending stream for %s: %s", self.name, _chat_id, exc)
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Return minimal chat info."""

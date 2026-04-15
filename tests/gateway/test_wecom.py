@@ -1171,8 +1171,8 @@ async def test_send_typing_without_message_id_is_noop():
 
 
 @pytest.mark.asyncio
-async def test_pause_typing_clears_stream_state_so_resume_reopens():
-    """After pause_typing_for_chat, send_typing should open a fresh stream."""
+async def test_pause_typing_closes_stream_and_resume_reopens():
+    """pause_typing_for_chat schedules stream close; next send_typing drains it and opens fresh."""
     from gateway.config import PlatformConfig
     from gateway.platforms.wecom import WeComAdapter
 
@@ -1184,18 +1184,36 @@ async def test_pause_typing_clears_stream_state_so_resume_reopens():
     # Initial typing opens a stream
     await adapter.send_typing("chat-typing", metadata={"message_id": "msg-typing"})
     assert adapter._send_reply_request.await_count == 1
+    first_stream_id = adapter._send_reply_request.await_args_list[0].args[1]["stream"]["id"]
 
     # Second call is a no-op (stream already open)
     await adapter.send_typing("chat-typing", metadata={"message_id": "msg-typing"})
     assert adapter._send_reply_request.await_count == 1
 
-    # Pause clears the state
+    # Pause moves the stream to pending close
     adapter.pause_typing_for_chat("chat-typing")
     assert "chat-typing" not in adapter._typing_stream_state_by_chat
+    assert "chat-typing" in adapter._streams_pending_close
 
-    # After pause, send_typing opens a fresh stream
+    # Resume typing (remove from paused set)
+    adapter.resume_typing_for_chat("chat-typing")
+
+    # Next send_typing drains pending close (finish=True for old stream)
+    # then opens a fresh stream
     await adapter.send_typing("chat-typing", metadata={"message_id": "msg-typing"})
-    assert adapter._send_reply_request.await_count == 2
+    # Call 2 = close old stream, Call 3 = open new stream
+    assert adapter._send_reply_request.await_count == 3
+
+    # Verify the close frame for the old stream
+    close_call = adapter._send_reply_request.await_args_list[1]
+    assert close_call.args[1]["stream"]["id"] == first_stream_id
+    assert close_call.args[1]["stream"]["finish"] is True
+    assert close_call.args[1]["stream"]["content"] == ""
+
+    # Verify the new stream has a different ID
+    new_open_call = adapter._send_reply_request.await_args_list[2]
+    assert new_open_call.args[1]["stream"]["finish"] is False
+    assert new_open_call.args[1]["stream"]["id"] != first_stream_id
 
 
 @pytest.mark.asyncio
