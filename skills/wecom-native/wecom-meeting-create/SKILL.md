@@ -4,18 +4,15 @@ description: 企业微信会议创建技能, 支持创建预约会议. 当用户
 ---
 # 企业微信会议创建技能
 
-
-> ⚠️ **前置条件**：首次调用前，必须按 `wecom-preflight` 技能执行前置条件检查。
-
 ## 概述
 
-wecom-meeting-create 提供企业微信预约会议的创建能力, 支持设置会议参数, 邀请参与人等.
+wecom-meeting-create 提供企业微信预约会议的创建能力, 支持设置会议参数配置等.
 
 ## 命令调用方式
 
 可用工具通过 MCP 自动发现
 
-执行指定命令：使用 `mcp_wecom_*` tool 调用 `mcp_wecom_meeting_<tool_name> '<json_params>'`
+执行指定命令：调用 `mcp_wecom_meeting_<tool_name> '<json_params>'`
 
 ---
 
@@ -27,7 +24,7 @@ wecom-meeting-create 提供企业微信预约会议的创建能力, 支持设置
 
 #### 执行命令
 
-使用 `mcp_wecom_*` tool 调用 `mcp_wecom_meeting_create_meeting '{"title": "<会议标题>", "meeting_start_datetime": "<会议开始时间>", "meeting_duration": <会议持续时长(秒)>}'`
+调用 `mcp_wecom_meeting_create_meeting '{"title": "<会议标题>", "meeting_start_datetime": "<会议开始时间>", "meeting_duration": <会议持续时长(秒)>}'`
 
 #### 入参说明
 
@@ -91,7 +88,7 @@ wecom-meeting-create 提供企业微信预约会议的创建能力, 支持设置
 1. **解析用户意图**: 时间 + 主题已有, 邀请人未提及则默认留空, 直接创建.
 2. **调用创建命令**:
 
-使用 `mcp_wecom_*` tool 调用 `mcp_wecom_meeting_create_meeting '{"title": "周例会", "meeting_start_datetime": "2026-03-18 15:00", "meeting_duration": 3600}'`
+调用 `mcp_wecom_meeting_create_meeting '{"title": "周例会", "meeting_start_datetime": "2026-03-18 15:00", "meeting_duration": 3600}'`
 
 3. **展示结果**:
 
@@ -120,7 +117,7 @@ wecom-meeting-create 提供企业微信预约会议的创建能力, 支持设置
 
 3. **信息已充分, 直接调用创建命令** (禁止暴露内部 ID):
 
-使用 `mcp_wecom_*` tool 调用 `mcp_wecom_meeting_create_meeting '{"title": "技术方案评审", "meeting_start_datetime": "2026-03-18 15:00", "meeting_duration": 3600, "location": "3楼会议室", "invitees": {"userid": ["zhangsan", "lisi"]}}'`
+调用 `mcp_wecom_meeting_create_meeting '{"title": "技术方案评审", "meeting_start_datetime": "2026-03-18 15:00", "meeting_duration": 3600, "location": "3楼会议室", "invitees": {"userid": ["zhangsan", "lisi"]}}'`
 
 4. **展示结果**:
 

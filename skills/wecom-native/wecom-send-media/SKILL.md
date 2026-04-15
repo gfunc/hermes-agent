@@ -32,7 +32,7 @@ MEDIA: <文件的绝对路径>
 
 ## 文件存放
 
-将生成的文件优先存放至 `~/.hermes/workspace/` 目录，确保路径可访问。
+将生成的文件优先存放至 `/tmp/` 目录，确保路径可访问。
 
 ## 文件大小与格式限制
 
@@ -55,10 +55,10 @@ MEDIA: <文件的绝对路径>
 
 ```
 以下是生成的图表：
-MEDIA: ~/.hermes/workspace/output.png
+MEDIA: /tmp/output.png
 
 报告已生成，请查收：
-MEDIA: ~/.hermes/workspace/report.pdf
+MEDIA: /tmp/report.pdf
 ```
 
 ## 错误示例

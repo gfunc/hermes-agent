@@ -5,9 +5,6 @@ description: 企业微信待办详情批量查询技能，根据待办 ID 列表
 
 # 企业微信待办详情查询技能
 
-
-> ⚠️ **前置条件**：首次调用前，必须按 `wecom-preflight` 技能执行前置条件检查。
-
 通过 `mcp_wecom_*` 原生 MCP 工具 根据待办 ID 列表批量查询完整详情，包含待办内容和分派人信息。
 
 ## 行为策略
@@ -24,7 +21,7 @@ description: 企业微信待办详情批量查询技能，根据待办 ID 列表
 
 ## 调用方式
 
-使用 `mcp_wecom_*` tool 调用 `mcp_wecom_todo_get_todo_detail '<json格式的入参>'`
+调用 `mcp_wecom_todo_get_todo_detail '<json格式的入参>'`
 
 ## 参数说明
 
@@ -34,7 +31,7 @@ description: 企业微信待办详情批量查询技能，根据待办 ID 列表
 
 **调用示例：**
 
-使用 `mcp_wecom_*` tool 调用 `mcp_wecom_todo_get_todo_detail '{"todo_id_list": ["TODO_ID_1", "TODO_ID_2"]}'`
+调用 `mcp_wecom_todo_get_todo_detail '{"todo_id_list": ["TODO_ID_1", "TODO_ID_2"]}'`
 
 ## 返回格式
 
@@ -92,8 +89,8 @@ description: 企业微信待办详情批量查询技能，根据待办 ID 列表
 
 用户问："看看我最近的待办" / "我有哪些待办事项？"
 
-1. 第一步：通过 wecom-get-todo-list 获取待办列表。使用 `mcp_wecom_*` tool 调用 `mcp_wecom_todo_get_todo_list '{}'`
-2. 第二步：根据返回的 todo_id 批量获取详情。使用 `mcp_wecom_*` tool 调用 `mcp_wecom_todo_get_todo_detail '{"todo_id_list": ["TODO_ID_1", "TODO_ID_2", "TODO_ID_3"]}'`
+1. 第一步：通过 wecom-get-todo-list 获取待办列表。调用 `mcp_wecom_todo_get_todo_list '{}'`
+2. 第二步：根据返回的 todo_id 批量获取详情。调用 `mcp_wecom_todo_get_todo_detail '{"todo_id_list": ["TODO_ID_1", "TODO_ID_2", "TODO_ID_3"]}'`
 3. 第三步（不要跳过！）：通过 wecom-contact-lookup 获取通讯录，将 follower_id / creator_id 转为姓名。用返回的 userlist 中的 userid 匹配 follower_id 和 creator_id，取 name 字段作为展示姓名
 
 > 第三步是展示可读结果的前提。没有这一步，用户看到的是一串无意义的 ID 而非姓名。
