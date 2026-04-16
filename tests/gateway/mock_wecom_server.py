@@ -27,12 +27,16 @@ class MockWeComServer:
         self.app.router.add_get("/ws", self._ws_handler)
         self._clients: List[web.WebSocketResponse] = []
         self._received: List[Dict[str, Any]] = []
-        self._server: Optional[Any] = None
+        self._server: Optional[web.AppRunner] = None
         self.ws_url: str = ""
 
     async def _ws_handler(self, request: web.Request) -> web.WebSocketResponse:
         ws = web.WebSocketResponse()
         await ws.prepare(request)
+        if self.scenario == "close_silent":
+            if request.transport is not None:
+                request.transport.close()
+            return ws
         self._clients.append(ws)
         try:
             async for msg in ws:
@@ -51,7 +55,7 @@ class MockWeComServer:
         req_id = payload.get("headers", {}).get("req_id", "")
 
         if cmd == "aibot_subscribe":
-            if self.delay_auth_seconds:
+            if self.delay_auth_seconds > 0:
                 await asyncio.sleep(self.delay_auth_seconds)
             await ws.send_json({
                 "cmd": "aibot_subscribe",
@@ -84,6 +88,8 @@ class MockWeComServer:
 
     async def send_callback(self, chatid: str, text: str, msgid: str = "mock-msg-1") -> None:
         for ws in list(self._clients):
+            if ws.closed:
+                continue
             await ws.send_json({
                 "cmd": "aibot_msg_callback",
                 "headers": {"req_id": f"mock-req-{msgid}"},
@@ -100,9 +106,9 @@ class MockWeComServer:
     async def start(self) -> None:
         runner = web.AppRunner(self.app)
         await runner.setup()
+        self._server = runner
         site = web.TCPSite(runner, "127.0.0.1", 0)
         await site.start()
-        self._server = runner
         self.ws_url = f"http://127.0.0.1:{site._server.sockets[0].getsockname()[1]}/ws"
 
     async def stop(self) -> None:
