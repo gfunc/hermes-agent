@@ -182,6 +182,7 @@ class WeComAdapter(BasePlatformAdapter):
         self._pending_responses: Dict[str, asyncio.Future] = {}
         self._dedup = MessageDeduplicator(max_size=DEDUP_MAX_SIZE)
         self._reply_req_ids: Dict[str, str] = {}
+        self._last_reply_req_id_per_chat: Dict[str, str] = {}
         self._pending_stream_acks: set[str] = set()
 
         # Webhook server (for bot webhook mode accounts)
@@ -344,6 +345,7 @@ class WeComAdapter(BasePlatformAdapter):
 
         self._dedup.clear()
         self._typing_stream_state_by_chat.clear()
+        self._last_reply_req_id_per_chat.clear()
         logger.info("[%s] Disconnected", self.name)
 
     async def _cleanup_ws(self) -> None:
@@ -880,6 +882,13 @@ class WeComAdapter(BasePlatformAdapter):
         if not chat_id:
             logger.debug("[%s] Missing chat id, skipping message", self.name)
             return
+
+        # Also track the freshest req_id per chat so resumed typing after
+        # /approve can use the most recent (still-valid) message's req_id.
+        if str(body.get("msgtype") or "").lower() != "event":
+            _req_id = self._payload_req_id(payload)
+            if _req_id:
+                self._last_reply_req_id_per_chat[chat_id] = _req_id
 
         is_group = str(body.get("chattype") or "").lower() == "group"
         if is_group:
@@ -1745,10 +1754,6 @@ class WeComAdapter(BasePlatformAdapter):
                     # is still active). Put it back so the real response can
                     # close it later.
                     self._typing_stream_state_by_chat[chat_id] = state
-            # Prevent _keep_typing from opening a new stream after this
-            # response closes the current one.  The typing_paused set is
-            # cleared by _keep_typing's finally block.
-            self._typing_paused.add(chat_id)
 
         # Close any remaining orphaned streams that definitely won't be
         # reused.  Skip the current chat: if we have a matching pending
@@ -2144,23 +2149,33 @@ class WeComAdapter(BasePlatformAdapter):
         if not chat_id:
             return
 
-        metadata = metadata if isinstance(metadata, dict) else {}
-        message_id = str(metadata.get("message_id") or "").strip()
-        if not message_id:
+        current_state = self._typing_stream_state_by_chat.get(chat_id)
+        if current_state:
+            # Stream already active — nothing to do.
             return
 
+        metadata = metadata if isinstance(metadata, dict) else {}
+        message_id = str(metadata.get("message_id") or "").strip()
+
         reply_req_id = self._reply_req_id_for_message(message_id)
+        if not reply_req_id and chat_id:
+            # Fall back to the most recent message in this chat so resumed
+            # typing after /approve attaches to the fresh /approve message
+            # instead of an expired or scrolled-out original message.
+            reply_req_id = self._last_reply_req_id_per_chat.get(chat_id)
         if not reply_req_id:
             return
 
         current_state = self._typing_stream_state_by_chat.get(chat_id)
         if current_state and current_state[0] == reply_req_id:
-            # Stream already open for this reply — no need to resend.
+            # Already active for this exact message.
             return
+        if current_state:
+            # Different message: close the old stream before opening a new one.
+            await self.stop_typing(chat_id)
 
         stream_id = self._new_req_id("stream")
         self._typing_stream_state_by_chat[chat_id] = (reply_req_id, stream_id)
-
         try:
             response = await self._send_reply_request(
                 reply_req_id,
@@ -2174,6 +2189,17 @@ class WeComAdapter(BasePlatformAdapter):
                 },
             )
             self._raise_for_wecom_error(response, "send typing stream")
+        except RuntimeError as exc:
+            err_text = str(exc)
+            if "846608" in err_text:
+                logger.warning(
+                    "[%s] Typing stream expired (846608) for req_id=%s, clearing cache",
+                    self.name, reply_req_id,
+                )
+                self._reply_req_ids.pop(message_id, None)
+                self._last_reply_req_id_per_chat.pop(chat_id, None)
+            else:
+                logger.debug("[%s] Failed to send typing placeholder to %s: %s", self.name, chat_id, exc)
         except Exception as exc:
             logger.debug("[%s] Failed to send typing placeholder to %s: %s", self.name, chat_id, exc)
 
@@ -2209,6 +2235,16 @@ class WeComAdapter(BasePlatformAdapter):
                 },
             )
             self._raise_for_wecom_error(response, "stop typing stream")
+        except RuntimeError as exc:
+            if "846608" in str(exc):
+                logger.warning(
+                    "[%s] Stop-typing stream expired (846608) for req_id=%s, clearing cache",
+                    self.name, reply_req_id,
+                )
+                self._reply_req_ids.pop(state[0], None)
+                self._last_reply_req_id_per_chat.pop(chat_id, None)
+            else:
+                logger.debug("[%s] Failed to stop typing placeholder for %s: %s", self.name, chat_id, exc)
         except Exception as exc:
             logger.debug("[%s] Failed to stop typing placeholder for %s: %s", self.name, chat_id, exc)
 

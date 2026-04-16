@@ -1152,8 +1152,8 @@ async def test_send_reply_stream_reuses_typing_stream_id():
     assert response_body["stream"]["content"] == "Hello!"
     # Typing state should be consumed
     assert "chat-typing" not in adapter._typing_stream_state_by_chat
-    # Typing should be paused to prevent _keep_typing from reopening
-    assert "chat-typing" in adapter._typing_paused
+    # _send_reply_stream no longer manipulates _typing_paused; that is
+    # the responsibility of _keep_typing's caller (base platform).
 
 
 @pytest.mark.asyncio
