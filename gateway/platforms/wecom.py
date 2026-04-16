@@ -307,6 +307,21 @@ class WeComAdapter(BasePlatformAdapter):
             message = f"WeCom startup failed: {exc}"
             self._set_fatal_error("wecom_connect_error", message, retryable=True)
             logger.error("[%s] Failed to connect: %s", self.name, exc, exc_info=True)
+            # Cancel tasks that may have been started before the failure
+            if self._listen_task:
+                self._listen_task.cancel()
+                try:
+                    await self._listen_task
+                except asyncio.CancelledError:
+                    pass
+                self._listen_task = None
+            if self._heartbeat_task:
+                self._heartbeat_task.cancel()
+                try:
+                    await self._heartbeat_task
+                except asyncio.CancelledError:
+                    pass
+                self._heartbeat_task = None
             await self._cleanup_ws()
             await self._cleanup_webhook()
             if self._http_client:

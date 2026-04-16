@@ -77,3 +77,60 @@ async def test_connect_does_not_block_on_mcp_discovery(monkeypatch):
     assert discover_called.is_set()
 
     await adapter.disconnect()
+
+
+async def test_connect_cancels_tasks_when_discovery_raises(monkeypatch):
+    """
+    If _discover_mcp_configs() raises after listen/heartbeat tasks are created,
+    connect() must cancel and null them out to avoid dangling tasks.
+    """
+    import gateway.platforms.wecom as wecom_module
+    from gateway.platforms.wecom import WeComAdapter
+
+    monkeypatch.setattr(wecom_module, "AIOHTTP_AVAILABLE", True)
+    monkeypatch.setattr(wecom_module, "HTTPX_AVAILABLE", True)
+
+    class DummyClient:
+        async def aclose(self):
+            return None
+
+    class DummyHttpx:
+        def AsyncClient(self, **kwargs):
+            return DummyClient()
+
+    monkeypatch.setattr(wecom_module, "httpx", DummyHttpx())
+
+    adapter = WeComAdapter(
+        PlatformConfig(enabled=True, extra={"bot_id": "bot-1", "secret": "secret-1"})
+    )
+
+    async def fake_open():
+        return None
+
+    async def fake_discover():
+        await asyncio.sleep(0)
+        raise RuntimeError("discovery failed")
+
+    async def fake_listen():
+        try:
+            while True:
+                await asyncio.sleep(1)
+        except asyncio.CancelledError:
+            pass
+
+    async def fake_heartbeat():
+        try:
+            while True:
+                await asyncio.sleep(1)
+        except asyncio.CancelledError:
+            pass
+
+    adapter._open_connection = fake_open
+    adapter._discover_mcp_configs = fake_discover
+    adapter._listen_loop = fake_listen
+    adapter._heartbeat_loop = fake_heartbeat
+
+    success = await adapter.connect()
+    assert success is False
+    assert adapter._listen_task is None
+    assert adapter._heartbeat_task is None
