@@ -278,6 +278,7 @@ class WeComAdapter(BasePlatformAdapter):
                 self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
                 self._watchdog_task = asyncio.create_task(self._watchdog_loop())
                 self._last_frame_at = asyncio.get_running_loop().time()
+                self._mark_connected()
                 await self._discover_mcp_configs()
                 logger.info(
                     "[%s] WebSocket connected for account '%s' to %s",
@@ -307,7 +308,8 @@ class WeComAdapter(BasePlatformAdapter):
                 connected_any = True
 
             if connected_any:
-                self._mark_connected()
+                if not self._running:
+                    self._mark_connected()
                 return True
 
             message = "WeCom startup failed: no accounts could be connected"

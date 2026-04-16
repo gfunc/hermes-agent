@@ -416,7 +416,15 @@ async def test_mock_server_receives_and_delivers_message():
                 },
             )
         )
-        adapter._running = True
+
+        received_payloads = []
+        original_on_message = adapter._on_message
+
+        async def _spy_on_message(payload):
+            received_payloads.append(payload)
+            # Do not await original to avoid full gateway plumbing
+
+        adapter._on_message = _spy_on_message
 
         success = await adapter.connect()
         assert success is True
@@ -426,6 +434,15 @@ async def test_mock_server_receives_and_delivers_message():
 
         # Verify subscription was received by mock server
         assert any(p.get("cmd") == "aibot_subscribe" for p in server._received)
+
+        # Push a message from the mock server and verify adapter receives it
+        await server.send_callback("chat-1", "hello from mock")
+        await asyncio.sleep(0.1)
+
+        assert len(received_payloads) >= 1
+        body = received_payloads[0].get("body", {})
+        assert body.get("chatid") == "chat-1"
+        assert body.get("text", {}).get("content") == "hello from mock"
 
         await adapter.disconnect()
     finally:
@@ -450,7 +467,6 @@ async def test_adapter_reconnects_after_mock_server_closes():
                 },
             )
         )
-        adapter._running = True
 
         # Shorten backoff for test speed
         import gateway.platforms.wecom as wecom_module
