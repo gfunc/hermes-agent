@@ -1253,6 +1253,47 @@ async def test_pause_typing_closes_stream_and_resume_reopens():
 
 
 @pytest.mark.asyncio
+async def test_send_reply_stream_closes_pending_streams_after_pause():
+    """_send_reply_stream must drain _streams_pending_close so inline responses
+    don't leave the original typing indicator hanging."""
+    from gateway.config import PlatformConfig
+    from gateway.platforms.wecom import WeComAdapter
+
+    config = PlatformConfig(extra={"bot_id": "b", "secret": "s"})
+    adapter = WeComAdapter(config)
+    adapter._send_reply_request = AsyncMock(return_value={"headers": {"req_id": "r1"}, "body": {"errcode": 0}})
+    adapter._remember_reply_req_id("msg-typing", "req-typing")
+
+    # Open typing stream for the original message
+    await adapter.send_typing("chat-typing", metadata={"message_id": "msg-typing"})
+    assert adapter._send_reply_request.await_count == 1
+    typing_stream_id = adapter._send_reply_request.await_args_list[0].args[1]["stream"]["id"]
+
+    # Pause moves the stream to pending close
+    adapter.pause_typing_for_chat("chat-typing")
+    assert "chat-typing" in adapter._streams_pending_close
+
+    # Inline /approve response goes through _send_reply_stream
+    adapter._remember_reply_req_id("msg-approve", "req-approve")
+    await adapter._send_reply_stream("req-approve", "Approved!", chat_id="chat-typing")
+
+    # First call after typing should close the orphaned stream
+    assert adapter._send_reply_request.await_count == 3
+    close_call = adapter._send_reply_request.await_args_list[1]
+    assert close_call.args[1]["stream"]["id"] == typing_stream_id
+    assert close_call.args[1]["stream"]["finish"] is True
+    assert close_call.args[1]["stream"]["content"] == ""
+
+    # Second call is the actual inline response
+    reply_call = adapter._send_reply_request.await_args_list[2]
+    assert reply_call.args[1]["stream"]["finish"] is True
+    assert reply_call.args[1]["stream"]["content"] == "Approved!"
+
+    # Pending close set should be drained
+    assert "chat-typing" not in adapter._streams_pending_close
+
+
+@pytest.mark.asyncio
 async def test_on_message_respects_group_disabled_policy():
     from gateway.config import PlatformConfig
     from gateway.platforms.wecom import WeComAdapter

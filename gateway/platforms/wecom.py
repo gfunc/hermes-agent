@@ -1720,6 +1720,11 @@ class WeComAdapter(BasePlatformAdapter):
         return response
 
     async def _send_reply_stream(self, reply_req_id: str, content: str, chat_id: str = "") -> Dict[str, Any]:
+        # Close any streams orphaned by pause_typing_for_chat before opening
+        # a new one.  Otherwise inline responses (e.g. /approve) can leave the
+        # original typing indicator hanging forever.
+        await self._close_pending_streams()
+
         # Reuse the typing stream_id if one is active for this chat.
         # This mirrors the plugin pattern: thinking stream (finish=false)
         # and final response (finish=true) share the same stream_id.
