@@ -350,12 +350,18 @@ class WeComAdapter(BasePlatformAdapter):
 
     async def _cleanup_ws(self) -> None:
         """Close the live websocket/session, if any."""
-        if self._ws and not self._ws.closed:
-            await self._ws.close()
+        try:
+            if self._ws and not self._ws.closed:
+                await self._ws.close()
+        except Exception:
+            pass
         self._ws = None
 
-        if self._session and not self._session.closed:
-            await self._session.close()
+        try:
+            if self._session and not self._session.closed:
+                await self._session.close()
+        except Exception:
+            pass
         self._session = None
 
     async def _start_webhook_server(self, accounts: List[WeComAccount]) -> None:
@@ -704,6 +710,8 @@ class WeComAdapter(BasePlatformAdapter):
                     await self._open_connection()
                     backoff_idx = 0
                     logger.info("[%s] Reconnected", self.name)
+                except asyncio.CancelledError:
+                    raise
                 except Exception as reconnect_exc:
                     logger.warning("[%s] Reconnect failed: %s", self.name, reconnect_exc)
 
