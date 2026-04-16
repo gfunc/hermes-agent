@@ -1929,6 +1929,19 @@ class WeComAdapter(BasePlatformAdapter):
 
         try:
             reply_req_id = self._reply_req_id_for_message(reply_to)
+
+            # If there is no mapped reply req_id but an active typing stream
+            # exists for this chat, reuse its req_id so the message replaces
+            # the typing indicator instead of leaving it hanging forever.
+            if not reply_req_id and chat_id:
+                typing_state = self._typing_stream_state_by_chat.pop(chat_id, None)
+                if not typing_state:
+                    typing_state = self._streams_pending_close.pop(chat_id, None)
+                if typing_state:
+                    reply_req_id = typing_state[0]
+                    # Put it back so _send_reply_stream can pop and reuse the stream_id.
+                    self._typing_stream_state_by_chat[chat_id] = typing_state
+
             chunks = self._chunk_markdown_text(content, chunk_limit=self.MAX_MESSAGE_LENGTH)
             if not chunks:
                 return SendResult(success=False, error="empty content")

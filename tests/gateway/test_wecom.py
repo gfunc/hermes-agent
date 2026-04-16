@@ -1297,6 +1297,33 @@ async def test_send_reply_stream_reuses_pending_stream_for_matching_req_id():
 
 
 @pytest.mark.asyncio
+async def test_send_reuses_typing_stream_when_reply_to_is_missing():
+    """When send() is called without reply_to (e.g. error handler) but a typing
+    stream is active, the message should reuse that stream so the placeholder
+    is replaced instead of hanging forever."""
+    from gateway.config import PlatformConfig
+    from gateway.platforms.wecom import WeComAdapter
+
+    config = PlatformConfig(extra={"bot_id": "b", "secret": "s"})
+    adapter = WeComAdapter(config)
+    adapter._send_reply_request = AsyncMock(return_value={"headers": {"req_id": "r1"}, "body": {"errcode": 0}})
+    adapter._remember_reply_req_id("msg-typing", "req-typing")
+
+    # Open typing stream
+    await adapter.send_typing("chat-typing", metadata={"message_id": "msg-typing"})
+    typing_stream_id = adapter._send_reply_request.await_args_list[0].args[1]["stream"]["id"]
+
+    # send() without reply_to should still reuse the active typing stream
+    result = await adapter.send(chat_id="chat-typing", content="Error message")
+    assert result.success is True
+    assert adapter._send_reply_request.await_count == 2
+    final_call = adapter._send_reply_request.await_args_list[1]
+    assert final_call.args[1]["stream"]["id"] == typing_stream_id
+    assert final_call.args[1]["stream"]["finish"] is True
+    assert final_call.args[1]["stream"]["content"] == "Error message"
+
+
+@pytest.mark.asyncio
 async def test_on_message_respects_group_disabled_policy():
     from gateway.config import PlatformConfig
     from gateway.platforms.wecom import WeComAdapter
