@@ -788,7 +788,9 @@ class WeComAdapter(BasePlatformAdapter):
         """Send a raw JSON frame over the active websocket."""
         if not self._ws or self._ws.closed:
             raise RuntimeError("WeCom websocket is not connected")
-        await self._ws.send_json(payload)
+        await asyncio.wait_for(
+            self._ws.send_json(payload), timeout=REQUEST_TIMEOUT_SECONDS
+        )
 
     async def _send_request(self, cmd: str, body: Dict[str, Any], timeout: float = REQUEST_TIMEOUT_SECONDS) -> Dict[str, Any]:
         """Send a JSON request and await the correlated response."""

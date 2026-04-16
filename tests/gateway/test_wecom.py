@@ -1351,3 +1351,24 @@ async def test_template_card_event_is_handled_gracefully():
     await adapter._on_message(payload)
     # Should not crash and should not dispatch as normal message
     adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_send_json_raises_timeout_when_ws_hangs(monkeypatch):
+    """_send_json must raise asyncio.TimeoutError if ws.send_json blocks forever."""
+    import asyncio
+    from gateway.config import PlatformConfig
+    from gateway.platforms import wecom
+    from gateway.platforms.wecom import WeComAdapter
+
+    monkeypatch.setattr(wecom, "REQUEST_TIMEOUT_SECONDS", 0.1)
+
+    async def _hang_forever(*args, **kwargs):
+        await asyncio.Event().wait()
+
+    adapter = WeComAdapter(PlatformConfig(enabled=True))
+    adapter._ws = AsyncMock()
+    adapter._ws.closed = False
+    adapter._ws.send_json = _hang_forever
+    with pytest.raises(asyncio.TimeoutError):
+        await adapter._send_json({"cmd": "test"})
