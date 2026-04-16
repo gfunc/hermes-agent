@@ -1253,9 +1253,10 @@ async def test_pause_typing_closes_stream_and_resume_reopens():
 
 
 @pytest.mark.asyncio
-async def test_send_reply_stream_closes_pending_streams_after_pause():
-    """_send_reply_stream must drain _streams_pending_close so inline responses
-    don't leave the original typing indicator hanging."""
+async def test_send_reply_stream_reuses_pending_stream_for_matching_req_id():
+    """When the real response arrives after pause_typing_for_chat, it should
+    reuse the original stream_id so the final text replaces the typing
+    placeholder instead of leaving it hanging forever."""
     from gateway.config import PlatformConfig
     from gateway.platforms.wecom import WeComAdapter
 
@@ -1273,23 +1274,25 @@ async def test_send_reply_stream_closes_pending_streams_after_pause():
     adapter.pause_typing_for_chat("chat-typing")
     assert "chat-typing" in adapter._streams_pending_close
 
-    # Inline /approve response goes through _send_reply_stream
+    # Inline /approve response (different req_id) should NOT close the pending stream.
     adapter._remember_reply_req_id("msg-approve", "req-approve")
     await adapter._send_reply_stream("req-approve", "Approved!", chat_id="chat-typing")
 
-    # First call after typing should close the orphaned stream
+    # Only the inline response is sent; original stream is preserved.
+    assert adapter._send_reply_request.await_count == 2
+    inline_call = adapter._send_reply_request.await_args_list[1]
+    assert inline_call.args[1]["stream"]["finish"] is True
+    assert inline_call.args[1]["stream"]["content"] == "Approved!"
+    assert inline_call.args[1]["stream"]["id"] != typing_stream_id
+    assert "chat-typing" in adapter._streams_pending_close
+
+    # Real response arrives with matching req_id and reuses the original stream.
+    await adapter._send_reply_stream("req-typing", "Hello!", chat_id="chat-typing")
     assert adapter._send_reply_request.await_count == 3
-    close_call = adapter._send_reply_request.await_args_list[1]
-    assert close_call.args[1]["stream"]["id"] == typing_stream_id
-    assert close_call.args[1]["stream"]["finish"] is True
-    assert close_call.args[1]["stream"]["content"] == ""
-
-    # Second call is the actual inline response
-    reply_call = adapter._send_reply_request.await_args_list[2]
-    assert reply_call.args[1]["stream"]["finish"] is True
-    assert reply_call.args[1]["stream"]["content"] == "Approved!"
-
-    # Pending close set should be drained
+    final_call = adapter._send_reply_request.await_args_list[2]
+    assert final_call.args[1]["stream"]["id"] == typing_stream_id
+    assert final_call.args[1]["stream"]["finish"] is True
+    assert final_call.args[1]["stream"]["content"] == "Hello!"
     assert "chat-typing" not in adapter._streams_pending_close
 
 

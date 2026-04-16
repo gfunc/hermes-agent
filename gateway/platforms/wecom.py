@@ -1720,29 +1720,41 @@ class WeComAdapter(BasePlatformAdapter):
         return response
 
     async def _send_reply_stream(self, reply_req_id: str, content: str, chat_id: str = "") -> Dict[str, Any]:
-        # Close any streams orphaned by pause_typing_for_chat before opening
-        # a new one.  Otherwise inline responses (e.g. /approve) can leave the
-        # original typing indicator hanging forever.
-        await self._close_pending_streams()
-
         # Reuse the typing stream_id if one is active for this chat.
         # This mirrors the plugin pattern: thinking stream (finish=false)
         # and final response (finish=true) share the same stream_id.
         stream_id = None
         if chat_id:
-            state = self._typing_stream_state_by_chat.pop(chat_id, None)
-            if state and state[0] == reply_req_id:
-                stream_id = state[1]
-            elif state:
-                # The typing state belongs to a different message (e.g.
-                # inline /approve response while the original agent stream
-                # is still active). Put it back so the real response can
-                # close it later.
-                self._typing_stream_state_by_chat[chat_id] = state
+            # First check if a stream was orphaned by pause_typing_for_chat
+            # and belongs to the same message.  Reusing the stream_id lets
+            # the final response replace the <think></think> placeholder
+            # instead of leaving it hanging forever.
+            pending_state = self._streams_pending_close.pop(chat_id, None)
+            if pending_state and pending_state[0] == reply_req_id:
+                stream_id = pending_state[1]
+            elif pending_state:
+                self._streams_pending_close[chat_id] = pending_state
+
+            if not stream_id:
+                state = self._typing_stream_state_by_chat.pop(chat_id, None)
+                if state and state[0] == reply_req_id:
+                    stream_id = state[1]
+                elif state:
+                    # The typing state belongs to a different message (e.g.
+                    # inline /approve response while the original agent stream
+                    # is still active). Put it back so the real response can
+                    # close it later.
+                    self._typing_stream_state_by_chat[chat_id] = state
             # Prevent _keep_typing from opening a new stream after this
             # response closes the current one.  The typing_paused set is
             # cleared by _keep_typing's finally block.
             self._typing_paused.add(chat_id)
+
+        # Close any remaining orphaned streams that definitely won't be
+        # reused.  Skip the current chat: if we have a matching pending
+        # stream we want to send the response through it.
+        await self._close_pending_streams(skip_chat_id=chat_id or None)
+
         if not stream_id:
             stream_id = self._new_req_id("stream")
 
@@ -2187,10 +2199,14 @@ class WeComAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.debug("[%s] Failed to stop typing placeholder for %s: %s", self.name, chat_id, exc)
 
-    async def _close_pending_streams(self) -> None:
+    async def _close_pending_streams(self, skip_chat_id: Optional[str] = None) -> None:
         """Send ``finish=True`` for streams orphaned by ``pause_typing_for_chat``."""
-        while self._streams_pending_close:
-            _chat_id, (req_id, stream_id) = self._streams_pending_close.popitem()
+        items = list(self._streams_pending_close.items())
+        self._streams_pending_close.clear()
+        for _chat_id, (req_id, stream_id) in items:
+            if skip_chat_id and _chat_id == skip_chat_id:
+                self._streams_pending_close[_chat_id] = (req_id, stream_id)
+                continue
             try:
                 resp = await self._send_reply_request(
                     req_id,
