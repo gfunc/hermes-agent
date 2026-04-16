@@ -709,6 +709,9 @@ class WeComAdapter(BasePlatformAdapter):
                 backoff_idx += 1
                 logger.info("[%s] Reconnecting in %ss (attempt %s)", self.name, delay, backoff_idx)
                 await asyncio.sleep(delay)
+                if not self._running:
+                    logger.debug("[%s] Listen loop stopping after sleep (_running=False)", self.name)
+                    return
 
                 try:
                     await asyncio.wait_for(
@@ -736,9 +739,14 @@ class WeComAdapter(BasePlatformAdapter):
             raise RuntimeError("WebSocket not connected")
 
         while self._running and self._ws and not self._ws.closed:
-            msg = await asyncio.wait_for(
-                self._ws.receive(), timeout=HEARTBEAT_INTERVAL_SECONDS * 3
-            )
+            try:
+                msg = await asyncio.wait_for(
+                    self._ws.receive(), timeout=HEARTBEAT_INTERVAL_SECONDS * 3
+                )
+            except asyncio.TimeoutError:
+                raise RuntimeError(
+                    "WeCom websocket read timeout (%ss)" % (HEARTBEAT_INTERVAL_SECONDS * 3)
+                )
             if msg.type == aiohttp.WSMsgType.TEXT:
                 payload = self._parse_json(msg.data)
                 if payload:

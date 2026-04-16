@@ -1453,7 +1453,7 @@ class BasePlatformAdapter(ABC):
             "timed out" in lowered
             or "readtimeout" in lowered
             or "writetimeout" in lowered
-            or re.search(r"\\btimeout\\b", lowered) is not None
+            or re.search(r"\btimeout\b", lowered) is not None
         )
 
     async def _send_with_retry(

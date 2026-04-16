@@ -1412,3 +1412,141 @@ async def test_send_json_raises_timeout_when_ws_hangs(monkeypatch):
     adapter._ws.send_json = _hang_forever
     with pytest.raises(asyncio.TimeoutError):
         await adapter._send_json({"cmd": "test"})
+
+
+class TestWeComReconnectLogic:
+    @pytest.mark.asyncio
+    async def test_read_events_raises_when_ws_closed(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.wecom import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._running = True
+        adapter._ws = AsyncMock()
+        adapter._ws.closed = True
+
+        with pytest.raises(RuntimeError, match="WebSocket not connected"):
+            await adapter._read_events()
+
+    @pytest.mark.asyncio
+    async def test_read_events_raises_descriptive_timeout(self, monkeypatch):
+        import asyncio
+        import gateway.platforms.wecom as wecom_module
+        from gateway.config import PlatformConfig
+        from gateway.platforms.wecom import WeComAdapter
+
+        monkeypatch.setattr(wecom_module, "HEARTBEAT_INTERVAL_SECONDS", 0.05)
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._running = True
+        adapter._ws = AsyncMock()
+        adapter._ws.closed = False
+        adapter._ws.receive = AsyncMock(side_effect=asyncio.TimeoutError)
+
+        with pytest.raises(RuntimeError, match="read timeout"):
+            await adapter._read_events()
+
+    @pytest.mark.asyncio
+    async def test_listen_loop_reconnects_with_backoff_on_read_timeout(self, monkeypatch):
+        import asyncio
+        import gateway.platforms.wecom as wecom_module
+        from gateway.config import PlatformConfig
+        from gateway.platforms.wecom import WeComAdapter
+
+        monkeypatch.setattr(wecom_module, "RECONNECT_BACKOFF", [0.05, 0.1])
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._running = True
+        adapter._fail_pending_responses = lambda exc: None
+
+        read_calls = 0
+
+        async def _failing_read_events():
+            nonlocal read_calls
+            read_calls += 1
+            raise RuntimeError("WeCom websocket read timeout (0.15s)")
+
+        open_calls = 0
+
+        async def _failing_open_connection():
+            nonlocal open_calls
+            open_calls += 1
+            raise RuntimeError("auth failed")
+
+        adapter._read_events = _failing_read_events
+        adapter._open_connection = _failing_open_connection
+        adapter._cleanup_ws = AsyncMock()
+
+        task = asyncio.create_task(adapter._listen_loop())
+        await asyncio.sleep(0.35)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        assert read_calls >= 2
+        assert open_calls >= 1
+
+    @pytest.mark.asyncio
+    async def test_listen_loop_stops_after_sleep_if_running_false(self, monkeypatch):
+        import asyncio
+        import gateway.platforms.wecom as wecom_module
+        from gateway.config import PlatformConfig
+        from gateway.platforms.wecom import WeComAdapter
+
+        monkeypatch.setattr(wecom_module, "RECONNECT_BACKOFF", [0.1])
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._running = True
+        adapter._fail_pending_responses = lambda exc: None
+
+        async def _failing_read_events():
+            raise RuntimeError("WeCom websocket closed")
+
+        open_calls = 0
+
+        async def _open_connection():
+            nonlocal open_calls
+            open_calls += 1
+
+        adapter._read_events = _failing_read_events
+        adapter._open_connection = _open_connection
+        adapter._cleanup_ws = AsyncMock()
+
+        task = asyncio.create_task(adapter._listen_loop())
+        await asyncio.sleep(0.05)
+        adapter._running = False
+        await asyncio.sleep(0.2)
+
+        assert task.done()
+        assert open_calls == 0
+
+    @pytest.mark.asyncio
+    async def test_listen_loop_propagates_cancelled_error_during_reconnect(self, monkeypatch):
+        import asyncio
+        import gateway.platforms.wecom as wecom_module
+        from gateway.config import PlatformConfig
+        from gateway.platforms.wecom import WeComAdapter
+
+        monkeypatch.setattr(wecom_module, "RECONNECT_BACKOFF", [0.1])
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._running = True
+        adapter._fail_pending_responses = lambda exc: None
+
+        async def _failing_read_events():
+            raise RuntimeError("WeCom websocket closed")
+
+        async def _open_connection():
+            raise asyncio.CancelledError()
+
+        adapter._read_events = _failing_read_events
+        adapter._open_connection = _open_connection
+        adapter._cleanup_ws = AsyncMock()
+
+        task = asyncio.create_task(adapter._listen_loop())
+        await asyncio.sleep(0.05)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
