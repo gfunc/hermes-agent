@@ -1623,7 +1623,12 @@ class BasePlatformAdapter(ABC):
 
             # Call the handler (this can take a while with tool calls)
             response = await self._message_handler(event)
-            
+            logger.info(
+                "[hang-debug] handler returned for chat=%s response_len=%s",
+                event.source.chat_id,
+                len(response) if response else 0,
+            )
+
             # Send response if any.  A None/empty response is normal when
             # streaming already delivered the text (already_sent=True) or
             # when the message was queued behind an active agent.  Log at

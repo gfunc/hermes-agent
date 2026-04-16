@@ -3855,6 +3855,10 @@ class GatewayRunner:
                 _platform_name, source.chat_id or "unknown",
                 _response_time, _api_calls, _resp_len,
             )
+            logger.info(
+                "[hang-debug] entering post-processing for chat=%s",
+                source.chat_id or "unknown",
+            )
 
             # Successful turn — clear any stuck-loop counter for this session.
             # This ensures the counter only accumulates across CONSECUTIVE
