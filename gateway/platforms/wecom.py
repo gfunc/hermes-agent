@@ -407,9 +407,10 @@ class WeComAdapter(BasePlatformAdapter):
             # Platform may not support these options (macOS uses TCP_KEEPALIVE instead of TCP_KEEPIDLE)
             try:
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                # macOS uses TCP_KEEPALIVE (value 0x10) instead of TCP_KEEPIDLE
                 sock.setsockopt(socket.IPPROTO_TCP, getattr(socket, "TCP_KEEPALIVE", 0x10), TCP_KEEPALIVE_IDLE)
             except (OSError, AttributeError):
-                pass
+                logger.debug("[%s] Could not apply TCP keepalive socket options", self.name)
 
     async def _start_webhook_server(self, accounts: List[WeComAccount]) -> None:
         """Start aiohttp server for bot webhook mode accounts."""

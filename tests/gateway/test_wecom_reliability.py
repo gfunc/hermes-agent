@@ -214,3 +214,89 @@ async def test_websocket_uses_tcp_keepalive(monkeypatch):
     assert sock_opts[(socket.SOL_SOCKET, socket.SO_KEEPALIVE)] == 1
     assert (socket.IPPROTO_TCP, socket.TCP_KEEPIDLE) in sock_opts
     assert sock_opts[(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE)] == 30
+    assert (socket.IPPROTO_TCP, socket.TCP_KEEPINTVL) in sock_opts
+    assert sock_opts[(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL)] == 10
+    assert (socket.IPPROTO_TCP, socket.TCP_KEEPCNT) in sock_opts
+    assert sock_opts[(socket.IPPROTO_TCP, socket.TCP_KEEPCNT)] == 3
+
+
+async def test_apply_tcp_keepalive_fallback_when_keepidle_missing(monkeypatch):
+    import socket
+    import gateway.platforms.wecom as wecom_module
+    from gateway.platforms.wecom import WeComAdapter
+
+    monkeypatch.setattr(wecom_module, "AIOHTTP_AVAILABLE", True)
+    monkeypatch.setattr(wecom_module, "HTTPX_AVAILABLE", True)
+
+    class DummyClient:
+        async def aclose(self):
+            return None
+
+    monkeypatch.setattr(
+        wecom_module,
+        "httpx",
+        type("httpx", (), {"AsyncClient": lambda **kwargs: DummyClient()})(),
+    )
+
+    adapter = WeComAdapter(
+        PlatformConfig(enabled=True, extra={"bot_id": "bot-1", "secret": "secret-1"})
+    )
+
+    sock_opts = {}
+
+    class FakeSocket:
+        family = socket.AF_INET
+
+        def setsockopt(self, level, optname, value):
+            # Simulate missing TCP_KEEPIDLE by raising AttributeError for it
+            if level == socket.IPPROTO_TCP and optname == getattr(socket, "TCP_KEEPIDLE", 4):
+                raise AttributeError("TCP_KEEPIDLE")
+            sock_opts[(level, optname)] = value
+
+    class FakeTransport:
+        def get_extra_info(self, name):
+            if name == "socket":
+                return FakeSocket()
+            return None
+
+    class FakeWS:
+        closed = False
+
+        def get_extra_info(self, name, default=None):
+            if name == "socket":
+                return FakeTransport().get_extra_info(name)
+            return default
+
+        async def send_json(self, payload):
+            pass
+
+        async def receive(self):
+            await asyncio.Event().wait()
+
+        async def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(adapter, "_wait_for_handshake", AsyncMock(return_value={"errcode": 0}))
+
+    session_mock = AsyncMock()
+    session_mock.ws_connect = AsyncMock(return_value=FakeWS())
+    session_mock.closed = False
+    session_mock.close = AsyncMock()
+
+    monkeypatch.setattr(
+        wecom_module,
+        "aiohttp",
+        type("aiohttp", (), {
+            "ClientSession": lambda *args, **kwargs: session_mock,
+            "WSMsgType": type("WSMsgType", (), {
+                "TEXT": 1, "CLOSE": 2, "CLOSED": 3, "ERROR": 4, "PING": 5, "PONG": 6
+            }),
+        })()
+    )
+
+    await adapter._open_connection()
+
+    assert (socket.SOL_SOCKET, socket.SO_KEEPALIVE) in sock_opts
+    assert sock_opts[(socket.SOL_SOCKET, socket.SO_KEEPALIVE)] == 1
+    assert (socket.IPPROTO_TCP, getattr(socket, "TCP_KEEPALIVE", 0x10)) in sock_opts
+    assert sock_opts[(socket.IPPROTO_TCP, getattr(socket, "TCP_KEEPALIVE", 0x10))] == 30
