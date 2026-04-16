@@ -1724,6 +1724,12 @@ class WeComAdapter(BasePlatformAdapter):
             state = self._typing_stream_state_by_chat.pop(chat_id, None)
             if state and state[0] == reply_req_id:
                 stream_id = state[1]
+            elif state:
+                # The typing state belongs to a different message (e.g.
+                # inline /approve response while the original agent stream
+                # is still active). Put it back so the real response can
+                # close it later.
+                self._typing_stream_state_by_chat[chat_id] = state
             # Prevent _keep_typing from opening a new stream after this
             # response closes the current one.  The typing_paused set is
             # cleared by _keep_typing's finally block.

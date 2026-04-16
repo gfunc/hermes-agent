@@ -1157,6 +1157,42 @@ async def test_send_reply_stream_reuses_typing_stream_id():
 
 
 @pytest.mark.asyncio
+async def test_send_reply_stream_preserves_mismatched_typing_state():
+    """When reply_req_id doesn't match the typing stream (e.g. /approve inline
+    response), the original typing state must be preserved so the real response
+    can close it later."""
+    from gateway.config import PlatformConfig
+    from gateway.platforms.wecom import WeComAdapter
+
+    config = PlatformConfig(extra={"bot_id": "b", "secret": "s"})
+    adapter = WeComAdapter(config)
+    adapter._send_reply_request = AsyncMock(return_value={"headers": {"req_id": "r1"}, "body": {"errcode": 0}})
+    adapter._remember_reply_req_id("msg-typing", "req-typing")
+    adapter._remember_reply_req_id("msg-approve", "req-approve")
+
+    # Open typing stream for the original message
+    await adapter.send_typing("chat-typing", metadata={"message_id": "msg-typing"})
+    typing_stream_id = adapter._send_reply_request.await_args_list[0].args[1]["stream"]["id"]
+
+    # Simulate an inline /approve response with a different reply_req_id
+    await adapter._send_reply_stream("req-approve", "Approved!", chat_id="chat-typing")
+    approve_call = adapter._send_reply_request.await_args_list[1]
+    assert approve_call.args[1]["stream"]["id"] != typing_stream_id
+    assert approve_call.args[1]["stream"]["finish"] is True
+
+    # Original typing state should still be present
+    assert "chat-typing" in adapter._typing_stream_state_by_chat
+    assert adapter._typing_stream_state_by_chat["chat-typing"][1] == typing_stream_id
+
+    # Finally, the real response closes the original typing stream
+    await adapter._send_reply_stream("req-typing", "Hello!", chat_id="chat-typing")
+    final_call = adapter._send_reply_request.await_args_list[2]
+    assert final_call.args[1]["stream"]["id"] == typing_stream_id
+    assert final_call.args[1]["stream"]["finish"] is True
+    assert "chat-typing" not in adapter._typing_stream_state_by_chat
+
+
+@pytest.mark.asyncio
 async def test_send_typing_without_message_id_is_noop():
     from gateway.config import PlatformConfig
     from gateway.platforms.wecom import WeComAdapter
