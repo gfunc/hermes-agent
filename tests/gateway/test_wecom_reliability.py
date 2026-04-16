@@ -396,3 +396,78 @@ async def test_apply_tcp_keepalive_fallback_when_keepidle_missing(monkeypatch):
     assert sock_opts[(socket.SOL_SOCKET, socket.SO_KEEPALIVE)] == 1
     assert (socket.IPPROTO_TCP, getattr(socket, "TCP_KEEPALIVE", 0x10)) in sock_opts
     assert sock_opts[(socket.IPPROTO_TCP, getattr(socket, "TCP_KEEPALIVE", 0x10))] == 30
+
+
+async def test_mock_server_receives_and_delivers_message():
+    from tests.gateway.mock_wecom_server import MockWeComServer
+    from gateway.platforms.wecom import WeComAdapter
+    from gateway.config import PlatformConfig
+
+    server = MockWeComServer()
+    await server.start()
+    try:
+        adapter = WeComAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={
+                    "bot_id": "bot-1",
+                    "secret": "secret-1",
+                    "websocket_url": server.ws_url,
+                },
+            )
+        )
+        adapter._running = True
+
+        success = await adapter.connect()
+        assert success is True
+
+        # Give listen loop time to start
+        await asyncio.sleep(0.1)
+
+        # Verify subscription was received by mock server
+        assert any(p.get("cmd") == "aibot_subscribe" for p in server._received)
+
+        await adapter.disconnect()
+    finally:
+        await server.stop()
+
+
+async def test_adapter_reconnects_after_mock_server_closes():
+    from tests.gateway.mock_wecom_server import MockWeComServer
+    from gateway.platforms.wecom import WeComAdapter
+    from gateway.config import PlatformConfig
+
+    server = MockWeComServer(scenario="close_after_auth")
+    await server.start()
+    try:
+        adapter = WeComAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={
+                    "bot_id": "bot-1",
+                    "secret": "secret-1",
+                    "websocket_url": server.ws_url,
+                },
+            )
+        )
+        adapter._running = True
+
+        # Shorten backoff for test speed
+        import gateway.platforms.wecom as wecom_module
+        original_backoff = wecom_module.RECONNECT_BACKOFF
+        wecom_module.RECONNECT_BACKOFF = [0.05, 0.1]
+
+        success = await adapter.connect()
+        assert success is True
+
+        # Wait for server to close after auth and for reconnect to happen
+        await asyncio.sleep(0.3)
+
+        # There should be at least 2 subscribe calls (initial + reconnect)
+        subs = [p for p in server._received if p.get("cmd") == "aibot_subscribe"]
+        assert len(subs) >= 2
+
+        wecom_module.RECONNECT_BACKOFF = original_backoff
+        await adapter.disconnect()
+    finally:
+        await server.stop()
