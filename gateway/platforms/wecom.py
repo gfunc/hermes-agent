@@ -264,9 +264,9 @@ class WeComAdapter(BasePlatformAdapter):
                 self._secret = primary.secret
                 self._ws_url = primary.websocket_url
                 await self._open_connection()
-                await self._discover_mcp_configs()
                 self._listen_task = asyncio.create_task(self._listen_loop())
                 self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+                await self._discover_mcp_configs()
                 logger.info(
                     "[%s] WebSocket connected for account '%s' to %s",
                     self.name, primary.account_id, self._ws_url,
