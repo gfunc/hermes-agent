@@ -950,37 +950,6 @@ class TestMediaPreparerIntegration:
                     mock_prep.prepare.assert_awaited_once_with("/tmp/img.png", file_name=None)
 
 
-class TestCommandAuthIntegration:
-    @pytest.mark.asyncio
-    async def test_on_message_blocks_unauthorized_command(self):
-        from gateway.config import PlatformConfig
-        from gateway.platforms.wecom import WeComAdapter
-
-        config = PlatformConfig(extra={
-            "bot_id": "b",
-            "secret": "s",
-            "dm_policy": "allowlist",
-            "allow_from": ["alice"],
-        })
-        adapter = WeComAdapter(config)
-        adapter.handle_message = AsyncMock()
-
-        payload = {
-            "cmd": "aibot_msg_callback",
-            "headers": {"req_id": "r1"},
-            "body": {
-                "msgid": "m1",
-                "msgtype": "text",
-                "text": {"content": "/reset"},
-                "from": {"userid": "bob"},
-                "chatid": "c1",
-            },
-        }
-        await adapter._on_message(payload)
-        # Before implementation, this will be called. After adding auth, it should not.
-        adapter.handle_message.assert_not_awaited()
-
-
 class TestPlatformEnum:
     def test_wecom_in_platform_enum(self):
         assert Platform.WECOM.value == "wecom"

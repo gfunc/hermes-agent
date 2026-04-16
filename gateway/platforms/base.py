@@ -1449,7 +1449,12 @@ class BasePlatformAdapter(ABC):
         if not error:
             return False
         lowered = error.lower()
-        return "timed out" in lowered or "readtimeout" in lowered or "writetimeout" in lowered
+        return (
+            "timed out" in lowered
+            or "readtimeout" in lowered
+            or "writetimeout" in lowered
+            or re.search(r"\\btimeout\\b", lowered) is not None
+        )
 
     async def _send_with_retry(
         self,
@@ -1693,7 +1698,7 @@ class BasePlatformAdapter(ABC):
 
             # Call the handler (this can take a while with tool calls)
             response = await self._message_handler(event)
-            logger.info(
+            logger.debug(
                 "[hang-debug] handler returned for chat=%s response_len=%s",
                 event.source.chat_id,
                 len(response) if response else 0,
