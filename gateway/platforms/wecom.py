@@ -105,6 +105,12 @@ REQUEST_TIMEOUT_SECONDS = 15.0
 HEARTBEAT_INTERVAL_SECONDS = 30.0
 RECONNECT_BACKOFF = [2, 5, 10, 30, 60]
 
+# TCP keepalive tuning (Linux) — detect dead proxies/NAT within ~60s
+TCP_KEEPALIVE_ENABLED = True
+TCP_KEEPALIVE_IDLE = 30   # seconds before first probe
+TCP_KEEPALIVE_INTERVAL = 10  # seconds between probes
+TCP_KEEPALIVE_COUNT = 3   # probes before declaring dead
+
 DEDUP_MAX_SIZE = 1000
 
 IMAGE_MAX_BYTES = 10 * 1024 * 1024
@@ -379,6 +385,32 @@ class WeComAdapter(BasePlatformAdapter):
             pass
         self._session = None
 
+    def _apply_tcp_keepalive(self) -> None:
+        """Set TCP keepalive socket options on the active websocket."""
+        import socket
+
+        if not TCP_KEEPALIVE_ENABLED:
+            return
+        if not self._ws:
+            return
+
+        sock = self._ws.get_extra_info("socket")
+        if sock is None:
+            return
+
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, TCP_KEEPALIVE_IDLE)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, TCP_KEEPALIVE_INTERVAL)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, TCP_KEEPALIVE_COUNT)
+        except (OSError, AttributeError):
+            # Platform may not support these options (macOS uses TCP_KEEPALIVE instead of TCP_KEEPIDLE)
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                sock.setsockopt(socket.IPPROTO_TCP, getattr(socket, "TCP_KEEPALIVE", 0x10), TCP_KEEPALIVE_IDLE)
+            except (OSError, AttributeError):
+                pass
+
     async def _start_webhook_server(self, accounts: List[WeComAccount]) -> None:
         """Start aiohttp server for bot webhook mode accounts."""
         self._stream_store = StreamStore(flush_handler=self._on_webhook_flush)
@@ -651,6 +683,7 @@ class WeComAdapter(BasePlatformAdapter):
         if errcode not in (0, None):
             errmsg = auth_payload.get("errmsg", "authentication failed")
             raise RuntimeError(f"{errmsg} (errcode={errcode})")
+        self._apply_tcp_keepalive()
 
     async def _discover_mcp_configs(self) -> None:
         """Fetch MCP server URLs for known categories after WS connect."""
