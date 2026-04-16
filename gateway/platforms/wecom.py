@@ -111,6 +111,8 @@ TCP_KEEPALIVE_IDLE = 30   # seconds before first probe
 TCP_KEEPALIVE_INTERVAL = 10  # seconds between probes
 TCP_KEEPALIVE_COUNT = 3   # probes before declaring dead
 
+WATCHDOG_TIMEOUT_SECONDS = 45.0  # must be > HEARTBEAT_INTERVAL_SECONDS (30s)
+
 DEDUP_MAX_SIZE = 1000
 
 IMAGE_MAX_BYTES = 10 * 1024 * 1024
@@ -185,6 +187,8 @@ class WeComAdapter(BasePlatformAdapter):
         self._http_client: Optional["httpx.AsyncClient"] = None
         self._listen_task: Optional[asyncio.Task] = None
         self._heartbeat_task: Optional[asyncio.Task] = None
+        self._watchdog_task: Optional[asyncio.Task] = None
+        self._last_frame_at: float = 0.0
         self._pending_responses: Dict[str, asyncio.Future] = {}
         self._dedup = MessageDeduplicator(max_size=DEDUP_MAX_SIZE)
         self._reply_req_ids: Dict[str, str] = {}
@@ -272,6 +276,8 @@ class WeComAdapter(BasePlatformAdapter):
                 await self._open_connection()
                 self._listen_task = asyncio.create_task(self._listen_loop())
                 self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+                self._watchdog_task = asyncio.create_task(self._watchdog_loop())
+                self._last_frame_at = asyncio.get_running_loop().time()
                 await self._discover_mcp_configs()
                 logger.info(
                     "[%s] WebSocket connected for account '%s' to %s",
@@ -328,6 +334,13 @@ class WeComAdapter(BasePlatformAdapter):
                 except asyncio.CancelledError:
                     pass
                 self._heartbeat_task = None
+            if self._watchdog_task:
+                self._watchdog_task.cancel()
+                try:
+                    await self._watchdog_task
+                except asyncio.CancelledError:
+                    pass
+                self._watchdog_task = None
             await self._cleanup_ws()
             await self._cleanup_webhook()
             if self._http_client:
@@ -355,6 +368,14 @@ class WeComAdapter(BasePlatformAdapter):
             except asyncio.CancelledError:
                 pass
             self._heartbeat_task = None
+
+        if self._watchdog_task:
+            self._watchdog_task.cancel()
+            try:
+                await self._watchdog_task
+            except asyncio.CancelledError:
+                pass
+            self._watchdog_task = None
 
         self._fail_pending_responses(RuntimeError("WeCom adapter disconnected"))
         await self._cleanup_ws()
@@ -788,6 +809,7 @@ class WeComAdapter(BasePlatformAdapter):
             raise RuntimeError("WebSocket not connected")
 
         while self._running and self._ws and not self._ws.closed:
+            self._last_frame_at = asyncio.get_running_loop().time()
             try:
                 msg = await asyncio.wait_for(
                     self._ws.receive(), timeout=HEARTBEAT_INTERVAL_SECONDS * 3
@@ -808,6 +830,28 @@ class WeComAdapter(BasePlatformAdapter):
             self._running,
             self._ws.closed if self._ws else True,
         )
+
+    async def _watchdog_loop(self) -> None:
+        """Monitor websocket activity and force reconnect if traffic stalls."""
+        try:
+            while self._running:
+                await asyncio.sleep(WATCHDOG_TIMEOUT_SECONDS)
+                if not self._running:
+                    return
+                if not self._ws or self._ws.closed:
+                    continue
+                idle = asyncio.get_running_loop().time() - self._last_frame_at
+                if idle >= WATCHDOG_TIMEOUT_SECONDS:
+                    logger.warning(
+                        "[%s] WebSocket watchdog timeout (idle %.1fs), forcing reconnect",
+                        self.name, idle,
+                    )
+                    try:
+                        await self._ws.close()
+                    except Exception:
+                        pass
+        except asyncio.CancelledError:
+            pass
 
     async def _heartbeat_loop(self) -> None:
         """Send lightweight application-level pings."""

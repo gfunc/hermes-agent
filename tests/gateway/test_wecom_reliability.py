@@ -220,6 +220,102 @@ async def test_websocket_uses_tcp_keepalive(monkeypatch):
     assert sock_opts[(socket.IPPROTO_TCP, socket.TCP_KEEPCNT)] == 3
 
 
+async def test_watchdog_triggers_reconnect_on_silent_connection(monkeypatch):
+    """
+    If no websocket frame is received for WATCHDOG_TIMEOUT_SECONDS,
+    the watchdog should close the connection so _listen_loop reconnects.
+    """
+    import gateway.platforms.wecom as wecom_module
+    from gateway.platforms.wecom import WeComAdapter
+
+    monkeypatch.setattr(wecom_module, "AIOHTTP_AVAILABLE", True)
+    monkeypatch.setattr(wecom_module, "HTTPX_AVAILABLE", True)
+
+    class DummyClient:
+        async def aclose(self):
+            return None
+
+    monkeypatch.setattr(
+        wecom_module,
+        "httpx",
+        type("httpx", (), {"AsyncClient": lambda **kwargs: DummyClient()})(),
+    )
+
+    adapter = WeComAdapter(
+        PlatformConfig(enabled=True, extra={"bot_id": "bot-1", "secret": "secret-1"})
+    )
+
+    receive_calls = 0
+    reconnect_attempts = 0
+
+    class SilentWS:
+        def __init__(self):
+            self.closed = False
+            self._event = asyncio.Event()
+
+        async def send_json(self, payload):
+            pass
+
+        async def receive(self):
+            nonlocal receive_calls
+            receive_calls += 1
+            await self._event.wait()
+            raise RuntimeError("websocket closed")
+
+        async def close(self):
+            self.closed = True
+            self._event.set()
+
+    class SilentSession:
+        closed = False
+
+        async def ws_connect(self, *args, **kwargs):
+            nonlocal reconnect_attempts
+            reconnect_attempts += 1
+            return SilentWS()
+
+        async def close(self):
+            self.closed = True
+
+    adapter._session = SilentSession()
+    adapter._ws = SilentWS()
+    adapter._running = True
+    adapter._last_frame_at = asyncio.get_running_loop().time()
+
+    monkeypatch.setattr(wecom_module, "WATCHDOG_TIMEOUT_SECONDS", 0.2)
+    monkeypatch.setattr(wecom_module, "RECONNECT_BACKOFF", [0.05])
+
+    monkeypatch.setattr(adapter, "_wait_for_handshake", AsyncMock(return_value={"errcode": 0}))
+
+    monkeypatch.setattr(
+        wecom_module,
+        "aiohttp",
+        type("aiohttp", (), {
+            "ClientSession": lambda *args, **kwargs: SilentSession(),
+            "WSMsgType": type("WSMsgType", (), {
+                "TEXT": 1, "CLOSE": 2, "CLOSED": 3, "ERROR": 4, "PING": 5, "PONG": 6
+            }),
+        })(),
+    )
+
+    listen_task = asyncio.create_task(adapter._listen_loop())
+    watchdog_task = asyncio.create_task(adapter._watchdog_loop())
+    await asyncio.sleep(0.5)
+    adapter._running = False
+    listen_task.cancel()
+    watchdog_task.cancel()
+    try:
+        await listen_task
+    except asyncio.CancelledError:
+        pass
+    try:
+        await watchdog_task
+    except asyncio.CancelledError:
+        pass
+
+    assert reconnect_attempts >= 2
+
+
 async def test_apply_tcp_keepalive_fallback_when_keepidle_missing(monkeypatch):
     import socket
     import gateway.platforms.wecom as wecom_module
