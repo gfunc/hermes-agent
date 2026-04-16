@@ -706,6 +706,7 @@ class WeComAdapter(BasePlatformAdapter):
             errmsg = auth_payload.get("errmsg", "authentication failed")
             raise RuntimeError(f"{errmsg} (errcode={errcode})")
         self._apply_tcp_keepalive()
+        self._last_frame_at = asyncio.get_running_loop().time()
 
     async def _discover_mcp_configs(self) -> None:
         """Fetch MCP server URLs for known categories after WS connect."""
