@@ -1,7 +1,7 @@
 import asyncio
 import pytest
 
-from gateway.platforms.wecom_stream_store import StreamStore
+from gateway.platforms.wecom.stream_store import StreamStore
 
 
 @pytest.mark.asyncio
@@ -53,7 +53,7 @@ def test_ack_streams_for_batch():
 
 def test_stream_is_near_timeout():
     import time
-    from gateway.platforms.wecom_stream_store import StreamState
+    from gateway.platforms.wecom.stream_store import StreamState
 
     async def flush_handler(pending):
         pass

@@ -38,9 +38,9 @@ except ImportError:
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
-from gateway.platforms.wecom_accounts import resolve_wecom_accounts, WeComAccount
-from gateway.platforms.wecom_crypto import WXBizMsgCrypt, WeComCryptoError
-from gateway.platforms.wecom_media import MediaPreparer
+from gateway.platforms.wecom.accounts import resolve_wecom_accounts, WeComAccount
+from gateway.platforms.wecom.crypto import WXBizMsgCrypt, WeComCryptoError
+from gateway.platforms.wecom.media import MediaPreparer
 
 logger = logging.getLogger(__name__)
 

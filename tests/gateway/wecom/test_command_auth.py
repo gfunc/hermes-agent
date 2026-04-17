@@ -1,5 +1,5 @@
-from gateway.platforms.wecom_command_auth import is_command, resolve_command_auth, build_unauthorized_command_prompt
-from gateway.platforms.wecom_accounts import WeComAccount
+from gateway.platforms.wecom.command_auth import is_command, resolve_command_auth, build_unauthorized_command_prompt
+from gateway.platforms.wecom.accounts import WeComAccount
 
 
 def test_is_command_detects_slash_commands():

@@ -1,6 +1,6 @@
 import os
 from gateway.config import PlatformConfig
-from gateway.platforms.wecom_accounts import resolve_wecom_accounts
+from gateway.platforms.wecom.accounts import resolve_wecom_accounts
 
 
 def test_resolve_single_account_from_top_level():

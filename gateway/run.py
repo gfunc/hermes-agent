@@ -2493,7 +2493,7 @@ class GatewayRunner:
             return FeishuAdapter(config)
 
         elif platform == Platform.WECOM_CALLBACK:
-            from gateway.platforms.wecom_callback import (
+            from gateway.platforms.wecom.callback import (
                 WecomCallbackAdapter,
                 check_wecom_callback_requirements,
             )

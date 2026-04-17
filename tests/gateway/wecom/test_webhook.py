@@ -9,8 +9,8 @@ import pytest
 
 from gateway.config import PlatformConfig
 from gateway.platforms.wecom import WeComAdapter
-from gateway.platforms.wecom_accounts import WeComAccount
-from gateway.platforms.wecom_crypto import WXBizMsgCrypt
+from gateway.platforms.wecom.accounts import WeComAccount
+from gateway.platforms.wecom.crypto import WXBizMsgCrypt
 
 
 def _webhook_account(account_id="wh-acct", token="tok", aes_key="abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG"):
@@ -186,7 +186,7 @@ class TestWebhookCallback:
                           "bot_id": account.bot_id, "connection_mode": "webhook"}]
         }))
         # Initialize stream store and create a stream
-        from gateway.platforms.wecom_stream_store import StreamStore
+        from gateway.platforms.wecom.stream_store import StreamStore
         adapter._stream_store = StreamStore(flush_handler=lambda p: None)
         stream_id = adapter._stream_store.create_stream()
         stream = adapter._stream_store.get_stream(stream_id)
@@ -299,7 +299,7 @@ class TestWebhookCallback:
 @pytest.mark.asyncio
 async def test_stream_refresh_near_timeout_triggers_fallback():
     import time
-    from gateway.platforms.wecom_stream_store import StreamStore
+    from gateway.platforms.wecom.stream_store import StreamStore
 
     adapter = WeComAdapter(PlatformConfig(enabled=True, extra={
         "accounts": [{"account_id": "a1", "bot_id": "b1", "token": "t", "encoding_aes_key": "k", "corp_id": "c1", "connection_mode": "webhook"}]
@@ -315,7 +315,7 @@ async def test_stream_refresh_near_timeout_triggers_fallback():
     stream.content = "near timeout result"
     stream.finished = True
 
-    from gateway.platforms.wecom_accounts import WeComAccount
+    from gateway.platforms.wecom.accounts import WeComAccount
     account = WeComAccount(account_id="a1", bot_id="b1")
     response = await adapter._handle_stream_refresh(account, "c1", stream_id)
     assert response.status == 200

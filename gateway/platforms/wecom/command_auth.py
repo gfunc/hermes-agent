@@ -4,7 +4,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
-from gateway.platforms.wecom_accounts import WeComAccount
+from gateway.platforms.wecom.accounts import WeComAccount
 
 
 def is_command(raw_body: str) -> bool:

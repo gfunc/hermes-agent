@@ -1,4 +1,4 @@
-from gateway.platforms.wecom_media import detect_mime_from_bytes, apply_file_size_limits, detect_wecom_media_type
+from gateway.platforms.wecom.media import detect_mime_from_bytes, apply_file_size_limits, detect_wecom_media_type
 
 
 def test_detect_png():

@@ -11,7 +11,7 @@ pytestmark = pytest.mark.asyncio
 
 
 async def test_mock_server_starts_and_stops():
-    from tests.gateway.mock_wecom_server import MockWeComServer
+    from tests.gateway.wecom.mock_server import MockWeComServer
 
     server = MockWeComServer()
     await server.start()
@@ -25,7 +25,7 @@ async def test_connect_does_not_block_on_mcp_discovery(monkeypatch):
     Previously _discover_mcp_configs() was called before _listen_task
     was created, so _send_request futures timed out (15s x 6 = 90s).
     """
-    import gateway.platforms.wecom as wecom_module
+    import gateway.platforms.wecom.adapter as wecom_module
     from gateway.platforms.wecom import WeComAdapter
 
     monkeypatch.setattr(wecom_module, "AIOHTTP_AVAILABLE", True)
@@ -85,7 +85,7 @@ async def test_connect_cancels_tasks_when_discovery_raises(monkeypatch):
     If _discover_mcp_configs() raises after listen/heartbeat tasks are created,
     connect() must cancel and null them out to avoid dangling tasks.
     """
-    import gateway.platforms.wecom as wecom_module
+    import gateway.platforms.wecom.adapter as wecom_module
     from gateway.platforms.wecom import WeComAdapter
 
     monkeypatch.setattr(wecom_module, "AIOHTTP_AVAILABLE", True)
@@ -139,7 +139,7 @@ async def test_connect_cancels_tasks_when_discovery_raises(monkeypatch):
 
 async def test_websocket_uses_tcp_keepalive(monkeypatch):
     import socket
-    import gateway.platforms.wecom as wecom_module
+    import gateway.platforms.wecom.adapter as wecom_module
     from gateway.platforms.wecom import WeComAdapter
 
     monkeypatch.setattr(wecom_module, "AIOHTTP_AVAILABLE", True)
@@ -225,7 +225,7 @@ async def test_watchdog_triggers_reconnect_on_silent_connection(monkeypatch):
     If no websocket frame is received for WATCHDOG_TIMEOUT_SECONDS,
     the watchdog should close the connection so _listen_loop reconnects.
     """
-    import gateway.platforms.wecom as wecom_module
+    import gateway.platforms.wecom.adapter as wecom_module
     from gateway.platforms.wecom import WeComAdapter
 
     monkeypatch.setattr(wecom_module, "AIOHTTP_AVAILABLE", True)
@@ -318,7 +318,7 @@ async def test_watchdog_triggers_reconnect_on_silent_connection(monkeypatch):
 
 async def test_apply_tcp_keepalive_fallback_when_keepidle_missing(monkeypatch):
     import socket
-    import gateway.platforms.wecom as wecom_module
+    import gateway.platforms.wecom.adapter as wecom_module
     from gateway.platforms.wecom import WeComAdapter
 
     monkeypatch.setattr(wecom_module, "AIOHTTP_AVAILABLE", True)
@@ -399,7 +399,7 @@ async def test_apply_tcp_keepalive_fallback_when_keepidle_missing(monkeypatch):
 
 
 async def test_mock_server_receives_and_delivers_message():
-    from tests.gateway.mock_wecom_server import MockWeComServer
+    from tests.gateway.wecom.mock_server import MockWeComServer
     from gateway.platforms.wecom import WeComAdapter
     from gateway.config import PlatformConfig
 
@@ -450,7 +450,7 @@ async def test_mock_server_receives_and_delivers_message():
 
 
 async def test_adapter_reconnects_after_mock_server_closes():
-    from tests.gateway.mock_wecom_server import MockWeComServer
+    from tests.gateway.wecom.mock_server import MockWeComServer
     from gateway.platforms.wecom import WeComAdapter
     from gateway.config import PlatformConfig
 
@@ -469,7 +469,7 @@ async def test_adapter_reconnects_after_mock_server_closes():
         )
 
         # Shorten backoff for test speed
-        import gateway.platforms.wecom as wecom_module
+        import gateway.platforms.wecom.adapter as wecom_module
         original_backoff = wecom_module.RECONNECT_BACKOFF
         wecom_module.RECONNECT_BACKOFF = [0.05, 0.1]
 
@@ -579,7 +579,7 @@ async def test_reply_queue_respects_max_size():
 # ------------------------------------------------------------------
 
 async def test_missed_pong_closes_connection_after_three_misses(monkeypatch):
-    import gateway.platforms.wecom as wecom_module
+    import gateway.platforms.wecom.adapter as wecom_module
     from gateway.platforms.wecom import WeComAdapter
 
     monkeypatch.setattr(wecom_module, "AIOHTTP_AVAILABLE", True)
@@ -638,7 +638,7 @@ async def test_missed_pong_closes_connection_after_three_misses(monkeypatch):
 
 
 async def test_missed_pong_counter_resets_on_inbound_frame(monkeypatch):
-    import gateway.platforms.wecom as wecom_module
+    import gateway.platforms.wecom.adapter as wecom_module
     from gateway.platforms.wecom import WeComAdapter
 
     monkeypatch.setattr(wecom_module, "AIOHTTP_AVAILABLE", True)
@@ -701,9 +701,9 @@ async def test_missed_pong_counter_resets_on_inbound_frame(monkeypatch):
 # ------------------------------------------------------------------
 
 async def test_disconnected_event_prevents_reconnect():
-    from tests.gateway.mock_wecom_server import MockWeComServer
+    from tests.gateway.wecom.mock_server import MockWeComServer
     from gateway.platforms.wecom import WeComAdapter
-    import gateway.platforms.wecom as wecom_module
+    import gateway.platforms.wecom.adapter as wecom_module
 
     server = MockWeComServer(scenario="normal")
     await server.start()
@@ -741,7 +741,7 @@ async def test_disconnected_event_prevents_reconnect():
 
 
 async def test_disconnected_event_allows_reconnect_after_manual_disconnect(monkeypatch):
-    import gateway.platforms.wecom as wecom_module
+    import gateway.platforms.wecom.adapter as wecom_module
     from gateway.platforms.wecom import WeComAdapter
 
     monkeypatch.setattr(wecom_module, "AIOHTTP_AVAILABLE", True)

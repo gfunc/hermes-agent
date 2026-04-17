@@ -6,9 +6,9 @@ from xml.etree import ElementTree as ET
 import pytest
 
 from gateway.config import PlatformConfig
-from gateway.platforms.wecom_accounts import WeComAccount
-from gateway.platforms.wecom_callback import WecomCallbackAdapter
-from gateway.platforms.wecom_crypto import WXBizMsgCrypt
+from gateway.platforms.wecom.accounts import WeComAccount
+from gateway.platforms.wecom.callback import WecomCallbackAdapter
+from gateway.platforms.wecom.crypto import WXBizMsgCrypt
 
 
 def _account(account_id="test-app", corp_id="ww1234567890", agent_id=1000002):
@@ -61,7 +61,7 @@ class TestWecomCrypto:
         crypt = WXBizMsgCrypt(account.token, account.encoding_aes_key, account.corp_id)
         encrypted_xml = crypt.encrypt("<xml/>", nonce="n", timestamp="1")
         root = ET.fromstring(encrypted_xml)
-        from gateway.platforms.wecom_crypto import SignatureError
+        from gateway.platforms.wecom.crypto import SignatureError
         with pytest.raises(SignatureError):
             crypt.decrypt("bad-sig", "1", "n", root.findtext("Encrypt", default=""))
 
@@ -170,7 +170,7 @@ import logging
 
 def test_build_event_logs_agent_id_mismatch(caplog):
     from gateway.config import PlatformConfig
-    from gateway.platforms.wecom_callback import WecomCallbackAdapter
+    from gateway.platforms.wecom.callback import WecomCallbackAdapter
 
     config = PlatformConfig(
         enabled=True,
@@ -227,7 +227,7 @@ class TestWecomCallbackPollLoop:
 async def test_callback_adapter_send_document_flow():
     from unittest.mock import AsyncMock, patch
     from gateway.config import PlatformConfig
-    from gateway.platforms.wecom_callback import WecomCallbackAdapter
+    from gateway.platforms.wecom.callback import WecomCallbackAdapter
     from gateway.platforms.base import SendResult
 
     config = PlatformConfig(
@@ -243,7 +243,7 @@ async def test_callback_adapter_send_document_flow():
     adapter = WecomCallbackAdapter(config)
     adapter._http_client = AsyncMock()
 
-    with patch("gateway.platforms.wecom_callback.MediaPreparer") as mock_prep_cls:
+    with patch("gateway.platforms.wecom.callback.MediaPreparer") as mock_prep_cls:
         mock_prep = mock_prep_cls.return_value
         mock_prep.prepare = AsyncMock(return_value={
             "data": b"fakepdf",

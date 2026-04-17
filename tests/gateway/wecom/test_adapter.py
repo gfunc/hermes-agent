@@ -14,22 +14,22 @@ from gateway.platforms.base import SendResult
 
 class TestWeComRequirements:
     def test_returns_false_without_aiohttp(self, monkeypatch):
-        monkeypatch.setattr("gateway.platforms.wecom.AIOHTTP_AVAILABLE", False)
-        monkeypatch.setattr("gateway.platforms.wecom.HTTPX_AVAILABLE", True)
+        monkeypatch.setattr("gateway.platforms.wecom.adapter.AIOHTTP_AVAILABLE", False)
+        monkeypatch.setattr("gateway.platforms.wecom.adapter.HTTPX_AVAILABLE", True)
         from gateway.platforms.wecom import check_wecom_requirements
 
         assert check_wecom_requirements() is False
 
     def test_returns_false_without_httpx(self, monkeypatch):
-        monkeypatch.setattr("gateway.platforms.wecom.AIOHTTP_AVAILABLE", True)
-        monkeypatch.setattr("gateway.platforms.wecom.HTTPX_AVAILABLE", False)
+        monkeypatch.setattr("gateway.platforms.wecom.adapter.AIOHTTP_AVAILABLE", True)
+        monkeypatch.setattr("gateway.platforms.wecom.adapter.HTTPX_AVAILABLE", False)
         from gateway.platforms.wecom import check_wecom_requirements
 
         assert check_wecom_requirements() is False
 
     def test_returns_true_when_available(self, monkeypatch):
-        monkeypatch.setattr("gateway.platforms.wecom.AIOHTTP_AVAILABLE", True)
-        monkeypatch.setattr("gateway.platforms.wecom.HTTPX_AVAILABLE", True)
+        monkeypatch.setattr("gateway.platforms.wecom.adapter.AIOHTTP_AVAILABLE", True)
+        monkeypatch.setattr("gateway.platforms.wecom.adapter.HTTPX_AVAILABLE", True)
         from gateway.platforms.wecom import check_wecom_requirements
 
         assert check_wecom_requirements() is True
@@ -72,7 +72,7 @@ class TestWeComAdapterInit:
 class TestWeComConnect:
     @pytest.mark.asyncio
     async def test_connect_records_missing_credentials(self, monkeypatch):
-        import gateway.platforms.wecom as wecom_module
+        import gateway.platforms.wecom.adapter as wecom_module
         from gateway.platforms.wecom import WeComAdapter
 
         monkeypatch.setattr(wecom_module, "AIOHTTP_AVAILABLE", True)
@@ -89,7 +89,7 @@ class TestWeComConnect:
 
     @pytest.mark.asyncio
     async def test_connect_records_handshake_failure_details(self, monkeypatch):
-        import gateway.platforms.wecom as wecom_module
+        import gateway.platforms.wecom.adapter as wecom_module
         from gateway.platforms.wecom import WeComAdapter
 
         class DummyClient:
@@ -118,7 +118,7 @@ class TestWeComConnect:
 
     @pytest.mark.asyncio
     async def test_connect_discovers_mcp_configs_after_websocket_success(self, monkeypatch):
-        import gateway.platforms.wecom as wecom_module
+        import gateway.platforms.wecom.adapter as wecom_module
         from gateway.platforms.wecom import WeComAdapter
 
         class DummyClient:
@@ -164,7 +164,7 @@ class TestWeComConnect:
 
     @pytest.mark.asyncio
     async def test_connect_mcp_config_failure_is_non_fatal(self, monkeypatch):
-        import gateway.platforms.wecom as wecom_module
+        import gateway.platforms.wecom.adapter as wecom_module
         from gateway.platforms.wecom import WeComAdapter
 
         class DummyClient:
@@ -198,7 +198,7 @@ class TestWeComConnect:
 
     @pytest.mark.asyncio
     async def test_connect_mcp_config_missing_url_is_skipped(self, monkeypatch):
-        import gateway.platforms.wecom as wecom_module
+        import gateway.platforms.wecom.adapter as wecom_module
         from gateway.platforms.wecom import WeComAdapter
 
         class DummyClient:
@@ -233,7 +233,7 @@ class TestWeComConnect:
 
     @pytest.mark.asyncio
     async def test_connect_mcp_config_exception_is_non_fatal(self, monkeypatch):
-        import gateway.platforms.wecom as wecom_module
+        import gateway.platforms.wecom.adapter as wecom_module
         from gateway.platforms.wecom import WeComAdapter
 
         class DummyClient:
@@ -546,7 +546,7 @@ class TestMediaHelpers:
 class TestMediaUpload:
     @pytest.mark.asyncio
     async def test_upload_media_bytes_uses_sdk_sequence(self, monkeypatch):
-        import gateway.platforms.wecom as wecom_module
+        import gateway.platforms.wecom.adapter as wecom_module
         from gateway.platforms.wecom import (
             APP_CMD_UPLOAD_MEDIA_CHUNK,
             APP_CMD_UPLOAD_MEDIA_FINISH,
@@ -979,7 +979,7 @@ class TestMediaPreparerIntegration:
         config = PlatformConfig(extra={"bot_id": "b", "secret": "s"})
         adapter = WeComAdapter(config)
 
-        with patch("gateway.platforms.wecom.MediaPreparer") as mock_prep_cls:
+        with patch("gateway.platforms.wecom.adapter.MediaPreparer") as mock_prep_cls:
             mock_prep = mock_prep_cls.return_value
             mock_prep.prepare = AsyncMock(return_value={
                 "data": b"fakepng",
@@ -1046,7 +1046,7 @@ async def test_extract_media_extracts_video_frame():
     config = PlatformConfig(extra={"bot_id": "b", "secret": "s"})
     adapter = WeComAdapter(config)
 
-    with patch("gateway.platforms.wecom_video.extract_first_video_frame", return_value="/tmp/frame.jpg") as mock_extract:
+    with patch("gateway.platforms.wecom.video.extract_first_video_frame", return_value="/tmp/frame.jpg") as mock_extract:
         body = {
             "msgtype": "video",
             "video": {"url": "/tmp/video.mp4", "sdkfileid": "v1", "md5sum": "abc"},
@@ -1509,7 +1509,7 @@ class TestWeComReconnectLogic:
     @pytest.mark.asyncio
     async def test_read_events_raises_descriptive_timeout(self, monkeypatch):
         import asyncio
-        import gateway.platforms.wecom as wecom_module
+        import gateway.platforms.wecom.adapter as wecom_module
         from gateway.config import PlatformConfig
         from gateway.platforms.wecom import WeComAdapter
 
@@ -1527,7 +1527,7 @@ class TestWeComReconnectLogic:
     @pytest.mark.asyncio
     async def test_listen_loop_reconnects_with_backoff_on_read_timeout(self, monkeypatch):
         import asyncio
-        import gateway.platforms.wecom as wecom_module
+        import gateway.platforms.wecom.adapter as wecom_module
         from gateway.config import PlatformConfig
         from gateway.platforms.wecom import WeComAdapter
 
@@ -1569,7 +1569,7 @@ class TestWeComReconnectLogic:
     @pytest.mark.asyncio
     async def test_listen_loop_stops_after_sleep_if_running_false(self, monkeypatch):
         import asyncio
-        import gateway.platforms.wecom as wecom_module
+        import gateway.platforms.wecom.adapter as wecom_module
         from gateway.config import PlatformConfig
         from gateway.platforms.wecom import WeComAdapter
 
@@ -1603,7 +1603,7 @@ class TestWeComReconnectLogic:
     @pytest.mark.asyncio
     async def test_listen_loop_propagates_cancelled_error_during_reconnect(self, monkeypatch):
         import asyncio
-        import gateway.platforms.wecom as wecom_module
+        import gateway.platforms.wecom.adapter as wecom_module
         from gateway.config import PlatformConfig
         from gateway.platforms.wecom import WeComAdapter
 
@@ -1682,7 +1682,7 @@ class TestWeComHandshake:
     @pytest.mark.asyncio
     async def test_wait_for_handshake_raises_on_timeout(self):
         import asyncio
-        import gateway.platforms.wecom as wecom_module
+        import gateway.platforms.wecom.adapter as wecom_module
         from gateway.config import PlatformConfig
         from gateway.platforms.wecom import WeComAdapter
 
@@ -1704,7 +1704,7 @@ class TestWeComHeartbeat:
     @pytest.mark.asyncio
     async def test_heartbeat_loop_sends_ping_and_skips_when_socket_closed(self, monkeypatch):
         import asyncio
-        import gateway.platforms.wecom as wecom_module
+        import gateway.platforms.wecom.adapter as wecom_module
         from gateway.config import PlatformConfig
         from gateway.platforms.wecom import WeComAdapter
 
@@ -1739,7 +1739,7 @@ class TestWeComHeartbeat:
     @pytest.mark.asyncio
     async def test_heartbeat_loop_skips_when_ws_is_none(self, monkeypatch):
         import asyncio
-        import gateway.platforms.wecom as wecom_module
+        import gateway.platforms.wecom.adapter as wecom_module
         from gateway.config import PlatformConfig
         from gateway.platforms.wecom import WeComAdapter
 
@@ -1766,7 +1766,7 @@ class TestWeComHeartbeat:
 class TestWeComSendRetry:
     @pytest.mark.asyncio
     async def test_send_with_retry_retries_transient_network_errors(self, monkeypatch):
-        import gateway.platforms.wecom as wecom_module
+        import gateway.platforms.wecom.adapter as wecom_module
         from gateway.config import PlatformConfig
         from gateway.platforms.wecom import WeComAdapter
 
@@ -1828,7 +1828,7 @@ class TestWeComSendRetry:
 
     @pytest.mark.asyncio
     async def test_send_with_retry_sends_delivery_failure_notice_after_exhaustion(self, monkeypatch):
-        import gateway.platforms.wecom as wecom_module
+        import gateway.platforms.wecom.adapter as wecom_module
         from gateway.config import PlatformConfig
         from gateway.platforms.wecom import WeComAdapter
 

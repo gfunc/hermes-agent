@@ -1,4 +1,4 @@
-from gateway.platforms.wecom_template_cards import extract_template_cards, mask_template_card_blocks
+from gateway.platforms.wecom.template_cards import extract_template_cards, mask_template_card_blocks
 
 
 def test_extract_single_template_card():

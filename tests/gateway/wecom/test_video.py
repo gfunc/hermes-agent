@@ -1,6 +1,6 @@
 import pytest
 
-from gateway.platforms.wecom_video import extract_first_video_frame
+from gateway.platforms.wecom.video import extract_first_video_frame
 
 
 def test_extract_first_frame_returns_path_for_mp4(tmp_path):
