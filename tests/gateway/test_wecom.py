@@ -658,6 +658,56 @@ class TestMediaUpload:
         assert Path(cached_path).read_bytes() == plaintext
         assert content_type == "application/octet-stream"
 
+    @pytest.mark.asyncio
+    async def test_cache_media_falls_back_to_raw_bytes_on_decrypt_failure(self):
+        from gateway.platforms.wecom import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        png_header = b"\x89PNG\r\n\x1a\n"
+        adapter._download_remote_bytes = AsyncMock(
+            return_value=(
+                png_header,
+                {"content-type": "image/png"},
+            )
+        )
+
+        with patch.object(adapter, "_decrypt_file_bytes", side_effect=ValueError("Incorrect padding")):
+            cached = await adapter._cache_media(
+                "image",
+                {
+                    "url": "https://example.com/img.png",
+                    "aeskey": "invalid-key-for-fallback-test",
+                },
+            )
+
+        assert cached is not None
+        cached_path, content_type = cached
+        assert Path(cached_path).read_bytes() == png_header
+        assert content_type == "image/png"
+
+    @pytest.mark.asyncio
+    async def test_cache_media_returns_none_when_decrypt_fails_and_data_is_invalid(self):
+        from gateway.platforms.wecom import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._download_remote_bytes = AsyncMock(
+            return_value=(
+                b"not an image",
+                {"content-type": "application/octet-stream"},
+            )
+        )
+
+        with patch.object(adapter, "_decrypt_file_bytes", side_effect=ValueError("Incorrect padding")):
+            cached = await adapter._cache_media(
+                "image",
+                {
+                    "url": "https://example.com/corrupt.bin",
+                    "aeskey": "invalid-key-for-fallback-test",
+                },
+            )
+
+        assert cached is None
+
 
 class TestSend:
     @pytest.mark.asyncio

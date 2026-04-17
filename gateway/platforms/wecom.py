@@ -1365,8 +1365,15 @@ class WeComAdapter(BasePlatformAdapter):
             try:
                 raw = self._decrypt_file_bytes(raw, aes_key)
             except Exception as exc:
-                logger.debug("[%s] Failed to decrypt %s from %s: %s", self.name, kind, url, exc)
-                return None
+                # WeCom sometimes sends aeskey even when data is already plaintext
+                # (COS server-side encryption). Fall back to raw bytes instead of
+                # losing the media entirely. cache_image_from_bytes will reject
+                # truly corrupted data via _looks_like_image.
+                logger.warning(
+                    "[%s] AES decrypt failed for %s from %s (data may already be plaintext from COS SSE), "
+                    "using raw bytes: %s",
+                    self.name, kind, url, exc,
+                )
 
         content_type = str(headers.get("content-type") or "").split(";", 1)[0].strip() or "application/octet-stream"
         if kind == "image":
