@@ -1316,6 +1316,34 @@ async def test_send_reply_stream_reuses_pending_stream_for_matching_req_id():
 
 
 @pytest.mark.asyncio
+async def test_send_typing_skips_after_response_already_sent():
+    """Once _send_reply_stream has delivered finish=True for a req_id,
+    send_typing must not open a new stream for the same req_id.
+    This prevents the _keep_typing loop from racing and creating an
+    orphan typing stream after the response is already out."""
+    from gateway.config import PlatformConfig
+    from gateway.platforms.wecom import WeComAdapter
+
+    config = PlatformConfig(extra={"bot_id": "b", "secret": "s"})
+    adapter = WeComAdapter(config)
+    adapter._send_reply_request = AsyncMock(return_value={"headers": {"req_id": "r1"}, "body": {"errcode": 0}})
+    adapter._remember_reply_req_id("msg-typing", "req-typing")
+
+    # Open typing stream
+    await adapter.send_typing("chat-typing", metadata={"message_id": "msg-typing"})
+    assert adapter._send_reply_request.await_count == 1
+
+    # Response delivered — this marks req-typing as "response sent"
+    await adapter._send_reply_stream("req-typing", "Hello!", chat_id="chat-typing")
+    assert adapter._send_reply_request.await_count == 2
+    assert "req-typing" in adapter._reply_req_ids_with_response
+
+    # A racing send_typing (from _keep_typing) must not create a new stream
+    await adapter.send_typing("chat-typing", metadata={"message_id": "msg-typing"})
+    assert adapter._send_reply_request.await_count == 2  # no new stream
+
+
+@pytest.mark.asyncio
 async def test_send_reuses_typing_stream_when_reply_to_is_missing():
     """When send() is called without reply_to (e.g. error handler) but a typing
     stream is active, the message should reuse that stream so the placeholder

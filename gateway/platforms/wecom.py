@@ -207,6 +207,10 @@ class WeComAdapter(BasePlatformAdapter):
         self._reply_req_ids: Dict[str, str] = {}
         self._last_reply_req_id_per_chat: Dict[str, str] = {}
         self._pending_stream_acks: set[str] = set()
+        # Tracks req_ids whose final response has already been sent via
+        # _send_reply_stream. Prevents the _keep_typing loop from opening
+        # a new typing stream after the response is delivered.
+        self._reply_req_ids_with_response: set[str] = set()
         self._reply_queue = WeComReplyQueue(
             send_json_fn=self._send_json,
             pending_responses_dict=self._pending_responses,
@@ -1990,6 +1994,11 @@ class WeComAdapter(BasePlatformAdapter):
             },
         )
         self._raise_for_wecom_error(response, "send reply stream")
+        # Mark this req_id as "response already sent" so the _keep_typing
+        # loop doesn't race and open a new typing stream after this.
+        self._reply_req_ids_with_response.add(reply_req_id)
+        while len(self._reply_req_ids_with_response) > DEDUP_MAX_SIZE:
+            self._reply_req_ids_with_response.pop()
         return response
 
     async def _send_reply_stream_nonblocking(
@@ -2379,6 +2388,12 @@ class WeComAdapter(BasePlatformAdapter):
             # instead of an expired or scrolled-out original message.
             reply_req_id = self._last_reply_req_id_per_chat.get(chat_id)
         if not reply_req_id:
+            return
+
+        # If the response has already been delivered for this req_id,
+        # do not open a new typing stream — the _keep_typing loop may
+        # race with _send_reply_stream finishing.
+        if reply_req_id in self._reply_req_ids_with_response:
             return
 
         current_state = self._typing_stream_state_by_chat.get(chat_id)
