@@ -29,6 +29,8 @@ class MockWeComServer:
         self._received: List[Dict[str, Any]] = []
         self._server: Optional[web.AppRunner] = None
         self.ws_url: str = ""
+        self._drop_acks_for: set[str] = set()
+        self._delay_acks_for: Dict[str, float] = {}
 
     async def _ws_handler(self, request: web.Request) -> web.WebSocketResponse:
         ws = web.WebSocketResponse()
@@ -69,9 +71,14 @@ class MockWeComServer:
         if cmd == "ping":
             return
 
-        if cmd == "aibot_send_msg":
+        if cmd in ("aibot_send_msg", "aibot_respond_msg"):
+            if req_id in self._drop_acks_for:
+                return
+            delay = self._delay_acks_for.get(req_id, 0.0)
+            if delay > 0:
+                await asyncio.sleep(delay)
             await ws.send_json({
-                "cmd": "aibot_send_msg",
+                "cmd": cmd,
                 "headers": {"req_id": req_id},
                 "body": {"errcode": 0},
             })
@@ -85,6 +92,24 @@ class MockWeComServer:
                 "body": {"errcode": 0, "url": f"http://localhost/mcp/{category}"},
             })
             return
+
+    def drop_acks_for(self, *req_ids: str) -> None:
+        self._drop_acks_for.update(req_ids)
+
+    def delay_acks_for(self, req_id: str, seconds: float) -> None:
+        self._delay_acks_for[req_id] = seconds
+
+    async def send_event(self, event_name: str, body_extra: Optional[Dict[str, Any]] = None) -> None:
+        body = dict(body_extra or {})
+        body["event"] = event_name
+        for ws in list(self._clients):
+            if ws.closed:
+                continue
+            await ws.send_json({
+                "cmd": "aibot_event_callback",
+                "headers": {"req_id": f"mock-event-{event_name}"},
+                "body": body,
+            })
 
     async def send_callback(self, chatid: str, text: str, msgid: str = "mock-msg-1") -> None:
         for ws in list(self._clients):

@@ -1091,7 +1091,7 @@ async def test_stop_typing_finishes_stream():
     stop_body = stop_call.args[1]
     assert stop_body["msgtype"] == "stream"
     assert stop_body["stream"]["finish"] is True
-    assert stop_body["stream"]["content"] == ""
+    assert stop_body["stream"]["content"] == "\u200b"
     # State should be cleared
     assert "chat-typing" not in adapter._typing_stream_state_by_chat
 
@@ -1213,7 +1213,7 @@ async def test_pause_typing_closes_stream_and_resume_reopens():
     close_call = adapter._send_reply_request.await_args_list[1]
     assert close_call.args[1]["stream"]["id"] == first_stream_id
     assert close_call.args[1]["stream"]["finish"] is True
-    assert close_call.args[1]["stream"]["content"] == ""
+    assert close_call.args[1]["stream"]["content"] == "\u200b"
 
     # Verify the new stream has a different ID
     new_open_call = adapter._send_reply_request.await_args_list[2]
@@ -1550,3 +1550,440 @@ class TestWeComReconnectLogic:
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
+
+
+class TestWeComHandshake:
+    @pytest.mark.asyncio
+    async def test_wait_for_handshake_ignores_pings_and_preauth_payloads(self):
+        import asyncio
+        import json
+        from gateway.config import PlatformConfig
+        from gateway.platforms.wecom import WeComAdapter, APP_CMD_PING
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._ws = AsyncMock()
+        adapter._ws.closed = False
+
+        # Simulate: ping, then pre-auth payload with different req_id, then matching response
+        responses = [
+            {"cmd": APP_CMD_PING, "headers": {"req_id": "ping-1"}, "body": {}},
+            {"cmd": "other", "headers": {"req_id": "other-1"}, "body": {}},
+            {"cmd": "aibot_subscribe", "headers": {"req_id": "sub-1"}, "body": {"errcode": 0}},
+        ]
+
+        async def _receive():
+            raw = responses.pop(0)
+            msg = AsyncMock()
+            msg.type = 1  # TEXT
+            msg.data = json.dumps(raw)
+            return msg
+
+        adapter._ws.receive = _receive
+        result = await adapter._wait_for_handshake("sub-1")
+        assert result["body"]["errcode"] == 0
+
+    @pytest.mark.asyncio
+    async def test_wait_for_handshake_raises_on_close_during_auth(self):
+        import asyncio
+        from gateway.config import PlatformConfig
+        from gateway.platforms.wecom import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._ws = AsyncMock()
+        adapter._ws.closed = False
+
+        async def _receive():
+            msg = AsyncMock()
+            msg.type = 258  # CLOSE
+            return msg
+
+        adapter._ws.receive = _receive
+        with pytest.raises(RuntimeError, match="closed during authentication"):
+            await adapter._wait_for_handshake("sub-1")
+
+    @pytest.mark.asyncio
+    async def test_wait_for_handshake_raises_on_timeout(self):
+        import asyncio
+        import gateway.platforms.wecom as wecom_module
+        from gateway.config import PlatformConfig
+        from gateway.platforms.wecom import WeComAdapter
+
+        # Temporarily shorten connect timeout for test speed
+        orig_timeout = wecom_module.CONNECT_TIMEOUT_SECONDS
+        wecom_module.CONNECT_TIMEOUT_SECONDS = 0.05
+        try:
+            adapter = WeComAdapter(PlatformConfig(enabled=True))
+            adapter._ws = AsyncMock()
+            adapter._ws.closed = False
+            adapter._ws.receive = AsyncMock(side_effect=asyncio.TimeoutError)
+            with pytest.raises(TimeoutError, match="Timed out waiting"):
+                await adapter._wait_for_handshake("sub-1")
+        finally:
+            wecom_module.CONNECT_TIMEOUT_SECONDS = orig_timeout
+
+
+class TestWeComHeartbeat:
+    @pytest.mark.asyncio
+    async def test_heartbeat_loop_sends_ping_and_skips_when_socket_closed(self, monkeypatch):
+        import asyncio
+        import gateway.platforms.wecom as wecom_module
+        from gateway.config import PlatformConfig
+        from gateway.platforms.wecom import WeComAdapter
+
+        monkeypatch.setattr(wecom_module, "HEARTBEAT_INTERVAL_SECONDS", 0.05)
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._running = True
+        adapter._ws = AsyncMock()
+        adapter._ws.closed = False
+
+        sent = []
+
+        async def _capture_send_json(payload):
+            sent.append(payload)
+
+        adapter._send_json = _capture_send_json
+
+        task = asyncio.create_task(adapter._heartbeat_loop())
+        await asyncio.sleep(0.12)
+        adapter._running = False
+        await asyncio.sleep(0.01)
+        if not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        # Should have sent at least one ping
+        assert any(p.get("cmd") == wecom_module.APP_CMD_PING for p in sent)
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_loop_skips_when_ws_is_none(self, monkeypatch):
+        import asyncio
+        import gateway.platforms.wecom as wecom_module
+        from gateway.config import PlatformConfig
+        from gateway.platforms.wecom import WeComAdapter
+
+        monkeypatch.setattr(wecom_module, "HEARTBEAT_INTERVAL_SECONDS", 0.05)
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._running = True
+        adapter._ws = None
+
+        task = asyncio.create_task(adapter._heartbeat_loop())
+        await asyncio.sleep(0.08)
+        adapter._running = False
+        await asyncio.sleep(0.01)
+        if not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        # No crash = pass
+        assert True
+
+
+class TestWeComSendRetry:
+    @pytest.mark.asyncio
+    async def test_send_with_retry_retries_transient_network_errors(self, monkeypatch):
+        import gateway.platforms.wecom as wecom_module
+        from gateway.config import PlatformConfig
+        from gateway.platforms.wecom import WeComAdapter
+
+        monkeypatch.setattr(wecom_module, "RECONNECT_BACKOFF", [0.05, 0.1])
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._running = True
+
+        calls = []
+
+        async def _flaky_send(chat_id, content, reply_to=None, metadata=None):
+            calls.append(content)
+            if len(calls) < 2:
+                return SendResult(success=False, error="Connection reset by peer", retryable=True)
+            return SendResult(success=True, message_id="ok")
+
+        adapter.send = _flaky_send
+        result = await adapter._send_with_retry("chat-1", "hello", max_retries=2, base_delay=0.01)
+        assert result.success is True
+        assert len(calls) == 2
+
+    @pytest.mark.asyncio
+    async def test_send_with_retry_falls_back_to_plain_text_on_permanent_error(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.wecom import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._running = True
+
+        calls = []
+
+        async def _failing_send(chat_id, content, reply_to=None, metadata=None):
+            calls.append(content)
+            # First call fails with formatting error; fallback also fails
+            return SendResult(success=False, error="Invalid markdown format")
+
+        adapter.send = _failing_send
+        result = await adapter._send_with_retry("chat-1", "hello", max_retries=1, base_delay=0.01)
+        assert result.success is False
+        # Verify fallback content was attempted
+        assert any("Response formatting failed" in c for c in calls)
+
+    @pytest.mark.asyncio
+    async def test_send_with_retry_returns_timeout_without_fallback(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.wecom import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._running = True
+
+        async def _timeout_send(chat_id, content, reply_to=None, metadata=None):
+            return SendResult(success=False, error="Timeout sending message to WeCom")
+
+        adapter.send = _timeout_send
+        result = await adapter._send_with_retry("chat-1", "hello", max_retries=1, base_delay=0.01)
+        assert result.success is False
+        assert "Timeout sending message to WeCom" in (result.error or "")
+        assert "Response formatting failed" not in (result.error or "")
+
+    @pytest.mark.asyncio
+    async def test_send_with_retry_sends_delivery_failure_notice_after_exhaustion(self, monkeypatch):
+        import gateway.platforms.wecom as wecom_module
+        from gateway.config import PlatformConfig
+        from gateway.platforms.wecom import WeComAdapter
+
+        monkeypatch.setattr(wecom_module, "RECONNECT_BACKOFF", [0.01])
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._running = True
+
+        calls = []
+
+        async def _always_fail(chat_id, content, reply_to=None, metadata=None):
+            calls.append(content)
+            return SendResult(success=False, error="Connection reset by peer", retryable=True)
+
+        adapter.send = _always_fail
+        result = await adapter._send_with_retry("chat-1", "hello", max_retries=1, base_delay=0.01)
+        assert result.success is False
+        # The final call should be the delivery-failure notice
+        assert any("delivery failed" in c or "could not be sent" in c for c in calls)
+
+
+class TestWeComSendGuards:
+    @pytest.mark.asyncio
+    async def test_send_json_raises_when_socket_closed(self):
+        import asyncio
+        from gateway.config import PlatformConfig
+        from gateway.platforms.wecom import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._ws = AsyncMock()
+        adapter._ws.closed = True
+        with pytest.raises(RuntimeError, match="WeCom websocket is not connected"):
+            await adapter._send_json({"cmd": "test"})
+
+    @pytest.mark.asyncio
+    async def test_send_request_raises_when_socket_closed(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.wecom import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._ws = AsyncMock()
+        adapter._ws.closed = True
+        with pytest.raises(RuntimeError, match="WeCom websocket is not connected"):
+            await adapter._send_request("cmd", {})
+
+    @pytest.mark.asyncio
+    async def test_send_request_propagates_cancelled_error(self):
+        import asyncio
+        from gateway.config import PlatformConfig
+        from gateway.platforms.wecom import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._ws = AsyncMock()
+        adapter._ws.closed = False
+        adapter._ws.send_json = AsyncMock(side_effect=asyncio.CancelledError())
+        with pytest.raises(asyncio.CancelledError):
+            await adapter._send_request("cmd", {})
+
+    @pytest.mark.asyncio
+    async def test_send_reply_request_propagates_cancelled_error(self):
+        import asyncio
+        from gateway.config import PlatformConfig
+        from gateway.platforms.wecom import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._ws = AsyncMock()
+        adapter._ws.closed = False
+        adapter._ws.send_json = AsyncMock(side_effect=asyncio.CancelledError())
+        with pytest.raises(asyncio.CancelledError):
+            await adapter._send_reply_request("req-1", {})
+
+
+class TestWeComTyping846608:
+    @pytest.mark.asyncio
+    async def test_send_typing_clears_reply_cache_on_846608(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.wecom import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._last_reply_req_id_per_chat["chat-1"] = "req-old"
+        adapter._reply_req_ids["msg-1"] = "req-old"
+        adapter._ws = AsyncMock()
+        adapter._ws.closed = False
+        adapter._ws.send_json = AsyncMock(
+            side_effect=RuntimeError("846608: message expired")
+        )
+
+        await adapter.send_typing("chat-1", metadata={"message_id": "msg-1"})
+        assert "chat-1" not in adapter._last_reply_req_id_per_chat
+        assert "msg-1" not in adapter._reply_req_ids
+
+    @pytest.mark.asyncio
+    async def test_stop_typing_clears_reply_cache_on_846608(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.wecom import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._typing_stream_state_by_chat["chat-1"] = ("req-old", "stream-1")
+        # stop_typing clears by req_id key, not message_id
+        adapter._reply_req_ids["req-old"] = "stream-1"
+        adapter._last_reply_req_id_per_chat["chat-1"] = "req-old"
+        adapter._ws = AsyncMock()
+        adapter._ws.closed = False
+        adapter._ws.send_json = AsyncMock(
+            side_effect=RuntimeError("846608: message expired")
+        )
+
+        await adapter.stop_typing("chat-1")
+        assert "req-old" not in adapter._reply_req_ids
+        assert "chat-1" not in adapter._last_reply_req_id_per_chat
+
+
+class TestWeComInboundEdgeCases:
+    @pytest.mark.asyncio
+    async def test_on_message_drops_duplicate_msgid(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.wecom import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter.handle_message = AsyncMock()
+        adapter._text_batcher._batch_delay = 0  # disable async batching for synchronous test
+
+        payload = {
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": "r1"},
+            "body": {
+                "msgid": "duplicate-msg",
+                "msgtype": "text",
+                "text": {"content": "hi"},
+                "from": {"userid": "u1"},
+                "chatid": "c1",
+            },
+        }
+        await adapter._on_message(payload)
+        await adapter._on_message(payload)
+        adapter.handle_message.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_on_message_voice_sets_message_type_voice(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.wecom import WeComAdapter, MessageType
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter.handle_message = AsyncMock()
+
+        payload = {
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": "r1"},
+            "body": {
+                "msgid": "m1",
+                "msgtype": "voice",
+                "voice": {"content": "transcribed voice"},
+                "from": {"userid": "u1"},
+                "chatid": "c1",
+            },
+        }
+        await adapter._on_message(payload)
+        event = adapter.handle_message.await_args.args[0]
+        assert event.message_type == MessageType.VOICE
+
+    @pytest.mark.asyncio
+    async def test_on_message_appmsg_sets_message_type_document(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.wecom import WeComAdapter, MessageType
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter.handle_message = AsyncMock()
+
+        payload = {
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": "r1"},
+            "body": {
+                "msgid": "m1",
+                "msgtype": "appmsg",
+                "appmsg": {
+                    "title": "report.pdf",
+                    "file": {"filename": "report.pdf", "base64": "JVBERi0xLjQKJcOkw7zDtsOfCjIgMCBvYmoKPDwvTGVuZ3RoIDMgMCBSL0ZpbHRlci9GbGF0ZURlY29kZT4+CnN0cmVhbQp4nDPQM1Qo5CpUMABCXUMFZXRhCwAVvAJhCmVuZHN0cmVhbQplbmRvYmoKCjMgMCBvYmoKMTQKZW5kb2JqCgo0IDAgb2JqCjw8L1R5cGUvUGFnZS9QYXJlbnQgMiAwIFIvUmVzb3VyY2VzPDwvRm9udDw8L0YxIDUgMCBSPj4+Pi9NZWRpYUJveFswIDAgNjEyIDc5Ml0+Pj4KZW5kb2JqCgo1IDAgb2JqCjw8L1R5cGUvRm9udC9TdWJ0eXBlL1R5cGUxL0Jhc2VGb250L0hlbHZldGljYT4+CmVuZG9iagoKeHJlZgowIDYKMDAwMDAwMDAwMCA2NTUzNSBmIAowMDAwMDAwMDE4IDAwMDAwIG4gCjAwMDAwMDAwNzcgMDAwMDAgbgAgCjAwMDAwMDAyMjggMDAwMDAgbgAgCjAwMDAwMDI0NyAwMDAwMCBuIAowMDAwMDAzNTggMDAwMDAgbiAKdHJhaWxlcgo8PC9TaXplIDYvUm9vdCA0IDAgUj4+CnN0YXJ0eHJlZgo0MzYKJSVFT0Y="},
+                },
+                "from": {"userid": "u1"},
+                "chatid": "c1",
+            },
+        }
+        await adapter._on_message(payload)
+        event = adapter.handle_message.await_args.args[0]
+        assert event.message_type == MessageType.DOCUMENT
+
+    @pytest.mark.asyncio
+    async def test_on_message_image_only_without_text_dispatches(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.wecom import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter.handle_message = AsyncMock()
+        adapter._cache_media = AsyncMock(return_value=("/tmp/img.jpg", "image/jpeg"))
+
+        payload = {
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": "r1"},
+            "body": {
+                "msgid": "m1",
+                "msgtype": "image",
+                "image": {"url": "https://example.com/img.jpg"},
+                "from": {"userid": "u1"},
+                "chatid": "c1",
+            },
+        }
+        await adapter._on_message(payload)
+        adapter.handle_message.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_on_message_quote_only_without_text_uses_quote(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.wecom import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter.handle_message = AsyncMock()
+        adapter._text_batcher._batch_delay = 0  # disable async batching for synchronous test
+
+        payload = {
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": "r1"},
+            "body": {
+                "msgid": "m1",
+                "msgtype": "text",
+                "text": {"content": ""},
+                "quote": {
+                    "msgtype": "text",
+                    "text": {"content": "original question"},
+                },
+                "from": {"userid": "u1"},
+                "chatid": "c1",
+            },
+        }
+        await adapter._on_message(payload)
+        event = adapter.handle_message.await_args.args[0]
+        assert event.text == "original question"

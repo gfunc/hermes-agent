@@ -29,6 +29,11 @@ Configuration in config.yaml:
 
 from __future__ import annotations
 
+# Allow this module to also act as a package so submodules in
+# gateway/platforms/wecom/ can be imported as gateway.platforms.wecom.X.
+import os as _os
+__path__ = [_os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "wecom")]
+
 import asyncio
 import base64
 import hashlib
@@ -71,6 +76,8 @@ from gateway.platforms.wecom_command_auth import (
     build_unauthorized_command_prompt,
 )
 from gateway.platforms.wecom_stream_store import StreamStore, PendingInbound
+from gateway.platforms.wecom.reply_queue import WeComReplyQueue
+from gateway.platforms.wecom.client import WeComWSClient
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
@@ -112,6 +119,12 @@ TCP_KEEPALIVE_INTERVAL = 10  # seconds between probes
 TCP_KEEPALIVE_COUNT = 3   # probes before declaring dead
 
 WATCHDOG_TIMEOUT_SECONDS = 45.0  # must be > HEARTBEAT_INTERVAL_SECONDS (30s)
+
+MAX_MISSED_PONGS = 2  # force-close on the 3rd miss
+REPLY_QUEUE_MAX_SIZE = 500
+REPLY_QUEUE_IDLE_TIMEOUT = 1.0
+
+STREAM_FINISH_CONTENT = "\u200b"  # zero-width space so WeCom sees visible text
 
 DEDUP_MAX_SIZE = 1000
 
@@ -194,6 +207,17 @@ class WeComAdapter(BasePlatformAdapter):
         self._reply_req_ids: Dict[str, str] = {}
         self._last_reply_req_id_per_chat: Dict[str, str] = {}
         self._pending_stream_acks: set[str] = set()
+        self._reply_queue = WeComReplyQueue(
+            send_json_fn=self._send_json,
+            pending_responses_dict=self._pending_responses,
+            max_size=REPLY_QUEUE_MAX_SIZE,
+            idle_timeout=REPLY_QUEUE_IDLE_TIMEOUT,
+        )
+        self._ws_client = WeComWSClient(
+            adapter_name=self.name,
+            max_missed_pongs=MAX_MISSED_PONGS,
+        )
+        self._kicked = False
 
         # Webhook server (for bot webhook mode accounts)
         self._webhook_runner: Optional["web.AppRunner"] = None
@@ -228,6 +252,7 @@ class WeComAdapter(BasePlatformAdapter):
         - websocket: opens a persistent WebSocket connection
         - webhook: registers an aiohttp route for encrypted JSON callbacks
         """
+        self._kicked = False
         if not AIOHTTP_AVAILABLE:
             message = "WeCom startup failed: aiohttp not installed"
             self._set_fatal_error("wecom_missing_dependency", message, retryable=True)
@@ -380,6 +405,8 @@ class WeComAdapter(BasePlatformAdapter):
             self._watchdog_task = None
 
         self._fail_pending_responses(RuntimeError("WeCom adapter disconnected"))
+        self._reply_queue.fail_all(RuntimeError("WeCom adapter disconnected"))
+        self._kicked = False
         await self._cleanup_ws()
         await self._cleanup_webhook()
 
@@ -747,7 +774,10 @@ class WeComAdapter(BasePlatformAdapter):
             if remaining <= 0:
                 raise TimeoutError("Timed out waiting for WeCom subscribe acknowledgement")
 
-            msg = await asyncio.wait_for(self._ws.receive(), timeout=remaining)
+            try:
+                msg = await asyncio.wait_for(self._ws.receive(), timeout=remaining)
+            except asyncio.TimeoutError:
+                raise TimeoutError("Timed out waiting for WeCom subscribe acknowledgement")
             if msg.type == aiohttp.WSMsgType.TEXT:
                 payload = self._parse_json(msg.data)
                 if not payload:
@@ -775,8 +805,12 @@ class WeComAdapter(BasePlatformAdapter):
                 if not self._running:
                     logger.debug("[%s] Listen loop stopping (_running=False)", self.name)
                     return
+                if self._kicked:
+                    logger.warning("[%s] Connection was kicked by server, not reconnecting", self.name)
+                    return
                 logger.warning("[%s] WebSocket error: %s", self.name, exc)
                 self._fail_pending_responses(RuntimeError("WeCom connection interrupted"))
+                self._reply_queue.fail_all(RuntimeError("WeCom connection interrupted"))
 
                 delay = RECONNECT_BACKOFF[min(backoff_idx, len(RECONNECT_BACKOFF) - 1)]
                 backoff_idx += 1
@@ -784,6 +818,9 @@ class WeComAdapter(BasePlatformAdapter):
                 await asyncio.sleep(delay)
                 if not self._running:
                     logger.debug("[%s] Listen loop stopping after sleep (_running=False)", self.name)
+                    return
+                if self._kicked:
+                    logger.warning("[%s] Connection was kicked by server after sleep, not reconnecting", self.name)
                     return
 
                 try:
@@ -822,6 +859,7 @@ class WeComAdapter(BasePlatformAdapter):
                     "WeCom websocket read timeout (%ss)" % (HEARTBEAT_INTERVAL_SECONDS * 3)
                 )
             if msg.type == aiohttp.WSMsgType.TEXT:
+                await self._ws_client.on_any_frame()
                 payload = self._parse_json(msg.data)
                 if payload:
                     await self._dispatch_payload(payload)
@@ -863,11 +901,32 @@ class WeComAdapter(BasePlatformAdapter):
                 await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
                 if not self._ws or self._ws.closed:
                     continue
+
+                if await self._ws_client.increment_missed():
+                    logger.warning(
+                        "[%s] Missed %s pongs — force-closing websocket",
+                        self.name, self._ws_client.missed_pongs,
+                    )
+                    try:
+                        await self._ws.close()
+                    except Exception:
+                        pass
+                    # Also close transport directly because aiohttp close() is graceful.
+                    transport = self._ws.get_extra_info("transport")
+                    if transport is not None:
+                        try:
+                            transport.close()
+                        except Exception:
+                            pass
+                    continue
+
+                ping_req_id = self._new_req_id("ping")
+                await self._ws_client.register_ping(ping_req_id)
                 try:
                     await self._send_json(
                         {
                             "cmd": APP_CMD_PING,
-                            "headers": {"req_id": self._new_req_id("ping")},
+                            "headers": {"req_id": ping_req_id},
                             "body": {},
                         }
                     )
@@ -882,6 +941,10 @@ class WeComAdapter(BasePlatformAdapter):
         cmd = str(payload.get("cmd") or "")
         body = payload.get("body") if isinstance(payload.get("body"), dict) else {}
 
+        # Ping/pong tracking: any inbound frame for a ping req_id counts as a pong.
+        if req_id and await self._ws_client.on_pong(req_id):
+            return
+
         # Clear pending stream ack on successful response
         if body.get("errcode") in (0, None):
             self._pending_stream_acks.discard(req_id)
@@ -894,6 +957,21 @@ class WeComAdapter(BasePlatformAdapter):
 
         if cmd in CALLBACK_COMMANDS or cmd == APP_CMD_EVENT_CALLBACK:
             event_name = str(body.get("event") or "").lower()
+            if event_name == "disconnected_event":
+                logger.warning(
+                    "[%s] Server sent disconnected_event — connection kicked, disabling auto-reconnect",
+                    self.name,
+                )
+                self._running = False
+                self._kicked = True
+                try:
+                    await self._ws.close()
+                except Exception:
+                    pass
+                exc = RuntimeError("WeCom connection kicked by server")
+                self._fail_pending_responses(exc)
+                self._reply_queue.fail_all(exc)
+                return
             if event_name == "enter_check_update":
                 try:
                     await self._send_request(
@@ -959,16 +1037,13 @@ class WeComAdapter(BasePlatformAdapter):
         if not normalized_req_id:
             raise ValueError("reply_req_id is required")
 
-        future = asyncio.get_running_loop().create_future()
-        self._pending_responses[normalized_req_id] = future
-        try:
-            await self._send_json(
-                {"cmd": cmd, "headers": {"req_id": normalized_req_id}, "body": body}
-            )
-            response = await asyncio.wait_for(future, timeout=timeout)
-            return response
-        finally:
-            self._pending_responses.pop(normalized_req_id, None)
+        future = await self._reply_queue.enqueue(
+            normalized_req_id,
+            {"cmd": cmd, "headers": {"req_id": normalized_req_id}, "body": body},
+            timeout=timeout,
+        )
+        response = await future
+        return response
 
     @staticmethod
     def _new_req_id(prefix: str) -> str:
@@ -2339,9 +2414,9 @@ class WeComAdapter(BasePlatformAdapter):
     async def stop_typing(self, chat_id: str) -> None:
         """Close any active WeCom typing stream for this chat.
 
-        Sends ``finish=True`` with empty content so the three-dot animation
-        disappears.  Called from ``_keep_typing``'s finally block and from
-        ``_process_message_background``'s finally block as a safety net.
+        Sends ``finish=True`` with minimal visible content so the three-dot
+        animation disappears.  Called from ``_keep_typing``'s finally block and
+        from ``_process_message_background``'s finally block as a safety net.
 
         When the response is delivered via ``_send_reply_stream``, that method
         pauses typing and pops the state *before* this runs, so this becomes
@@ -2363,7 +2438,7 @@ class WeComAdapter(BasePlatformAdapter):
                     "stream": {
                         "id": stream_id,
                         "finish": True,
-                        "content": "",
+                        "content": STREAM_FINISH_CONTENT,
                     },
                 },
             )
@@ -2394,7 +2469,7 @@ class WeComAdapter(BasePlatformAdapter):
                     req_id,
                     {
                         "msgtype": "stream",
-                        "stream": {"id": stream_id, "finish": True, "content": ""},
+                        "stream": {"id": stream_id, "finish": True, "content": STREAM_FINISH_CONTENT},
                     },
                 )
                 self._raise_for_wecom_error(resp, "close pending typing stream")

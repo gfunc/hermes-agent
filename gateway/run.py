@@ -8061,6 +8061,11 @@ class GatewayRunner:
                 }
             # Partial response — return what we got
         finally:
+            if _adapter:
+                try:
+                    await _adapter.stop_typing(source.chat_id)
+                except Exception:
+                    pass
             # Finalize stream consumer
             if _stream_consumer:
                 _stream_consumer.finish()

@@ -487,3 +487,278 @@ async def test_adapter_reconnects_after_mock_server_closes():
         await adapter.disconnect()
     finally:
         await server.stop()
+
+
+# ------------------------------------------------------------------
+# Reply queue tests
+# ------------------------------------------------------------------
+
+async def test_reply_queue_serializes_sends_for_same_req_id():
+    from gateway.platforms.wecom.reply_queue import WeComReplyQueue
+
+    pending: dict = {}
+    sent_order: list = []
+
+    async def slow_send_json(payload):
+        sent_order.append(payload.get("id"))
+        await asyncio.sleep(0.05)
+        future = pending.get("req-1")
+        if future and not future.done():
+            future.set_result({"errcode": 0})
+
+    queue = WeComReplyQueue(slow_send_json, pending, max_size=10)
+    future1 = await queue.enqueue("req-1", {"id": "a"}, timeout=0.5)
+    future2 = await queue.enqueue("req-1", {"id": "b"}, timeout=0.5)
+
+    await asyncio.gather(future1, future2)
+    assert sent_order == ["a", "b"]
+
+
+async def test_reply_queue_fails_on_disconnect():
+    from gateway.platforms.wecom.reply_queue import WeComReplyQueue
+
+    pending: dict = {}
+
+    async def send_json(payload):
+        pass  # never acks
+
+    queue = WeComReplyQueue(send_json, pending, max_size=10)
+    future = await queue.enqueue("req-1", {}, timeout=5.0)
+    exc = RuntimeError("disconnected")
+    queue.fail_all(exc)
+    with pytest.raises(RuntimeError, match="disconnected"):
+        await future
+
+
+async def test_reply_queue_timeout_races_with_late_ack():
+    from gateway.platforms.wecom.reply_queue import WeComReplyQueue
+
+    pending: dict = {}
+
+    async def send_json(payload):
+        pass  # don't ack
+
+    queue = WeComReplyQueue(send_json, pending, max_size=10)
+    future = await queue.enqueue("req-1", {}, timeout=0.1)
+    with pytest.raises(asyncio.TimeoutError):
+        await future
+    # Late ack should be a harmless no-op (future already done)
+    assert future.done()
+
+
+async def test_reply_queue_respects_max_size():
+    from gateway.platforms.wecom.reply_queue import WeComReplyQueue
+
+    pending: dict = {}
+    blocker = asyncio.Event()
+
+    async def send_json(payload):
+        await blocker.wait()
+
+    queue = WeComReplyQueue(send_json, pending, max_size=1)
+    future1 = await queue.enqueue("req-1", {}, timeout=5.0)
+    future2 = await queue.enqueue("req-1", {}, timeout=5.0)
+    future3 = await queue.enqueue("req-1", {}, timeout=5.0)
+
+    assert isinstance(future3.exception(), RuntimeError)
+    assert "full" in str(future3.exception()).lower()
+
+    # Clean up without hanging: fail queued/in-flight futures and release blocker.
+    queue.fail_all(RuntimeError("cleanup"))
+    for fut in list(pending.values()):
+        if not fut.done():
+            fut.set_exception(RuntimeError("cleanup"))
+    blocker.set()
+    # Retrieve exceptions so asyncio doesn't warn about unhandled futures.
+    _ = future1.exception()
+    _ = future2.exception()
+
+
+# ------------------------------------------------------------------
+# Missed-pong heartbeat tests
+# ------------------------------------------------------------------
+
+async def test_missed_pong_closes_connection_after_three_misses(monkeypatch):
+    import gateway.platforms.wecom as wecom_module
+    from gateway.platforms.wecom import WeComAdapter
+
+    monkeypatch.setattr(wecom_module, "AIOHTTP_AVAILABLE", True)
+    monkeypatch.setattr(wecom_module, "HTTPX_AVAILABLE", True)
+    monkeypatch.setattr(wecom_module, "HEARTBEAT_INTERVAL_SECONDS", 0.05)
+    monkeypatch.setattr(wecom_module, "MAX_MISSED_PONGS", 2)
+
+    class DummyClient:
+        async def aclose(self):
+            pass
+
+    monkeypatch.setattr(
+        wecom_module,
+        "httpx",
+        type("httpx", (), {"AsyncClient": lambda **kwargs: DummyClient()})(),
+    )
+
+    adapter = WeComAdapter(PlatformConfig(enabled=True, extra={"bot_id": "b", "secret": "s"}))
+
+    close_calls: list = []
+    transport_close_calls: list = []
+
+    class FakeTransport:
+        def close(self):
+            transport_close_calls.append(True)
+
+    class FakeWS:
+        closed = False
+
+        def get_extra_info(self, name, default=None):
+            if name == "transport":
+                return FakeTransport()
+            return default
+
+        async def send_json(self, payload):
+            pass
+
+        async def close(self):
+            close_calls.append(True)
+            self.closed = True
+
+    adapter._ws = FakeWS()
+    adapter._running = True
+
+    task = asyncio.create_task(adapter._heartbeat_loop())
+    await asyncio.sleep(0.25)
+    adapter._running = False
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+    assert len(close_calls) >= 1
+    assert len(transport_close_calls) >= 1
+
+
+async def test_missed_pong_counter_resets_on_inbound_frame(monkeypatch):
+    import gateway.platforms.wecom as wecom_module
+    from gateway.platforms.wecom import WeComAdapter
+
+    monkeypatch.setattr(wecom_module, "AIOHTTP_AVAILABLE", True)
+    monkeypatch.setattr(wecom_module, "HTTPX_AVAILABLE", True)
+    monkeypatch.setattr(wecom_module, "HEARTBEAT_INTERVAL_SECONDS", 0.05)
+    monkeypatch.setattr(wecom_module, "MAX_MISSED_PONGS", 2)
+
+    class DummyClient:
+        async def aclose(self):
+            pass
+
+    monkeypatch.setattr(
+        wecom_module,
+        "httpx",
+        type("httpx", (), {"AsyncClient": lambda **kwargs: DummyClient()})(),
+    )
+
+    adapter = WeComAdapter(PlatformConfig(enabled=True, extra={"bot_id": "b", "secret": "s"}))
+
+    close_calls: list = []
+
+    class FakeTransport:
+        def close(self):
+            close_calls.append(True)
+
+    class FakeWS:
+        closed = False
+
+        def get_extra_info(self, name, default=None):
+            if name == "transport":
+                return FakeTransport()
+            return default
+
+        async def send_json(self, payload):
+            pass
+
+        async def close(self):
+            close_calls.append(True)
+            self.closed = True
+
+    adapter._ws = FakeWS()
+    adapter._running = True
+
+    task = asyncio.create_task(adapter._heartbeat_loop())
+    await asyncio.sleep(0.12)
+    await adapter._ws_client.on_any_frame()
+    await asyncio.sleep(0.15)
+    adapter._running = False
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+    assert len(close_calls) == 0
+
+
+# ------------------------------------------------------------------
+# Disconnected event (kicked) tests
+# ------------------------------------------------------------------
+
+async def test_disconnected_event_prevents_reconnect():
+    from tests.gateway.mock_wecom_server import MockWeComServer
+    from gateway.platforms.wecom import WeComAdapter
+    import gateway.platforms.wecom as wecom_module
+
+    server = MockWeComServer(scenario="normal")
+    await server.start()
+    try:
+        original_backoff = wecom_module.RECONNECT_BACKOFF
+        wecom_module.RECONNECT_BACKOFF = [0.05, 0.1]
+
+        adapter = WeComAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={
+                    "bot_id": "b",
+                    "secret": "s",
+                    "websocket_url": server.ws_url,
+                },
+            )
+        )
+        success = await adapter.connect()
+        assert success is True
+        await asyncio.sleep(0.1)
+
+        await server.send_event("disconnected_event")
+        await asyncio.sleep(0.3)
+
+        assert adapter._kicked is True
+        assert adapter._running is False
+
+        subs = [p for p in server._received if p.get("cmd") == "aibot_subscribe"]
+        assert len(subs) == 1  # no reconnect subscribe
+
+        wecom_module.RECONNECT_BACKOFF = original_backoff
+        await adapter.disconnect()
+    finally:
+        await server.stop()
+
+
+async def test_disconnected_event_allows_reconnect_after_manual_disconnect(monkeypatch):
+    import gateway.platforms.wecom as wecom_module
+    from gateway.platforms.wecom import WeComAdapter
+
+    monkeypatch.setattr(wecom_module, "AIOHTTP_AVAILABLE", True)
+    monkeypatch.setattr(wecom_module, "HTTPX_AVAILABLE", True)
+
+    class DummyClient:
+        async def aclose(self):
+            pass
+
+    monkeypatch.setattr(
+        wecom_module,
+        "httpx",
+        type("httpx", (), {"AsyncClient": lambda **kwargs: DummyClient()})(),
+    )
+
+    adapter = WeComAdapter(PlatformConfig(enabled=True, extra={"bot_id": "b", "secret": "s"}))
+    adapter._kicked = True
+
+    await adapter.disconnect()
+    assert adapter._kicked is False
