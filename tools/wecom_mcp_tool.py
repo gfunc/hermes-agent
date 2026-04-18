@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from typing import Any
+from typing import Any, List
 
 from tools.registry import registry
 from tools.wecom_mcp.transport import send_json_rpc, McpRpcError, McpHttpError
@@ -19,14 +19,15 @@ logger = logging.getLogger(__name__)
 
 
 def _check_wecom_configured() -> bool:
-    """WeCom MCP tool only available when WeCom is configured."""
-    # Check env vars first
+    """WeCom MCP tool only available when WeCom is fully configured."""
+    # Corp-level credentials
+    if os.getenv("WECOM_CORP_ID") and os.getenv("WECOM_CORP_SECRET"):
+        return True
+    # Bot-level credentials
     if os.getenv("WECOM_BOT_ID") and os.getenv("WECOM_SECRET"):
         return True
-    if os.getenv("WECOM_CORP_ID"):
-        return True
 
-    # Check gateway config
+    # Check gateway config for enabled WeCom platforms
     try:
         from gateway.config import load_gateway_config, Platform
 
@@ -39,6 +40,77 @@ def _check_wecom_configured() -> bool:
         pass
 
     return False
+
+
+# ── Schema helpers ────────────────────────────────────────────────────────
+
+
+def _get_available_categories() -> List[str]:
+    """Try to get actually-discovered MCP categories from the live adapter."""
+    try:
+        from gateway.run import GatewayRunner
+
+        runner = getattr(GatewayRunner, "_instance", None)
+        if runner is not None:
+            adapter = getattr(runner, "adapter", None)
+            if adapter is not None and hasattr(adapter, "get_available_mcp_categories"):
+                return adapter.get_available_mcp_categories()
+            adapters = getattr(runner, "adapters", None)
+            if adapters is not None:
+                try:
+                    from gateway.config import Platform
+
+                    wecom_adapter = adapters.get(Platform.WECOM)
+                    if wecom_adapter is not None and hasattr(
+                        wecom_adapter, "get_available_mcp_categories"
+                    ):
+                        return wecom_adapter.get_available_mcp_categories()
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return []
+
+
+def _build_wecom_mcp_schema() -> dict:
+    """Build the wecom_mcp tool schema, with dynamic category enum when available."""
+    categories = _get_available_categories()
+
+    if categories:
+        category_field = {
+            "type": "string",
+            "enum": categories,
+            "description": f"MCP category name. Available: {', '.join(categories)}",
+        }
+    else:
+        category_field = {
+            "type": "string",
+            "description": (
+                "MCP category name: contact, doc, msg, meeting, todo, schedule, smartsheet. "
+                "Use 'wecom_mcp list <category>' to discover tools in a category."
+            ),
+        }
+
+    return {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["list", "call"],
+                "description": "Action: 'list' to enumerate tools or 'call' to invoke a tool. Examples: wecom_mcp list contact, wecom_mcp call contact get_userlist '{}'",
+            },
+            "category": category_field,
+            "method": {
+                "type": "string",
+                "description": "Tool method name (required for action='call'). Example: get_userlist, get_msg_chat_list",
+            },
+            "args": {
+                "type": ["string", "object"],
+                "description": "JSON arguments as string or object (required for action='call', default: {}). Example: '{}' or '{\"chat_type\": 1}'",
+            },
+        },
+        "required": ["action", "category"],
+    }
 
 
 # ── Handler ───────────────────────────────────────────────────────────────
@@ -69,7 +141,7 @@ async def handle_wecom_mcp(args: dict, **kwargs: Any) -> str:
         return json.dumps(
             {
                 "error": "MCP_MISSING_CATEGORY",
-                "message": "Missing 'category' parameter. Provide an MCP category such as 'contact', 'meeting', 'doc', 'msg', 'todo', or 'schedule'. Example: wecom_mcp list contact",
+                "message": "Missing 'category' parameter. Provide an MCP category such as 'contact', 'meeting', 'doc', 'msg', 'todo', 'schedule', or 'smartsheet'. Example: wecom_mcp list contact",
             },
             ensure_ascii=False,
         )
@@ -86,14 +158,23 @@ async def handle_wecom_mcp(args: dict, **kwargs: Any) -> str:
 
         if action == "call":
             parsed_args = json.loads(args_param) if isinstance(args_param, str) else (args_param or {})
-            logger.debug("wecom_mcp call category=%s method=%s args_keys=%s", category, method, list(parsed_args.keys()))
+            logger.debug(
+                "wecom_mcp call category=%s method=%s args_keys=%s",
+                category,
+                method,
+                list(parsed_args.keys()),
+            )
             ctx = CallContext(category=category, method=method, args=parsed_args)
 
             resolved = await resolve_before_call(ctx)
             final_args = resolved.get("args") if resolved.get("args") is not None else parsed_args
             timeout_ms = resolved.get("timeout_ms", 30000)
             if final_args is not parsed_args:
-                logger.debug("wecom_mcp call category=%s method=%s args_modified_by_interceptors", category, method)
+                logger.debug(
+                    "wecom_mcp call category=%s method=%s args_modified_by_interceptors",
+                    category,
+                    method,
+                )
 
             result = await send_json_rpc(
                 category,
@@ -109,6 +190,20 @@ async def handle_wecom_mcp(args: dict, **kwargs: Any) -> str:
         raise ValueError(f"Unknown action: {action}")
 
     except McpRpcError as exc:
+        if exc.code == 846610:
+            logger.warning("wecom_mcp category '%s' not enabled for this bot (846610)", category)
+            return json.dumps(
+                {
+                    "error": "MCP_CATEGORY_NOT_ENABLED",
+                    "message": (
+                        f"Category '{category}' is not enabled for this WeCom bot. "
+                        "Enable it in the WeCom admin panel: "
+                        "应用管理 → 智能助手 → 企业助手 → 应用能力 → 选择对应分类"
+                    ),
+                    "category": category,
+                },
+                ensure_ascii=False,
+            )
         logger.warning("wecom_mcp RPC error [%s]: %s", exc.code, exc)
         return json.dumps(
             {"error": "MCP_RPC_ERROR", "code": exc.code, "message": str(exc)},
@@ -136,34 +231,19 @@ async def handle_wecom_mcp(args: dict, **kwargs: Any) -> str:
 
 # ── Registration ──────────────────────────────────────────────────────────
 
+_DESCRIPTION = (
+    "Call WeCom MCP servers directly via Streamable HTTP protocol. "
+    "Use 'wecom_mcp list <category>' to discover tools, then 'wecom_mcp call <category> <method> <args>' to invoke. "
+    "If a category returns 'unsupported mcp biz type' (error 846610), it means the category is not enabled for this bot. "
+    "Enable it in the WeCom admin panel under 应用管理 → 智能助手 → 企业助手 → 应用能力."
+)
+
 registry.register(
     name="wecom_mcp",
     toolset="wecom",
-    schema={
-        "type": "object",
-        "properties": {
-            "action": {
-                "type": "string",
-                "enum": ["list", "call"],
-                "description": "Action: 'list' to enumerate tools in a category, 'call' to invoke a tool. Examples: wecom_mcp list contact, wecom_mcp call contact get_userlist '{}'",
-            },
-            "category": {
-                "type": "string",
-                "description": "MCP category name: contact, doc, msg, meeting, todo, schedule",
-            },
-            "method": {
-                "type": "string",
-                "description": "Tool method name (required for action='call'). Example: get_userlist, get_msg_chat_list",
-            },
-            "args": {
-                "type": ["string", "object"],
-                "description": "JSON arguments as string or object (required for action='call', default: {}). Example: '{}' or '{\"chat_type\": 1}'",
-            },
-        },
-        "required": ["action", "category"],
-    },
+    schema=_build_wecom_mcp_schema(),
     handler=handle_wecom_mcp,
     check_fn=_check_wecom_configured,
     is_async=True,
-    description="Call WeCom MCP servers directly via Streamable HTTP protocol. Use 'wecom_mcp list <category>' to discover tools, then 'wecom_mcp call <category> <method> <args>' to invoke.",
+    description=_DESCRIPTION,
 )

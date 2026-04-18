@@ -745,7 +745,7 @@ class WeComAdapter(BasePlatformAdapter):
 
     async def _discover_mcp_configs(self) -> None:
         """Fetch MCP server URLs for known categories after WS connect."""
-        categories = ["contact", "meeting", "todo", "schedule", "doc", "msg"]
+        categories = ["contact", "meeting", "todo", "schedule", "doc", "msg", "smartsheet"]
         configs: Dict[str, str] = {}
         logger.info("[%s] Discovering MCP configs for %d categories...", self.name, len(categories))
         for category in categories:
@@ -811,6 +811,10 @@ class WeComAdapter(BasePlatformAdapter):
     def get_mcp_configs(self) -> Dict[str, str]:
         """Return the discovered {category: url} MCP config map."""
         return dict(self._mcp_configs)
+
+    def get_available_mcp_categories(self) -> List[str]:
+        """Return the list of successfully-discovered MCP category names."""
+        return list(self._mcp_configs.keys())
 
     async def _wait_for_handshake(self, req_id: str) -> Dict[str, Any]:
         """Wait for the subscribe acknowledgement."""

@@ -154,12 +154,13 @@ class TestWeComConnect:
             "schedule": "https://mcp.example/schedule",
             "doc": "https://mcp.example/doc",
             "msg": "https://mcp.example/msg",
+            "smartsheet": "https://mcp.example/smartsheet",
         }
         # Verify _send_request was called for each category with aibot_get_mcp_config
-        assert adapter._send_request.await_count == 6
+        assert adapter._send_request.await_count == 7
         calls = adapter._send_request.await_args_list
         categories = [c.args[1]["biz_type"] for c in calls]
-        assert categories == ["contact", "meeting", "todo", "schedule", "doc", "msg"]
+        assert categories == ["contact", "meeting", "todo", "schedule", "doc", "msg", "smartsheet"]
         assert all(c.args[0] == "aibot_get_mcp_config" for c in calls)
 
     @pytest.mark.asyncio

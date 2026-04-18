@@ -37,6 +37,7 @@ class TestCheckFn:
 
     def test_check_fn_true_via_env_corp_id(self, monkeypatch):
         monkeypatch.setenv("WECOM_CORP_ID", "corp-1")
+        monkeypatch.setenv("WECOM_CORP_SECRET", "secret-1")
         assert _check_wecom_configured() is True
 
     def test_check_fn_false_when_nothing_set(self, monkeypatch):
@@ -475,3 +476,72 @@ class TestHandleWecomMcpDispatch:
             parsed = json.loads(result)
             assert parsed["category"] == "contact"
             assert parsed["count"] == 0
+
+
+# ------------------------------------------------------------------
+# Error 846610 — category not enabled
+# ------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_call_action_returns_friendly_error_on_846610(monkeypatch):
+    """Error 846610 'unsupported mcp biz type' should return actionable guidance."""
+    from tools.wecom_mcp.transport import McpRpcError
+
+    async def fake_send_json_rpc(category, method, params=None, *, timeout_ms=30000):
+        raise McpRpcError(846610, "unsupported mcp biz type")
+
+    monkeypatch.setattr(
+        "tools.wecom_mcp_tool.send_json_rpc",
+        fake_send_json_rpc,
+    )
+
+    result = await handle_wecom_mcp(
+        {"action": "list", "category": "meeting"},
+        task_id="test-task",
+    )
+    parsed = json.loads(result)
+    assert parsed["error"] == "MCP_CATEGORY_NOT_ENABLED"
+    assert "meeting" in parsed["message"]
+    assert "WeCom admin panel" in parsed["message"]
+    assert parsed["category"] == "meeting"
+
+
+# ------------------------------------------------------------------
+# Dynamic schema
+# ------------------------------------------------------------------
+
+class TestDynamicSchema:
+    def test_schema_uses_enum_when_categories_available(self, monkeypatch):
+        """When the adapter reports available categories, schema should use enum."""
+        fake_adapter = type("Adapter", (), {
+            "get_available_mcp_categories": lambda self: ["doc", "msg"],
+        })()
+        fake_runner = type("Runner", (), {"adapter": fake_adapter})()
+
+        monkeypatch.setattr(
+            "tools.wecom_mcp_tool._get_available_categories",
+            lambda: ["doc", "msg"],
+        )
+
+        from tools.wecom_mcp_tool import _build_wecom_mcp_schema
+        schema = _build_wecom_mcp_schema()
+        category = schema["properties"]["category"]
+        assert category["type"] == "string"
+        assert category["enum"] == ["doc", "msg"]
+        assert "doc" in category["description"]
+        assert "msg" in category["description"]
+
+    def test_schema_fallback_when_no_categories(self, monkeypatch):
+        """When no adapter is available, schema should be free-form string."""
+        monkeypatch.setattr(
+            "tools.wecom_mcp_tool._get_available_categories",
+            lambda: [],
+        )
+
+        from tools.wecom_mcp_tool import _build_wecom_mcp_schema
+        schema = _build_wecom_mcp_schema()
+        category = schema["properties"]["category"]
+        assert category["type"] == "string"
+        assert "enum" not in category
+        assert "contact" in category["description"]
+        assert "smartsheet" in category["description"]
