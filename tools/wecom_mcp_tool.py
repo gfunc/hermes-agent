@@ -55,6 +55,25 @@ async def handle_wecom_mcp(args: dict, **kwargs: Any) -> str:
     method = args.get("method", "")
     args_param = args.get("args")
     logger.debug("wecom_mcp %s category=%s method=%s", action, category, method or "-")
+
+    if not isinstance(action, str) or not action.strip():
+        return json.dumps(
+            {
+                "error": "MCP_MISSING_ACTION",
+                "message": "Missing 'action' parameter. Use 'list' to enumerate tools or 'call' to invoke a tool. Example: wecom_mcp list contact",
+            },
+            ensure_ascii=False,
+        )
+
+    if not isinstance(category, str) or not category.strip():
+        return json.dumps(
+            {
+                "error": "MCP_MISSING_CATEGORY",
+                "message": "Missing 'category' parameter. Provide an MCP category such as 'contact', 'meeting', 'doc', 'msg', 'todo', or 'schedule'. Example: wecom_mcp list contact",
+            },
+            ensure_ascii=False,
+        )
+
     try:
         if action == "list":
             result = await send_json_rpc(category, "tools/list")

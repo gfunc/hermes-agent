@@ -296,6 +296,75 @@ async def test_call_action_interceptor_after_call(monkeypatch):
 
 
 # ------------------------------------------------------------------
+# Missing action / category guards
+# ------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_missing_action_returns_error_json():
+    """Empty action should return a helpful error instead of 'Unknown action:'."""
+    result = await handle_wecom_mcp(
+        {"action": "", "category": "contact"},
+        task_id="test-task",
+    )
+    parsed = json.loads(result)
+    assert parsed["error"] == "MCP_MISSING_ACTION"
+    assert "Missing 'action' parameter" in parsed["message"]
+
+
+@pytest.mark.asyncio
+async def test_missing_category_returns_error_json():
+    """Empty category should return a helpful error."""
+    result = await handle_wecom_mcp(
+        {"action": "list", "category": ""},
+        task_id="test-task",
+    )
+    parsed = json.loads(result)
+    assert parsed["error"] == "MCP_MISSING_CATEGORY"
+    assert "Missing 'category' parameter" in parsed["message"]
+
+
+@pytest.mark.asyncio
+async def test_none_action_returns_error_json():
+    """None action should be treated as missing."""
+    result = await handle_wecom_mcp(
+        {"category": "contact"},
+        task_id="test-task",
+    )
+    parsed = json.loads(result)
+    assert parsed["error"] == "MCP_MISSING_ACTION"
+
+
+@pytest.mark.asyncio
+async def test_none_category_returns_error_json():
+    """None category should be treated as missing."""
+    result = await handle_wecom_mcp(
+        {"action": "list"},
+        task_id="test-task",
+    )
+    parsed = json.loads(result)
+    assert parsed["error"] == "MCP_MISSING_CATEGORY"
+
+
+# ------------------------------------------------------------------
+# Config guard
+# ------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_unconfigured_category_returns_error_json():
+    """When MCP config is missing, transport should raise a clear RuntimeError."""
+    import tools.wecom_mcp.transport as t
+    t._mcp_config_cache.clear()
+
+    result = await handle_wecom_mcp(
+        {"action": "list", "category": "nonexistent"},
+        task_id="test-task",
+    )
+    parsed = json.loads(result)
+    assert parsed["error"] == "MCP_CONFIG_ERROR"
+    assert "MCP config unavailable" in parsed["message"]
+
+
+# ------------------------------------------------------------------
 # Unknown action
 # ------------------------------------------------------------------
 

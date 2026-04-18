@@ -84,10 +84,10 @@ class MockWeComServer:
             })
             return
 
-        if cmd == "mcp_get_config":
-            category = payload.get("body", {}).get("category", "unknown")
+        if cmd == "aibot_get_mcp_config":
+            category = payload.get("body", {}).get("biz_type", "unknown")
             await ws.send_json({
-                "cmd": "mcp_get_config",
+                "cmd": "aibot_get_mcp_config",
                 "headers": {"req_id": req_id},
                 "body": {"errcode": 0, "url": f"http://localhost/mcp/{category}"},
             })

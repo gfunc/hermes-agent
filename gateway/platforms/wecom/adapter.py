@@ -96,7 +96,7 @@ APP_CMD_PING = "ping"
 APP_CMD_UPLOAD_MEDIA_INIT = "aibot_upload_media_init"
 APP_CMD_UPLOAD_MEDIA_CHUNK = "aibot_upload_media_chunk"
 APP_CMD_UPLOAD_MEDIA_FINISH = "aibot_upload_media_finish"
-APP_CMD_MCP_GET_CONFIG = "mcp_get_config"
+APP_CMD_MCP_GET_CONFIG = "aibot_get_mcp_config"
 
 CALLBACK_COMMANDS = {APP_CMD_CALLBACK, APP_CMD_LEGACY_CALLBACK}
 NON_RESPONSE_COMMANDS = CALLBACK_COMMANDS | {APP_CMD_EVENT_CALLBACK}
@@ -749,21 +749,52 @@ class WeComAdapter(BasePlatformAdapter):
         configs: Dict[str, str] = {}
         for category in categories:
             try:
-                response = await self._send_request(
-                    APP_CMD_MCP_GET_CONFIG,
-                    {"category": category},
-                    timeout=REQUEST_TIMEOUT_SECONDS,
-                )
-                if response.get("errcode") in (0, None):
-                    body = response.get("body") or {}
-                    url = body.get("url")
-                    if url:
-                        configs[category] = url
+                cfg = await self._fetch_single_mcp_config(category)
+                if cfg:
+                    configs[category] = cfg
             except Exception as exc:
                 logger.debug("[%s] MCP config discovery failed for %s: %s", self.name, category, exc)
         self._mcp_configs = configs
         if configs:
             logger.info("[%s] Discovered MCP configs for categories: %s", self.name, list(configs.keys()))
+
+    async def _fetch_single_mcp_config(self, category: str) -> Optional[str]:
+        """Fetch MCP URL for a single category via active WebSocket.
+
+        Matches the OpenClaw protocol: ``aibot_get_mcp_config`` with
+        ``biz_type`` body field.
+        """
+        response = await self._send_request(
+            APP_CMD_MCP_GET_CONFIG,
+            {"biz_type": category},
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        )
+        if response.get("errcode") not in (0, None):
+            errcode = response.get("errcode")
+            errmsg = response.get("errmsg", "unknown")
+            raise RuntimeError(f"MCP config request failed: errcode={errcode}, errmsg={errmsg}")
+
+        body = response.get("body") or {}
+        url = body.get("url")
+        if url:
+            return str(url)
+        return None
+
+    async def refresh_mcp_config(self, category: str) -> Optional[str]:
+        """On-demand fetch (or refresh) of a single MCP config.
+
+        Used by the transport layer when connect-time discovery returned
+        empty results or when a cached config is suspected stale.
+        """
+        try:
+            url = await self._fetch_single_mcp_config(category)
+            if url:
+                self._mcp_configs[category] = url
+                logger.info("[%s] Refreshed MCP config for '%s': %s", self.name, category, url)
+            return url
+        except Exception as exc:
+            logger.debug("[%s] MCP config refresh failed for %s: %s", self.name, category, exc)
+            return None
 
     def get_mcp_configs(self) -> Dict[str, str]:
         """Return the discovered {category: url} MCP config map."""

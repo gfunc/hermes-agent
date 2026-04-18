@@ -139,7 +139,7 @@ class TestWeComConnect:
         adapter._open_connection = AsyncMock()
 
         async def fake_send_request(cmd, body, timeout=0):
-            category = body.get("category")
+            category = body.get("biz_type")
             return {"errcode": 0, "body": {"url": f"https://mcp.example/{category}"}}
 
         adapter._send_request = AsyncMock(side_effect=fake_send_request)
@@ -155,12 +155,12 @@ class TestWeComConnect:
             "doc": "https://mcp.example/doc",
             "msg": "https://mcp.example/msg",
         }
-        # Verify _send_request was called for each category with mcp_get_config
+        # Verify _send_request was called for each category with aibot_get_mcp_config
         assert adapter._send_request.await_count == 6
         calls = adapter._send_request.await_args_list
-        categories = [c.args[1]["category"] for c in calls]
+        categories = [c.args[1]["biz_type"] for c in calls]
         assert categories == ["contact", "meeting", "todo", "schedule", "doc", "msg"]
-        assert all(c.args[0] == "mcp_get_config" for c in calls)
+        assert all(c.args[0] == "aibot_get_mcp_config" for c in calls)
 
     @pytest.mark.asyncio
     async def test_connect_mcp_config_failure_is_non_fatal(self, monkeypatch):
@@ -185,7 +185,7 @@ class TestWeComConnect:
         adapter._open_connection = AsyncMock()
 
         async def fake_send_request(cmd, body, timeout=0):
-            if body.get("category") == "contact":
+            if body.get("biz_type") == "contact":
                 return {"errcode": 0, "body": {"url": "https://mcp.example/contact"}}
             return {"errcode": 50001, "errmsg": "internal error"}
 
@@ -219,7 +219,7 @@ class TestWeComConnect:
         adapter._open_connection = AsyncMock()
 
         async def fake_send_request(cmd, body, timeout=0):
-            if body.get("category") == "contact":
+            if body.get("biz_type") == "contact":
                 return {"errcode": 0, "body": {"url": "https://mcp.example/contact"}}
             # Missing url field
             return {"errcode": 0, "body": {}}

@@ -97,7 +97,8 @@ def _get_wecom_adapter() -> Optional[Any]:
 async def fetch_mcp_config(category: str) -> dict:
     """Fetch full MCP config dict for a category.
 
-    Priority: in-memory cache -> WeCom adapter -> WECOM_MCP_CONFIG env var.
+    Priority: in-memory cache -> WeCom adapter cache -> WeCom adapter
+    on-demand fetch -> WECOM_MCP_CONFIG env var.
     """
     cached = _mcp_config_cache.get(category)
     if cached is not None:
@@ -106,15 +107,28 @@ async def fetch_mcp_config(category: str) -> dict:
 
     adapter = _get_wecom_adapter()
     if adapter is not None:
+        # 1. Try adapter's connect-time cached configs
         try:
             configs = adapter.get_mcp_configs()
             if category in configs:
                 cfg = {"url": configs[category]}
                 _mcp_config_cache[category] = cfg
-                logger.info("%s Config from adapter '%s': %s", LOG_TAG, category, cfg["url"])
+                logger.info("%s Config from adapter cache '%s': %s", LOG_TAG, category, cfg["url"])
                 return cfg
         except Exception as exc:
-            logger.debug("%s Adapter config failed: %s", LOG_TAG, exc)
+            logger.debug("%s Adapter config cache read failed: %s", LOG_TAG, exc)
+
+        # 2. On-demand fetch via active WebSocket (OpenClaw-style dynamic pull)
+        if hasattr(adapter, "refresh_mcp_config"):
+            try:
+                url = await adapter.refresh_mcp_config(category)
+                if url:
+                    cfg = {"url": url}
+                    _mcp_config_cache[category] = cfg
+                    logger.info("%s Config from adapter on-demand '%s': %s", LOG_TAG, category, url)
+                    return cfg
+            except Exception as exc:
+                logger.debug("%s Adapter on-demand fetch failed: %s", LOG_TAG, exc)
 
     env_raw = os.getenv("WECOM_MCP_CONFIG", "")
     if env_raw:
@@ -311,6 +325,9 @@ async def initialize_session(url: str, category: str) -> McpSession:
 
 async def get_or_create_session(url: str, category: str) -> McpSession:
     """Get existing session or create a new one (dedup concurrent init)."""
+    if not url:
+        raise RuntimeError(f"MCP server not configured for category '{category}'")
+
     if category in _stateless_categories:
         cached = _mcp_session_cache.get(category)
         if cached is not None:
@@ -390,7 +407,12 @@ async def send_json_rpc(
     Auto-manages session lifecycle, rebuilds on 404, clears cache on
     error codes -32001/-32002/-32003.
     """
+    if not category:
+        raise RuntimeError("MCP category must be a non-empty string")
+
     url = await _get_mcp_url(category)
+    if not url:
+        raise RuntimeError(f"MCP server not configured for category '{category}'")
 
     body: Dict[str, Any] = {
         "jsonrpc": "2.0",
