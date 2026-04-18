@@ -19,11 +19,12 @@ logger = logging.getLogger(__name__)
 
 
 def _check_wecom_configured() -> bool:
-    """WeCom MCP tool only available when WeCom is fully configured."""
-    # Corp-level credentials
-    if os.getenv("WECOM_CORP_ID") and os.getenv("WECOM_CORP_SECRET"):
-        return True
-    # Bot-level credentials
+    """WeCom MCP tool only available when bot credentials are present.
+
+    MCP requires the WebSocket long-connection, which is authenticated
+    with bot_id + secret. corp_id + corp_secret alone (Agent/webhook
+    mode) does not enable MCP.
+    """
     if os.getenv("WECOM_BOT_ID") and os.getenv("WECOM_SECRET"):
         return True
 

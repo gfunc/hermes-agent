@@ -35,21 +35,24 @@ class TestCheckFn:
         monkeypatch.setenv("WECOM_SECRET", "secret-1")
         assert _check_wecom_configured() is True
 
-    def test_check_fn_true_via_env_corp_id(self, monkeypatch):
+    def test_check_fn_false_via_env_corp_id_only(self, monkeypatch):
+        """corp_id + corp_secret alone does NOT enable MCP (needs bot_id + secret)."""
         monkeypatch.setenv("WECOM_CORP_ID", "corp-1")
         monkeypatch.setenv("WECOM_CORP_SECRET", "secret-1")
-        assert _check_wecom_configured() is True
+        assert _check_wecom_configured() is False
 
     def test_check_fn_false_when_nothing_set(self, monkeypatch):
         monkeypatch.delenv("WECOM_BOT_ID", raising=False)
         monkeypatch.delenv("WECOM_SECRET", raising=False)
         monkeypatch.delenv("WECOM_CORP_ID", raising=False)
+        monkeypatch.delenv("WECOM_CORP_SECRET", raising=False)
         assert _check_wecom_configured() is False
 
     def test_check_fn_true_via_gateway_config(self, monkeypatch):
         monkeypatch.delenv("WECOM_BOT_ID", raising=False)
         monkeypatch.delenv("WECOM_SECRET", raising=False)
         monkeypatch.delenv("WECOM_CORP_ID", raising=False)
+        monkeypatch.delenv("WECOM_CORP_SECRET", raising=False)
 
         fake_config = {
             "platforms": {
