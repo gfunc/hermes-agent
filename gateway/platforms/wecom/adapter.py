@@ -201,6 +201,7 @@ class WeComAdapter(BasePlatformAdapter):
         self._dedup = MessageDeduplicator(max_size=DEDUP_MAX_SIZE)
         self._reply_req_ids: Dict[str, str] = {}
         self._last_reply_req_id_per_chat: Dict[str, str] = {}
+        self._device_id = uuid.uuid4().hex
         self._pending_stream_acks: set[str] = set()
         # Tracks req_ids currently in the process of sending a response via
         # _send_reply_stream. Prevents the _keep_typing loop from opening a
@@ -726,7 +727,11 @@ class WeComAdapter(BasePlatformAdapter):
             {
                 "cmd": APP_CMD_SUBSCRIBE,
                 "headers": {"req_id": req_id},
-                "body": {"bot_id": self._bot_id, "secret": self._secret},
+                "body": {
+                    "bot_id": self._bot_id,
+                    "secret": self._secret,
+                    "device_id": self._device_id,
+                },
             }
         )
 
@@ -1092,13 +1097,6 @@ class WeComAdapter(BasePlatformAdapter):
             logger.debug("[%s] Missing chat id, skipping message", self.name)
             return
 
-        # Also track the freshest req_id per chat so resumed typing after
-        # /approve can use the most recent (still-valid) message's req_id.
-        if str(body.get("msgtype") or "").lower() != "event":
-            _req_id = self._payload_req_id(payload)
-            if _req_id:
-                self._last_reply_req_id_per_chat[chat_id] = _req_id
-
         is_group = str(body.get("chattype") or "").lower() == "group"
         if is_group:
             if not self._is_group_allowed(chat_id, sender_id):
@@ -1121,6 +1119,16 @@ class WeComAdapter(BasePlatformAdapter):
                     except Exception as exc:
                         logger.warning("[%s] Failed to send pairing rejection: %s", self.name, exc)
                 return
+
+        # Cache the freshest req_id per chat AFTER policy checks so proactive
+        # sends (e.g. cron, delayed replies) can fall back to APP_CMD_RESPONSE.
+        # Bounded to prevent unbounded growth on long-running gateways.
+        if str(body.get("msgtype") or "").lower() != "event":
+            _req_id = self._payload_req_id(payload)
+            if _req_id:
+                self._last_reply_req_id_per_chat[chat_id] = _req_id
+                while len(self._last_reply_req_id_per_chat) > DEDUP_MAX_SIZE:
+                    self._last_reply_req_id_per_chat.pop(next(iter(self._last_reply_req_id_per_chat)))
 
         text, reply_text = self._extract_text(body)
 

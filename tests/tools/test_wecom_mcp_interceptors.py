@@ -284,7 +284,8 @@ class TestSmartpageCreateInterceptor:
         assert result is None
 
     @pytest.mark.asyncio
-    async def test_before_call_resolves_pages(self, tmp_path):
+    async def test_before_call_resolves_pages(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("WECOM_MCP_UPLOAD_ROOT", str(tmp_path))
         f1 = tmp_path / "page1.md"
         f1.write_text("# Page 1")
         f2 = tmp_path / "page2.md"
@@ -305,7 +306,8 @@ class TestSmartpageCreateInterceptor:
         assert "page_filepath" not in resolved[1]
 
     @pytest.mark.asyncio
-    async def test_before_call_file_not_found(self, tmp_path):
+    async def test_before_call_file_not_found(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("WECOM_MCP_UPLOAD_ROOT", str(tmp_path))
         interceptor = SmartpageCreateInterceptor()
         ctx = CallContext(
             category="doc",
@@ -316,7 +318,8 @@ class TestSmartpageCreateInterceptor:
             await interceptor.before_call(ctx)
 
     @pytest.mark.asyncio
-    async def test_before_call_single_file_too_large(self, tmp_path):
+    async def test_before_call_single_file_too_large(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("WECOM_MCP_UPLOAD_ROOT", str(tmp_path))
         big = tmp_path / "big.md"
         big.write_bytes(b"x" * (10 * 1024 * 1024 + 1))
 
@@ -330,7 +333,8 @@ class TestSmartpageCreateInterceptor:
             await interceptor.before_call(ctx)
 
     @pytest.mark.asyncio
-    async def test_before_call_total_size_too_large(self, tmp_path):
+    async def test_before_call_total_size_too_large(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("WECOM_MCP_UPLOAD_ROOT", str(tmp_path))
         f1 = tmp_path / "a.md"
         f1.write_bytes(b"x" * (7 * 1024 * 1024))
         f2 = tmp_path / "b.md"
@@ -349,6 +353,30 @@ class TestSmartpageCreateInterceptor:
             ]},
         )
         with pytest.raises(ValueError, match="exceeds total limit"):
+            await interceptor.before_call(ctx)
+
+    @pytest.mark.asyncio
+    async def test_before_call_rejects_traversal_dotdot(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("WECOM_MCP_UPLOAD_ROOT", str(tmp_path))
+        interceptor = SmartpageCreateInterceptor()
+        ctx = CallContext(
+            category="doc",
+            method="smartpage_create",
+            args={"pages": [{"title": "p1", "page_filepath": "../outside.md"}]},
+        )
+        with pytest.raises(ValueError, match="contains '..'"):
+            await interceptor.before_call(ctx)
+
+    @pytest.mark.asyncio
+    async def test_before_call_rejects_path_outside_root(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("WECOM_MCP_UPLOAD_ROOT", str(tmp_path))
+        interceptor = SmartpageCreateInterceptor()
+        ctx = CallContext(
+            category="doc",
+            method="smartpage_create",
+            args={"pages": [{"title": "p1", "page_filepath": "/etc/passwd"}]},
+        )
+        with pytest.raises(ValueError, match="outside allowed root"):
             await interceptor.before_call(ctx)
 
 
@@ -462,6 +490,7 @@ async def test_resolve_before_call_no_match():
 
 @pytest.mark.asyncio
 async def test_resolve_before_call_smartpage_create_replaces_args(monkeypatch, tmp_path):
+    monkeypatch.setenv("WECOM_MCP_UPLOAD_ROOT", str(tmp_path))
     f1 = tmp_path / "p1.md"
     f1.write_text("hello")
 

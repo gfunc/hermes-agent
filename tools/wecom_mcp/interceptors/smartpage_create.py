@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+from pathlib import Path
 from typing import Any
 
 from .types import CallContext
@@ -9,6 +10,41 @@ logger = logging.getLogger(__name__)
 
 MAX_SINGLE_FILE_SIZE = 10 * 1024 * 1024  # 10MB
 MAX_TOTAL_FILE_SIZE = 20 * 1024 * 1024   # 20MB
+
+
+def _get_allowed_root() -> Path:
+    """Return the allowed filesystem root for smartpage_create uploads.
+
+    Falls back to current working directory.  Override via
+    ``WECOM_MCP_UPLOAD_ROOT`` env var.
+    """
+    env_root = os.getenv("WECOM_MCP_UPLOAD_ROOT", "").strip()
+    if env_root:
+        return Path(env_root).resolve()
+    return Path(os.getcwd()).resolve()
+
+
+def _validate_filepath(raw_path: str) -> str:
+    """Resolve and validate that *raw_path* stays inside the allowed root.
+
+    Raises ``ValueError`` on traversal attempts or paths outside the root.
+    Returns the resolved absolute path.
+    """
+    allowed_root = _get_allowed_root()
+    # Reject obvious traversal attempts before resolution
+    if ".." in raw_path:
+        raise ValueError(
+            f"smartpage_create: path contains '..' (traversal attempt): {raw_path}"
+        )
+    resolved = Path(raw_path).resolve()
+    try:
+        resolved.relative_to(allowed_root)
+    except ValueError as exc:
+        raise ValueError(
+            f"smartpage_create: path '{raw_path}' resolves to '{resolved}' "
+            f"which is outside allowed root '{allowed_root}'"
+        ) from exc
+    return str(resolved)
 
 
 class SmartpageCreateInterceptor:
@@ -38,9 +74,10 @@ async def _resolve_pages(ctx: CallContext, pages: list[Any]) -> dict[str, Any]:
     for i, page in enumerate(pages):
         if not isinstance(page, dict):
             continue
-        filepath = page.get("page_filepath")
-        if not isinstance(filepath, str) or not filepath:
+        raw_path = page.get("page_filepath")
+        if not isinstance(raw_path, str) or not raw_path:
             continue
+        filepath = _validate_filepath(raw_path)
         if not await asyncio.to_thread(os.path.isfile, filepath):
             raise FileNotFoundError(
                 f"smartpage_create: pages[{i}] file not found: {filepath}"
@@ -63,11 +100,12 @@ async def _resolve_pages(ctx: CallContext, pages: list[Any]) -> dict[str, Any]:
         if not isinstance(page, dict):
             resolved_pages.append(page)
             continue
-        filepath = page.get("page_filepath")
-        if not isinstance(filepath, str) or not filepath:
+        raw_path = page.get("page_filepath")
+        if not isinstance(raw_path, str) or not raw_path:
             resolved_pages.append(page)
             continue
 
+        filepath = _validate_filepath(raw_path)
         try:
             content = await asyncio.to_thread(_read_file_utf8, filepath)
         except Exception as exc:
