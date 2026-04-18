@@ -20,6 +20,7 @@ from tools.wecom_mcp.interceptors.msg_media import MediaInterceptor, _detect_mim
 from tools.wecom_mcp.interceptors.smartpage_create import SmartpageCreateInterceptor, _resolve_pages
 from tools.wecom_mcp.interceptors.smartpage_export import SmartpageExportInterceptor, _intercept_export
 from tools.wecom_mcp.interceptors.types import CallContext
+from tools.wecom_mcp_tool import handle_wecom_mcp
 
 
 # ------------------------------------------------------------------
@@ -530,3 +531,19 @@ async def test_run_after_call_no_match_returns_unchanged():
     result = {"data": 42}
     out = await run_after_call(ctx, result)
     assert out == result
+
+
+# ------------------------------------------------------------------
+# handle_wecom_mcp kwargs regression
+# ------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_handle_wecom_mcp_accepts_kwargs():
+    """Registry.dispatch passes **kwargs including task_id — handler must accept them."""
+    result = await handle_wecom_mcp(
+        action="list",
+        category="contact",
+        task_id="test-task",
+        some_other_kwarg="ignored",
+    )
+    assert isinstance(result, str)

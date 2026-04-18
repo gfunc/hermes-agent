@@ -49,6 +49,7 @@ async def handle_wecom_mcp(
     category: str,
     method: str = "",
     args: str | dict | None = None,
+    **kwargs: Any,
 ) -> str:
     """Handle wecom_mcp tool calls.
 
