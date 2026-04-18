@@ -202,10 +202,12 @@ class WeComAdapter(BasePlatformAdapter):
         self._reply_req_ids: Dict[str, str] = {}
         self._last_reply_req_id_per_chat: Dict[str, str] = {}
         self._pending_stream_acks: set[str] = set()
-        # Tracks req_ids whose final response has already been sent via
-        # _send_reply_stream. Prevents the _keep_typing loop from opening
-        # a new typing stream after the response is delivered.
-        self._reply_req_ids_with_response: set[str] = set()
+        # Tracks req_ids currently in the process of sending a response via
+        # _send_reply_stream. Prevents the _keep_typing loop from opening a
+        # new typing stream while the HTTP request is in-flight, which would
+        # create an orphan stream. Once the response is delivered, typing
+        # is allowed to resume for the same message (e.g. multi-turn analysis).
+        self._reply_req_ids_sending_response: set[str] = set()
         self._reply_queue = WeComReplyQueue(
             send_json_fn=self._send_json,
             pending_responses_dict=self._pending_responses,
@@ -2050,30 +2052,28 @@ class WeComAdapter(BasePlatformAdapter):
                 self.name, stream_id, reply_req_id, chat_id,
             )
 
-        response = await self._send_reply_request(
-            reply_req_id,
-            {
-                "msgtype": "stream",
-                "stream": {
-                    "id": stream_id,
-                    "finish": True,
-                    "content": content[:self.MAX_MESSAGE_LENGTH],
+        # Block _keep_typing from opening a new stream while this HTTP
+        # request is in-flight. Once delivered we allow typing again so
+        # multi-turn analysis within the same message shows an indicator.
+        self._reply_req_ids_sending_response.add(reply_req_id)
+        try:
+            response = await self._send_reply_request(
+                reply_req_id,
+                {
+                    "msgtype": "stream",
+                    "stream": {
+                        "id": stream_id,
+                        "finish": True,
+                        "content": content[:self.MAX_MESSAGE_LENGTH],
+                    },
                 },
-            },
-        )
+            )
+        finally:
+            self._reply_req_ids_sending_response.discard(reply_req_id)
         self._raise_for_wecom_error(response, "send reply stream")
-        # Mark this req_id as "response already sent" so the _keep_typing
-        # loop doesn't race and open a new typing stream after this.
         logger.debug(
-            "[%s] _send_reply_stream: response sent, marking req_id=%s as delivered",
-            self.name, reply_req_id,
-        )
-        self._reply_req_ids_with_response.add(reply_req_id)
-        while len(self._reply_req_ids_with_response) > DEDUP_MAX_SIZE:
-            self._reply_req_ids_with_response.pop()
-        logger.debug(
-            "[%s] _send_reply_stream: done chat=%s req_id=%s stream_id=%s",
-            self.name, chat_id, reply_req_id, stream_id,
+            "[%s] _send_reply_stream: response delivered for req_id=%s chat=%s stream_id=%s",
+            self.name, reply_req_id, chat_id, stream_id,
         )
         return response
 
@@ -2493,12 +2493,13 @@ class WeComAdapter(BasePlatformAdapter):
             )
             return
 
-        # If the response has already been delivered for this req_id,
-        # do not open a new typing stream — the _keep_typing loop may
-        # race with _send_reply_stream finishing.
-        if reply_req_id in self._reply_req_ids_with_response:
+        # If a response is currently being sent for this req_id (HTTP in
+        # flight), do not open a new typing stream — it would race with
+        # _send_reply_stream and create an orphan. Once the response is
+        # delivered, typing is allowed to resume for multi-turn analysis.
+        if reply_req_id in self._reply_req_ids_sending_response:
             logger.debug(
-                "[%s] send_typing: chat=%s req_id=%s already has response delivered, skip",
+                "[%s] send_typing: chat=%s req_id=%s response is in-flight, skip",
                 self.name, chat_id, reply_req_id,
             )
             return
