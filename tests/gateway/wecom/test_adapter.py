@@ -533,6 +533,72 @@ class TestMediaHelpers:
 
         assert decrypted == plaintext
 
+    def test_decrypt_file_bytes_with_43_char_unpadded_key(self):
+        """WeCom sends 43-char base64 aeskey without trailing '=' padding."""
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+        from gateway.platforms.wecom import WeComAdapter
+
+        plaintext = b"AI-bot-image-bytes"
+        key = os.urandom(32)
+        pad_len = 32 - (len(plaintext) % 32)
+        padded = plaintext + bytes([pad_len]) * pad_len
+        encryptor = Cipher(algorithms.AES(key), modes.CBC(key[:16])).encryptor()
+        encrypted_bytes = encryptor.update(padded) + encryptor.finalize()
+
+        # Normal padded 44-char base64 key
+        padded_b64_key = base64.b64encode(key).decode("ascii")
+        assert len(padded_b64_key) == 44
+        # Strip padding → 43-char key as WeCom sends it
+        unpadded_b64_key = padded_b64_key.rstrip("=")
+        assert len(unpadded_b64_key) == 43
+
+        decrypted = WeComAdapter._decrypt_file_bytes(encrypted_bytes, unpadded_b64_key)
+        assert decrypted == plaintext
+
+        # Also verify it works with actual keys from production logs
+        # Key: +rcfFfoUROWDu4b0fMEeQ7HBUoE0lklhgtL9n8Cznbg (43 chars → 32 bytes)
+        decodable_43_key = "+rcfFfoUROWDu4b0fMEeQ7HBUoE0lklhgtL9n8Cznbg"
+        assert len(decodable_43_key) == 43
+        decoded = base64.b64decode(decodable_43_key + "=")
+        assert len(decoded) == 32
+
+    @pytest.mark.asyncio
+    async def test_cache_media_decrypts_with_43_char_unpadded_key(self):
+        """Full flow: image downloaded from WeCom with 43-char unpadded aeskey."""
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+        from gateway.platforms.wecom import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        # Simulate a real decrypted image (PNG header)
+        png_header = b"\x89PNG\r\n\x1a\nfake-image-bytes"
+        key = os.urandom(32)
+        pad_len = 32 - (len(png_header) % 32)
+        padded = png_header + bytes([pad_len]) * pad_len
+        encryptor = Cipher(algorithms.AES(key), modes.CBC(key[:16])).encryptor()
+        encrypted = encryptor.update(padded) + encryptor.finalize()
+
+        adapter._download_remote_bytes = AsyncMock(
+            return_value=(
+                encrypted,
+                {"content-type": "application/octet-stream"},
+            )
+        )
+
+        unpadded_key = base64.b64encode(key).decode("ascii").rstrip("=")
+        assert len(unpadded_key) == 43
+
+        cached = await adapter._cache_media(
+            "image",
+            {
+                "url": "https://cos.example.com/img.png",
+                "aeskey": unpadded_key,
+            },
+        )
+
+        assert cached is not None
+        cached_path, content_type = cached
+        assert Path(cached_path).read_bytes() == png_header
+
     @pytest.mark.asyncio
     async def test_load_outbound_media_rejects_placeholder_path(self):
         from gateway.platforms.wecom import WeComAdapter
