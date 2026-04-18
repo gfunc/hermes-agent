@@ -489,6 +489,95 @@ async def test_adapter_reconnects_after_mock_server_closes():
         await server.stop()
 
 
+async def test_mock_server_multi_turn_typing_flow():
+    """Full E2E: typing opens, interim response, typing reopens, final response.
+
+    Verifies the exact frame sequence seen by the WeCom server when an
+    agent sends multiple responses for a single user message.
+    """
+    from tests.gateway.wecom.mock_server import MockWeComServer
+    from gateway.platforms.wecom import WeComAdapter
+    from gateway.config import PlatformConfig
+
+    server = MockWeComServer()
+    await server.start()
+    try:
+        adapter = WeComAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={
+                    "bot_id": "bot-1",
+                    "secret": "secret-1",
+                    "websocket_url": server.ws_url,
+                },
+            )
+        )
+
+        # Prevent full _on_message from running (no gateway plumbing)
+        adapter._on_message = AsyncMock()
+
+        success = await adapter.connect()
+        assert success is True
+
+        # Wait for connection and subscription handshake
+        await asyncio.sleep(0.1)
+
+        # Seed a reply req_id mapping (as if a callback message arrived)
+        adapter._remember_reply_req_id("msg-e2e", "req-e2e")
+
+        # Round 1: open typing indicator
+        await adapter.send_typing("chat-e2e", metadata={"message_id": "msg-e2e"})
+        await asyncio.sleep(0.2)
+
+        respond_frames = [p for p in server._received if p.get("cmd") == "aibot_respond_msg"]
+        assert len(respond_frames) == 1
+        frame1 = respond_frames[0]
+        assert frame1["body"]["msgtype"] == "stream"
+        assert frame1["body"]["stream"]["finish"] is False
+        stream_id_1 = frame1["body"]["stream"]["id"]
+
+        # Round 1: send intermediate response (reuses typing stream_id)
+        result1 = await adapter.send(
+            "chat-e2e", "Interim 1", reply_to="msg-e2e"
+        )
+        assert result1.success is True
+        await asyncio.sleep(0.2)
+
+        respond_frames = [p for p in server._received if p.get("cmd") == "aibot_respond_msg"]
+        assert len(respond_frames) == 2
+        frame2 = respond_frames[1]
+        assert frame2["body"]["stream"]["finish"] is True
+        assert frame2["body"]["stream"]["id"] == stream_id_1
+
+        # Round 2: typing reopens for ongoing work
+        await adapter.send_typing("chat-e2e", metadata={"message_id": "msg-e2e"})
+        await asyncio.sleep(0.2)
+
+        respond_frames = [p for p in server._received if p.get("cmd") == "aibot_respond_msg"]
+        assert len(respond_frames) == 3
+        frame3 = respond_frames[2]
+        assert frame3["body"]["stream"]["finish"] is False
+        stream_id_2 = frame3["body"]["stream"]["id"]
+        assert stream_id_2 != stream_id_1
+
+        # Round 2: send final response
+        result2 = await adapter.send(
+            "chat-e2e", "Final", reply_to="msg-e2e"
+        )
+        assert result2.success is True
+        await asyncio.sleep(0.2)
+
+        respond_frames = [p for p in server._received if p.get("cmd") == "aibot_respond_msg"]
+        assert len(respond_frames) == 4
+        frame4 = respond_frames[3]
+        assert frame4["body"]["stream"]["finish"] is True
+        assert frame4["body"]["stream"]["id"] == stream_id_2
+
+        await adapter.disconnect()
+    finally:
+        await server.stop()
+
+
 # ------------------------------------------------------------------
 # Reply queue tests
 # ------------------------------------------------------------------

@@ -1413,6 +1413,67 @@ async def test_send_typing_skips_while_response_in_flight():
 
 
 @pytest.mark.asyncio
+async def test_multiple_intermediate_responses_resume_typing_between():
+    """When an agent sends multiple responses for the same message (e.g.
+    interim analysis updates), typing must resume between each so the
+    user always sees the three-dot animation when work is ongoing."""
+    from gateway.config import PlatformConfig
+    from gateway.platforms.wecom import WeComAdapter
+
+    config = PlatformConfig(extra={"bot_id": "b", "secret": "s"})
+    adapter = WeComAdapter(config)
+    adapter._send_reply_request = AsyncMock(
+        return_value={"headers": {"req_id": "r1"}, "body": {"errcode": 0}}
+    )
+    adapter._remember_reply_req_id("msg-multi", "req-multi")
+
+    # Round 1: typing opens
+    await adapter.send_typing("chat-multi", metadata={"message_id": "msg-multi"})
+    assert adapter._send_reply_request.await_count == 1
+    first_stream_id = adapter._send_reply_request.await_args_list[0].args[1]["stream"]["id"]
+    assert adapter._typing_stream_state_by_chat["chat-multi"] == ("req-multi", first_stream_id)
+
+    # Round 1: first intermediate response (reuses typing stream)
+    result1 = await adapter.send(
+        chat_id="chat-multi", content="Interim 1", reply_to="msg-multi"
+    )
+    assert result1.success is True
+    assert adapter._send_reply_request.await_count == 2
+    assert adapter._typing_stream_state_by_chat.get("chat-multi") is None
+    assert "req-multi" not in adapter._reply_req_ids_sending_response
+
+    # Typing resumes for ongoing work
+    await adapter.send_typing("chat-multi", metadata={"message_id": "msg-multi"})
+    assert adapter._send_reply_request.await_count == 3
+    second_stream_id = adapter._send_reply_request.await_args_list[2].args[1]["stream"]["id"]
+    assert second_stream_id != first_stream_id
+    assert adapter._typing_stream_state_by_chat["chat-multi"] == ("req-multi", second_stream_id)
+
+    # Round 2: second intermediate response
+    result2 = await adapter.send(
+        chat_id="chat-multi", content="Interim 2", reply_to="msg-multi"
+    )
+    assert result2.success is True
+    assert adapter._send_reply_request.await_count == 4
+    assert adapter._typing_stream_state_by_chat.get("chat-multi") is None
+
+    # Typing resumes again
+    await adapter.send_typing("chat-multi", metadata={"message_id": "msg-multi"})
+    assert adapter._send_reply_request.await_count == 5
+    third_stream_id = adapter._send_reply_request.await_args_list[4].args[1]["stream"]["id"]
+    assert third_stream_id != second_stream_id
+    assert adapter._typing_stream_state_by_chat["chat-multi"] == ("req-multi", third_stream_id)
+
+    # Round 3: final response
+    result3 = await adapter.send(
+        chat_id="chat-multi", content="Final", reply_to="msg-multi"
+    )
+    assert result3.success is True
+    assert adapter._send_reply_request.await_count == 6
+    assert adapter._typing_stream_state_by_chat.get("chat-multi") is None
+
+
+@pytest.mark.asyncio
 async def test_send_reuses_typing_stream_when_reply_to_is_missing():
     """When send() is called without reply_to (e.g. error handler) but a typing
     stream is active, the message should reuse that stream so the placeholder
