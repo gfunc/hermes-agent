@@ -747,28 +747,40 @@ class WeComAdapter(BasePlatformAdapter):
         """Fetch MCP server URLs for known categories after WS connect."""
         categories = ["contact", "meeting", "todo", "schedule", "doc", "msg"]
         configs: Dict[str, str] = {}
+        logger.info("[%s] Discovering MCP configs for %d categories...", self.name, len(categories))
         for category in categories:
             try:
                 cfg = await self._fetch_single_mcp_config(category)
                 if cfg:
                     configs[category] = cfg
+                    logger.info("[%s] MCP config for '%s': %s", self.name, category, cfg)
+                else:
+                    logger.info("[%s] MCP config for '%s': no url returned", self.name, category)
             except Exception as exc:
-                logger.debug("[%s] MCP config discovery failed for %s: %s", self.name, category, exc)
+                logger.info("[%s] MCP config discovery failed for %s: %s", self.name, category, exc)
         self._mcp_configs = configs
         if configs:
             logger.info("[%s] Discovered MCP configs for categories: %s", self.name, list(configs.keys()))
+        else:
+            logger.warning("[%s] No MCP configs discovered", self.name)
 
     async def _fetch_single_mcp_config(self, category: str) -> Optional[str]:
         """Fetch MCP URL for a single category via active WebSocket.
 
         Matches the OpenClaw protocol: ``aibot_get_mcp_config`` with
-        ``biz_type`` body field.
+        ``biz_type`` and optional ``plugin_version`` body fields.
         """
+        body: Dict[str, Any] = {"biz_type": category}
+        # Some WeCom backends require a plugin_version field;
+        # include it for compatibility with OpenClaw-style backends.
+        body["plugin_version"] = "1.0.0"
         response = await self._send_request(
             APP_CMD_MCP_GET_CONFIG,
-            {"biz_type": category},
+            body,
             timeout=REQUEST_TIMEOUT_SECONDS,
         )
+        logger.debug("[%s] MCP config response for '%s': errcode=%s body=%s",
+                     self.name, category, response.get("errcode"), response.get("body"))
         if response.get("errcode") not in (0, None):
             errcode = response.get("errcode")
             errmsg = response.get("errmsg", "unknown")
