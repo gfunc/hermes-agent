@@ -1184,6 +1184,37 @@ class GatewayRunner:
             pass
         return ""
 
+    def _get_wecom_mcp_preflight(self) -> str:
+        """Return a system-prompt note about available WeCom MCP categories.
+
+        If the WeCom adapter is connected and has discovered MCP configs,
+        returns a note listing available categories. If no categories are
+        discovered, returns a note explaining that MCP is not available.
+        """
+        wecom_adapter = self.adapters.get(Platform.WECOM)
+        if wecom_adapter is None:
+            return ""
+
+        try:
+            categories = wecom_adapter.get_available_mcp_categories()
+        except Exception:
+            return ""
+
+        if categories:
+            return (
+                "\n\n**WeCom MCP:** The following MCP categories are available for this bot: "
+                f"{', '.join(categories)}. "
+                "Use 'wecom_mcp list <category>' to discover tools within a category. "
+                "If a category is not listed, it means the bot does not have permission "
+                "and you should ask the user to enable it in the WeCom admin panel."
+            )
+        else:
+            return (
+                "\n\n**WeCom MCP:** No MCP categories are currently available for this bot. "
+                "MCP functionality may need to be enabled in the WeCom admin panel "
+                "(应用管理 → 智能助手 → 企业助手 → 应用能力)."
+            )
+
     @staticmethod
     def _load_reasoning_config() -> dict | None:
         """Load reasoning effort from config.yaml.
@@ -3685,7 +3716,12 @@ class GatewayRunner:
 
         # Build the context prompt to inject
         context_prompt = build_session_context_prompt(context, redact_pii=_redact_pii)
-        
+
+        # Inject WeCom MCP preflight info (available categories) when WeCom is connected
+        _wecom_mcp_note = self._get_wecom_mcp_preflight()
+        if _wecom_mcp_note:
+            context_prompt += _wecom_mcp_note
+
         # If the previous session expired and was auto-reset, prepend a notice
         # so the agent knows this is a fresh conversation (not an intentional /reset).
         if getattr(session_entry, 'was_auto_reset', False):
