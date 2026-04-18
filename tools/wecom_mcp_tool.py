@@ -192,16 +192,22 @@ async def handle_wecom_mcp(args: dict, **kwargs: Any) -> str:
 
     except McpRpcError as exc:
         if exc.code == 846610:
-            logger.warning("wecom_mcp category '%s' not enabled for this bot (846610)", category)
+            logger.error(
+                "wecom_mcp PERMISSION DENIED for category='%s' (errcode=846610). "
+                "This bot does not have permission to use this MCP category.",
+                category,
+            )
             return json.dumps(
                 {
-                    "error": "MCP_CATEGORY_NOT_ENABLED",
+                    "error": "MCP_PERMISSION_DENIED",
                     "message": (
-                        f"Category '{category}' is not enabled for this WeCom bot. "
-                        "Enable it in the WeCom admin panel: "
-                        "应用管理 → 智能助手 → 企业助手 → 应用能力 → 选择对应分类"
+                        f"PERMISSION DENIED: The WeCom bot does not have access to the '{category}' MCP category. "
+                        f"This is not a configuration error on the agent side — the category is simply not enabled for this bot in the WeCom admin panel. "
+                        f"To enable it: 应用管理 → 智能助手 → 企业助手 → 应用能力 → 选择 '{category}' 分类并启用. "
+                        f"After enabling, wait a few minutes for the change to take effect."
                     ),
                     "category": category,
+                    "errcode": 846610,
                 },
                 ensure_ascii=False,
             )

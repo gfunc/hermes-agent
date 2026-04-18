@@ -503,10 +503,11 @@ async def test_call_action_returns_friendly_error_on_846610(monkeypatch):
         task_id="test-task",
     )
     parsed = json.loads(result)
-    assert parsed["error"] == "MCP_CATEGORY_NOT_ENABLED"
+    assert parsed["error"] == "MCP_PERMISSION_DENIED"
     assert "meeting" in parsed["message"]
-    assert "WeCom admin panel" in parsed["message"]
+    assert "PERMISSION DENIED" in parsed["message"]
     assert parsed["category"] == "meeting"
+    assert parsed["errcode"] == 846610
 
 
 # ------------------------------------------------------------------
