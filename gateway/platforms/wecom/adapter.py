@@ -1793,7 +1793,11 @@ class WeComAdapter(BasePlatformAdapter):
         if not aes_key:
             raise ValueError("aes_key is required")
 
-        key = base64.b64decode(aes_key)
+        # WeCom sends the AES key as a 43-char base64 string without the
+        # trailing '=' padding (same format as callback encoding_aes_key).
+        # We need to add the padding so base64.b64decode succeeds.
+        normalized_key = aes_key + "=" if len(aes_key) == 43 else aes_key
+        key = base64.b64decode(normalized_key)
         if len(key) != 32:
             raise ValueError(f"Invalid WeCom AES key length: expected 32 bytes, got {len(key)}")
 
