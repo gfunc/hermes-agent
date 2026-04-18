@@ -292,6 +292,12 @@ TOOLSETS = {
         "includes": []
     },
     
+    "wecom": {
+        "description": "WeCom MCP tool - unified WeCom enterprise messaging",
+        "tools": ["wecom_mcp"],
+        "includes": []
+    },
+
     "hermes-cli": {
         "description": "Full interactive CLI toolset - all default tools plus cronjob management",
         "tools": _HERMES_CORE_TOOLS,
