@@ -44,18 +44,16 @@ def _check_wecom_configured() -> bool:
 # ── Handler ───────────────────────────────────────────────────────────────
 
 
-async def handle_wecom_mcp(
-    action: str,
-    category: str,
-    method: str = "",
-    args: str | dict | None = None,
-    **kwargs: Any,
-) -> str:
+async def handle_wecom_mcp(args: dict, **kwargs: Any) -> str:
     """Handle wecom_mcp tool calls.
 
     action='list': List available tools in a category
     action='call': Call a specific tool method
     """
+    action = args.get("action", "")
+    category = args.get("category", "")
+    method = args.get("method", "")
+    args_param = args.get("args")
     logger.debug("wecom_mcp %s category=%s method=%s", action, category, method or "-")
     try:
         if action == "list":
@@ -68,7 +66,7 @@ async def handle_wecom_mcp(
             return json.dumps({"category": category, "count": len(tools), "tools": tools})
 
         if action == "call":
-            parsed_args = json.loads(args) if isinstance(args, str) else (args or {})
+            parsed_args = json.loads(args_param) if isinstance(args_param, str) else (args_param or {})
             logger.debug("wecom_mcp call category=%s method=%s args_keys=%s", category, method, list(parsed_args.keys()))
             ctx = CallContext(category=category, method=method, args=parsed_args)
 

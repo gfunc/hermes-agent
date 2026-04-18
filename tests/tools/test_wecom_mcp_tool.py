@@ -96,7 +96,7 @@ async def test_list_action_returns_tools(monkeypatch):
         fake_send_json_rpc,
     )
 
-    result = await handle_wecom_mcp(action="list", category="contact")
+    result = await handle_wecom_mcp({"action": "list", "category": "contact"})
     parsed = json.loads(result)
     assert parsed["category"] == "contact"
     assert parsed["count"] == 2
@@ -115,7 +115,7 @@ async def test_list_action_empty_tools(monkeypatch):
         fake_send_json_rpc,
     )
 
-    result = await handle_wecom_mcp(action="list", category="msg")
+    result = await handle_wecom_mcp({"action": "list", "category": "msg"})
     parsed = json.loads(result)
     assert parsed["count"] == 0
     assert parsed["tools"] == []
@@ -132,7 +132,7 @@ async def test_list_action_non_dict_result(monkeypatch):
         fake_send_json_rpc,
     )
 
-    result = await handle_wecom_mcp(action="list", category="contact")
+    result = await handle_wecom_mcp({"action": "list", "category": "contact"})
     parsed = json.loads(result)
     assert parsed["count"] == 0
     assert parsed["tools"] == []
@@ -156,10 +156,7 @@ async def test_call_action_with_string_args(monkeypatch):
     )
 
     result = await handle_wecom_mcp(
-        action="call",
-        category="contact",
-        method="get_userlist",
-        args='{"department_id": 1}',
+        {"action": "call", "category": "contact", "method": "get_userlist", "args": '{"department_id": 1}'},
     )
     parsed = json.loads(result)
     inner = json.loads(parsed["content"][0]["text"])
@@ -186,10 +183,7 @@ async def test_call_action_with_dict_args(monkeypatch):
     )
 
     result = await handle_wecom_mcp(
-        action="call",
-        category="contact",
-        method="get_userlist",
-        args={"department_id": 2},
+        {"action": "call", "category": "contact", "method": "get_userlist", "args": {"department_id": 2}},
     )
     parsed = json.loads(result)
     inner = json.loads(parsed["content"][0]["text"])
@@ -211,9 +205,7 @@ async def test_call_action_with_none_args(monkeypatch):
     )
 
     result = await handle_wecom_mcp(
-        action="call",
-        category="contact",
-        method="get_userlist",
+        {"action": "call", "category": "contact", "method": "get_userlist"},
     )
     parsed = json.loads(result)
     inner = json.loads(parsed["content"][0]["text"])
@@ -236,10 +228,7 @@ async def test_call_action_interceptor_timeout_applied(monkeypatch):
     )
 
     result = await handle_wecom_mcp(
-        action="call",
-        category="msg",
-        method="get_msg_media",
-        args={"media_id": "mid-1"},
+        {"action": "call", "category": "msg", "method": "get_msg_media", "args": {"media_id": "mid-1"}},
     )
     parsed = json.loads(result)
     inner = json.loads(parsed["content"][0]["text"])
@@ -267,10 +256,7 @@ async def test_call_action_interceptor_after_call(monkeypatch):
     )
 
     result = await handle_wecom_mcp(
-        action="call",
-        category="contact",
-        method="get_userlist",
-        args={},
+        {"action": "call", "category": "contact", "method": "get_userlist", "args": {}},
     )
     parsed = json.loads(result)
     inner = json.loads(parsed["content"][0]["text"])
@@ -286,7 +272,7 @@ async def test_call_action_interceptor_after_call(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_unknown_action_returns_error_json():
-    result = await handle_wecom_mcp(action="delete", category="contact")
+    result = await handle_wecom_mcp({"action": "delete", "category": "contact"})
     parsed = json.loads(result)
     assert parsed["error"] == "MCP_UNEXPECTED_ERROR"
     assert "Unknown action: delete" in parsed["message"]

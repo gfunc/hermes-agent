@@ -541,8 +541,7 @@ async def test_run_after_call_no_match_returns_unchanged():
 async def test_handle_wecom_mcp_accepts_kwargs():
     """Registry.dispatch passes **kwargs including task_id — handler must accept them."""
     result = await handle_wecom_mcp(
-        action="list",
-        category="contact",
+        {"action": "list", "category": "contact"},
         task_id="test-task",
         some_other_kwarg="ignored",
     )
