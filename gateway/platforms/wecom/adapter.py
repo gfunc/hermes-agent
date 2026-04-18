@@ -1506,6 +1506,10 @@ class WeComAdapter(BasePlatformAdapter):
         normalized_req_id = str(req_id or "").strip()
         if not normalized_message_id or not normalized_req_id:
             return
+        logger.debug(
+            "[%s] _remember_reply_req_id: msg_id=%s -> req_id=%s",
+            self.name, normalized_message_id, normalized_req_id,
+        )
         self._reply_req_ids[normalized_message_id] = normalized_req_id
         while len(self._reply_req_ids) > DEDUP_MAX_SIZE:
             self._reply_req_ids.pop(next(iter(self._reply_req_ids)))
@@ -1943,6 +1947,10 @@ class WeComAdapter(BasePlatformAdapter):
         return response
 
     async def _send_reply_stream(self, reply_req_id: str, content: str, chat_id: str = "") -> Dict[str, Any]:
+        logger.debug(
+            "[%s] _send_reply_stream: start chat=%s req_id=%s",
+            self.name, chat_id, reply_req_id,
+        )
         # Reuse the typing stream_id if one is active for this chat.
         # This mirrors the plugin pattern: thinking stream (finish=false)
         # and final response (finish=true) share the same stream_id.
@@ -1955,19 +1963,35 @@ class WeComAdapter(BasePlatformAdapter):
             pending_state = self._streams_pending_close.pop(chat_id, None)
             if pending_state and pending_state[0] == reply_req_id:
                 stream_id = pending_state[1]
+                logger.debug(
+                    "[%s] _send_reply_stream: reused pending stream_id=%s for req_id=%s chat=%s",
+                    self.name, stream_id, reply_req_id, chat_id,
+                )
             elif pending_state:
                 self._streams_pending_close[chat_id] = pending_state
+                logger.debug(
+                    "[%s] _send_reply_stream: pending state belongs to different req_id=%s, kept in queue",
+                    self.name, pending_state[0],
+                )
 
             if not stream_id:
                 state = self._typing_stream_state_by_chat.pop(chat_id, None)
                 if state and state[0] == reply_req_id:
                     stream_id = state[1]
+                    logger.debug(
+                        "[%s] _send_reply_stream: reused active stream_id=%s for req_id=%s chat=%s",
+                        self.name, stream_id, reply_req_id, chat_id,
+                    )
                 elif state:
                     # The typing state belongs to a different message (e.g.
                     # inline /approve response while the original agent stream
                     # is still active). Put it back so the real response can
                     # close it later.
                     self._typing_stream_state_by_chat[chat_id] = state
+                    logger.debug(
+                        "[%s] _send_reply_stream: active state belongs to different req_id=%s, put back",
+                        self.name, state[0],
+                    )
 
         # Close any remaining orphaned streams that definitely won't be
         # reused.  Skip the current chat: if we have a matching pending
@@ -1976,6 +2000,10 @@ class WeComAdapter(BasePlatformAdapter):
 
         if not stream_id:
             stream_id = self._new_req_id("stream")
+            logger.debug(
+                "[%s] _send_reply_stream: created new stream_id=%s for req_id=%s chat=%s",
+                self.name, stream_id, reply_req_id, chat_id,
+            )
 
         response = await self._send_reply_request(
             reply_req_id,
@@ -1991,9 +2019,17 @@ class WeComAdapter(BasePlatformAdapter):
         self._raise_for_wecom_error(response, "send reply stream")
         # Mark this req_id as "response already sent" so the _keep_typing
         # loop doesn't race and open a new typing stream after this.
+        logger.debug(
+            "[%s] _send_reply_stream: response sent, marking req_id=%s as delivered",
+            self.name, reply_req_id,
+        )
         self._reply_req_ids_with_response.add(reply_req_id)
         while len(self._reply_req_ids_with_response) > DEDUP_MAX_SIZE:
             self._reply_req_ids_with_response.pop()
+        logger.debug(
+            "[%s] _send_reply_stream: done chat=%s req_id=%s stream_id=%s",
+            self.name, chat_id, reply_req_id, stream_id,
+        )
         return response
 
     async def _send_reply_stream_nonblocking(
@@ -2153,6 +2189,12 @@ class WeComAdapter(BasePlatformAdapter):
 
         try:
             reply_req_id = self._reply_req_id_for_message(reply_to)
+            logger.debug(
+                "[%s] send: chat=%s reply_to=%s initial req_id=%s typing_state=%s pending=%s",
+                self.name, chat_id, reply_to, reply_req_id,
+                self._typing_stream_state_by_chat.get(chat_id),
+                self._streams_pending_close.get(chat_id),
+            )
 
             # If there is no mapped reply req_id but an active typing stream
             # exists for this chat, reuse its req_id so the message replaces
@@ -2165,6 +2207,10 @@ class WeComAdapter(BasePlatformAdapter):
                     reply_req_id = typing_state[0]
                     # Put it back so _send_reply_stream can pop and reuse the stream_id.
                     self._typing_stream_state_by_chat[chat_id] = typing_state
+                    logger.debug(
+                        "[%s] send: reused typing req_id=%s from state for chat=%s",
+                        self.name, reply_req_id, chat_id,
+                    )
 
             chunks = self._chunk_markdown_text(content, chunk_limit=self.MAX_MESSAGE_LENGTH)
             if not chunks:
@@ -2358,7 +2404,16 @@ class WeComAdapter(BasePlatformAdapter):
         super().pause_typing_for_chat(chat_id)
         state = self._typing_stream_state_by_chat.pop(chat_id, None)
         if state:
+            logger.debug(
+                "[%s] pause_typing_for_chat: moved chat=%s state=%s to pending_close",
+                self.name, chat_id, state,
+            )
             self._streams_pending_close[chat_id] = state
+        else:
+            logger.debug(
+                "[%s] pause_typing_for_chat: no active stream for chat=%s",
+                self.name, chat_id,
+            )
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """Emit WeCom's stream placeholder so clients show waiting animation."""
@@ -2366,11 +2421,15 @@ class WeComAdapter(BasePlatformAdapter):
         await self._close_pending_streams()
 
         if not chat_id:
+            logger.debug("[%s] send_typing: no chat_id, returning", self.name)
             return
 
         current_state = self._typing_stream_state_by_chat.get(chat_id)
         if current_state:
-            # Stream already active — nothing to do.
+            logger.debug(
+                "[%s] send_typing: chat=%s already has active stream state=%s, skip",
+                self.name, chat_id, current_state,
+            )
             return
 
         metadata = metadata if isinstance(metadata, dict) else {}
@@ -2383,24 +2442,44 @@ class WeComAdapter(BasePlatformAdapter):
             # instead of an expired or scrolled-out original message.
             reply_req_id = self._last_reply_req_id_per_chat.get(chat_id)
         if not reply_req_id:
+            logger.debug(
+                "[%s] send_typing: chat=%s msg_id=%s no reply_req_id, returning",
+                self.name, chat_id, message_id,
+            )
             return
 
         # If the response has already been delivered for this req_id,
         # do not open a new typing stream — the _keep_typing loop may
         # race with _send_reply_stream finishing.
         if reply_req_id in self._reply_req_ids_with_response:
+            logger.debug(
+                "[%s] send_typing: chat=%s req_id=%s already has response delivered, skip",
+                self.name, chat_id, reply_req_id,
+            )
             return
 
         current_state = self._typing_stream_state_by_chat.get(chat_id)
         if current_state and current_state[0] == reply_req_id:
             # Already active for this exact message.
+            logger.debug(
+                "[%s] send_typing: chat=%s stream already active for req_id=%s, skip",
+                self.name, chat_id, reply_req_id,
+            )
             return
         if current_state:
             # Different message: close the old stream before opening a new one.
+            logger.debug(
+                "[%s] send_typing: chat=%s has stream for different req_id=%s, stopping first",
+                self.name, chat_id, current_state[0],
+            )
             await self.stop_typing(chat_id)
 
         stream_id = self._new_req_id("stream")
         self._typing_stream_state_by_chat[chat_id] = (reply_req_id, stream_id)
+        logger.debug(
+            "[%s] send_typing: chat=%s opening stream_id=%s for req_id=%s",
+            self.name, chat_id, stream_id, reply_req_id,
+        )
         try:
             response = await self._send_reply_request(
                 reply_req_id,
@@ -2414,6 +2493,10 @@ class WeComAdapter(BasePlatformAdapter):
                 },
             )
             self._raise_for_wecom_error(response, "send typing stream")
+            logger.debug(
+                "[%s] send_typing: chat=%s stream_id=%s opened successfully",
+                self.name, chat_id, stream_id,
+            )
         except RuntimeError as exc:
             err_text = str(exc)
             if "846608" in err_text:
@@ -2444,9 +2527,17 @@ class WeComAdapter(BasePlatformAdapter):
 
         state = self._typing_stream_state_by_chat.pop(chat_id, None)
         if not state:
+            logger.debug(
+                "[%s] stop_typing: chat=%s no active stream, nothing to do",
+                self.name, chat_id,
+            )
             return
 
         reply_req_id, stream_id = state
+        logger.debug(
+            "[%s] stop_typing: chat=%s closing stream_id=%s for req_id=%s",
+            self.name, chat_id, stream_id, reply_req_id,
+        )
         try:
             response = await self._send_reply_request(
                 reply_req_id,
@@ -2460,6 +2551,10 @@ class WeComAdapter(BasePlatformAdapter):
                 },
             )
             self._raise_for_wecom_error(response, "stop typing stream")
+            logger.debug(
+                "[%s] stop_typing: chat=%s stream_id=%s closed successfully",
+                self.name, chat_id, stream_id,
+            )
         except RuntimeError as exc:
             if "846608" in str(exc):
                 logger.warning(
@@ -2476,11 +2571,24 @@ class WeComAdapter(BasePlatformAdapter):
     async def _close_pending_streams(self, skip_chat_id: Optional[str] = None) -> None:
         """Send ``finish=True`` for streams orphaned by ``pause_typing_for_chat``."""
         items = list(self._streams_pending_close.items())
+        if items:
+            logger.debug(
+                "[%s] _close_pending_streams: closing %d pending stream(s) skip=%s",
+                self.name, len(items), skip_chat_id,
+            )
         self._streams_pending_close.clear()
         for _chat_id, (req_id, stream_id) in items:
             if skip_chat_id and _chat_id == skip_chat_id:
                 self._streams_pending_close[_chat_id] = (req_id, stream_id)
+                logger.debug(
+                    "[%s] _close_pending_streams: skipped chat=%s (current response target)",
+                    self.name, _chat_id,
+                )
                 continue
+            logger.debug(
+                "[%s] _close_pending_streams: closing chat=%s stream_id=%s req_id=%s",
+                self.name, _chat_id, stream_id, req_id,
+            )
             try:
                 resp = await self._send_reply_request(
                     req_id,
@@ -2490,6 +2598,10 @@ class WeComAdapter(BasePlatformAdapter):
                     },
                 )
                 self._raise_for_wecom_error(resp, "close pending typing stream")
+                logger.debug(
+                    "[%s] _close_pending_streams: closed chat=%s stream_id=%s successfully",
+                    self.name, _chat_id, stream_id,
+                )
             except Exception as exc:
                 logger.debug("[%s] Failed to close pending stream for %s: %s", self.name, _chat_id, exc)
 
