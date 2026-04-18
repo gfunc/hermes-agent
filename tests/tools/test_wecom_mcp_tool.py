@@ -96,7 +96,10 @@ async def test_list_action_returns_tools(monkeypatch):
         fake_send_json_rpc,
     )
 
-    result = await handle_wecom_mcp({"action": "list", "category": "contact"})
+    result = await handle_wecom_mcp(
+        {"action": "list", "category": "contact"},
+        task_id="test-task",
+    )
     parsed = json.loads(result)
     assert parsed["category"] == "contact"
     assert parsed["count"] == 2
@@ -115,7 +118,10 @@ async def test_list_action_empty_tools(monkeypatch):
         fake_send_json_rpc,
     )
 
-    result = await handle_wecom_mcp({"action": "list", "category": "msg"})
+    result = await handle_wecom_mcp(
+        {"action": "list", "category": "msg"},
+        task_id="test-task",
+    )
     parsed = json.loads(result)
     assert parsed["count"] == 0
     assert parsed["tools"] == []
@@ -132,7 +138,10 @@ async def test_list_action_non_dict_result(monkeypatch):
         fake_send_json_rpc,
     )
 
-    result = await handle_wecom_mcp({"action": "list", "category": "contact"})
+    result = await handle_wecom_mcp(
+        {"action": "list", "category": "contact"},
+        task_id="test-task",
+    )
     parsed = json.loads(result)
     assert parsed["count"] == 0
     assert parsed["tools"] == []
@@ -156,7 +165,13 @@ async def test_call_action_with_string_args(monkeypatch):
     )
 
     result = await handle_wecom_mcp(
-        {"action": "call", "category": "contact", "method": "get_userlist", "args": '{"department_id": 1}'},
+        {
+            "action": "call",
+            "category": "contact",
+            "method": "get_userlist",
+            "args": '{"department_id": 1}',
+        },
+        task_id="test-task",
     )
     parsed = json.loads(result)
     inner = json.loads(parsed["content"][0]["text"])
@@ -183,7 +198,13 @@ async def test_call_action_with_dict_args(monkeypatch):
     )
 
     result = await handle_wecom_mcp(
-        {"action": "call", "category": "contact", "method": "get_userlist", "args": {"department_id": 2}},
+        {
+            "action": "call",
+            "category": "contact",
+            "method": "get_userlist",
+            "args": {"department_id": 2},
+        },
+        task_id="test-task",
     )
     parsed = json.loads(result)
     inner = json.loads(parsed["content"][0]["text"])
@@ -206,6 +227,7 @@ async def test_call_action_with_none_args(monkeypatch):
 
     result = await handle_wecom_mcp(
         {"action": "call", "category": "contact", "method": "get_userlist"},
+        task_id="test-task",
     )
     parsed = json.loads(result)
     inner = json.loads(parsed["content"][0]["text"])
@@ -228,7 +250,13 @@ async def test_call_action_interceptor_timeout_applied(monkeypatch):
     )
 
     result = await handle_wecom_mcp(
-        {"action": "call", "category": "msg", "method": "get_msg_media", "args": {"media_id": "mid-1"}},
+        {
+            "action": "call",
+            "category": "msg",
+            "method": "get_msg_media",
+            "args": {"media_id": "mid-1"},
+        },
+        task_id="test-task",
     )
     parsed = json.loads(result)
     inner = json.loads(parsed["content"][0]["text"])
@@ -257,6 +285,7 @@ async def test_call_action_interceptor_after_call(monkeypatch):
 
     result = await handle_wecom_mcp(
         {"action": "call", "category": "contact", "method": "get_userlist", "args": {}},
+        task_id="test-task",
     )
     parsed = json.loads(result)
     inner = json.loads(parsed["content"][0]["text"])
@@ -272,7 +301,108 @@ async def test_call_action_interceptor_after_call(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_unknown_action_returns_error_json():
-    result = await handle_wecom_mcp({"action": "delete", "category": "contact"})
+    result = await handle_wecom_mcp(
+        {"action": "delete", "category": "contact"},
+        task_id="test-task",
+    )
     parsed = json.loads(result)
     assert parsed["error"] == "MCP_UNEXPECTED_ERROR"
     assert "Unknown action: delete" in parsed["message"]
+
+
+# ------------------------------------------------------------------
+# Dispatch-path tests (registry calling convention)
+# ------------------------------------------------------------------
+
+
+class TestHandleWecomMcpDispatch:
+    """Tests that verify the handler works when called exactly as registry.dispatch() does."""
+
+    @pytest.mark.asyncio
+    async def test_list_accepts_args_dict_and_kwargs(self):
+        """Registry passes args as dict + kwargs — handler must unpack correctly."""
+        with patch("tools.wecom_mcp_tool.send_json_rpc", new_callable=AsyncMock) as mock_send:
+            mock_send.return_value = {"tools": [{"name": "get_userlist", "inputSchema": {}}]}
+            result = await handle_wecom_mcp(
+                {"action": "list", "category": "contact"},
+                task_id="test-task",
+            )
+            assert isinstance(result, str)
+            parsed = json.loads(result)
+            assert parsed["category"] == "contact"
+            assert len(parsed["tools"]) == 1
+            assert parsed["tools"][0]["name"] == "get_userlist"
+            mock_send.assert_awaited_once_with("contact", "tools/list")
+
+    @pytest.mark.asyncio
+    async def test_call_accepts_args_dict_and_kwargs(self):
+        with patch("tools.wecom_mcp_tool.send_json_rpc", new_callable=AsyncMock) as mock_send:
+            mock_send.return_value = {"content": [{"type": "text", "text": "{}"}]}
+            result = await handle_wecom_mcp(
+                {
+                    "action": "call",
+                    "category": "contact",
+                    "method": "get_userlist",
+                    "args": "{}",
+                },
+                task_id="test-task",
+            )
+            assert isinstance(result, str)
+            mock_send.assert_awaited_once()
+            call_args = mock_send.call_args
+            assert call_args[0][0] == "contact"
+            assert call_args[0][1] == "tools/call"
+            assert call_args[0][2] == {"name": "get_userlist", "arguments": {}}
+
+    @pytest.mark.asyncio
+    async def test_call_with_dict_args(self):
+        with patch("tools.wecom_mcp_tool.send_json_rpc", new_callable=AsyncMock) as mock_send:
+            mock_send.return_value = {"content": [{"type": "text", "text": "{}"}]}
+            result = await handle_wecom_mcp(
+                {
+                    "action": "call",
+                    "category": "contact",
+                    "method": "get_userlist",
+                    "args": {"chat_type": 1},
+                },
+                task_id="test-task",
+            )
+            assert isinstance(result, str)
+            call_args = mock_send.call_args
+            assert call_args[0][2]["arguments"] == {"chat_type": 1}
+
+    @pytest.mark.asyncio
+    async def test_unknown_action(self):
+        result = await handle_wecom_mcp(
+            {"action": "invalid", "category": "contact"},
+            task_id="test-task",
+        )
+        assert "error" in result.lower() or "unknown" in result.lower()
+        parsed = json.loads(result)
+        assert "error" in parsed
+
+    @pytest.mark.asyncio
+    async def test_dispatch_via_registry(self):
+        """Simulate exactly how registry.dispatch() calls the handler.
+
+        registry.dispatch() for async handlers does:
+            _run_async(entry.handler(args, **kwargs))
+
+        The key invariant: entry.handler(args, **kwargs) must return a
+        coroutine (not raise TypeError about unexpected args / missing params).
+        """
+        with patch("tools.wecom_mcp_tool.send_json_rpc", new_callable=AsyncMock) as mock_send:
+            mock_send.return_value = {"tools": []}
+            # This is what registry.dispatch does — handler(args_dict, **kwargs)
+            coro = handle_wecom_mcp(
+                {"action": "list", "category": "contact"},
+                task_id="some-task-id",
+                user_task="some-task",
+            )
+            # Must be a coroutine (async def), not a plain value or exception
+            assert hasattr(coro, "__await__")
+            result = await coro
+            assert isinstance(result, str)
+            parsed = json.loads(result)
+            assert parsed["category"] == "contact"
+            assert parsed["count"] == 0
