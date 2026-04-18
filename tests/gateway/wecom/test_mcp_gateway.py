@@ -82,8 +82,8 @@ def _install_fake_agent(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_run_agent_registers_wecom_mcp_servers_and_refreshes_tools(monkeypatch):
-    """When source platform is WeCom, _run_agent should register MCP configs and refresh agent tools."""
+async def test_run_agent_skips_generic_mcp_for_wecom(monkeypatch):
+    """WeCom MCP is handled by the dedicated wecom_mcp tool; generic registration is skipped."""
     _install_fake_agent(monkeypatch)
     runner = _make_runner()
 
@@ -144,20 +144,9 @@ async def test_run_agent_registers_wecom_mcp_servers_and_refreshes_tools(monkeyp
     )
 
     assert result["final_response"] == "ok"
-    assert len(registered_configs) == 1
-    assert registered_configs[0] == {
-        "contact": {"url": "https://mcp.example/contact"},
-        "doc": {"url": "https://mcp.example/doc"},
-    }
-
-    # Verify the cached agent's tools were refreshed and system prompt invalidated
-    cached_agent = runner._agent_cache["agent:main:wecom:dm:chat-1"][0]
-    assert cached_agent.tools == [
-        {"function": {"name": "existing_tool"}},
-        {"function": {"name": "mcp_contact_search"}},
-    ]
-    assert cached_agent.valid_tool_names == {"existing_tool", "mcp_contact_search"}
-    assert cached_agent._system_prompt_invalidated is True
+    # WeCom MCP is now handled by the dedicated `wecom_mcp` tool;
+    # generic MCP registration is skipped for WeCom URLs.
+    assert len(registered_configs) == 0
 
 
 @pytest.mark.asyncio

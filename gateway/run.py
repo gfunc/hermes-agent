@@ -8658,51 +8658,9 @@ class GatewayRunner:
             agent.service_tier = self._service_tier
             agent.request_overrides = turn_route.get("request_overrides")
 
-            # WeCom dynamic MCP registration
-            if source.platform == Platform.WECOM:
-                wecom_adapter = self.adapters.get(Platform.WECOM)
-                if wecom_adapter and hasattr(wecom_adapter, "get_mcp_configs"):
-                    mcp_configs = wecom_adapter.get_mcp_configs()
-                    if mcp_configs:
-                        try:
-                            from tools.mcp_tool import register_mcp_servers
-
-                            config_map = {
-                                category: {"url": url}
-                                for category, url in mcp_configs.items()
-                            }
-                            register_mcp_servers(config_map)
-                        except Exception:
-                            logger.warning(
-                                "[Gateway] Failed to register WeCom MCP servers",
-                                exc_info=True,
-                            )
-                        else:
-                            try:
-                                from model_tools import get_tool_definitions
-
-                                _enabled_toolsets = getattr(agent, "enabled_toolsets", None) or enabled_toolsets
-                                _disabled_toolsets = getattr(agent, "disabled_toolsets", None)
-                                agent.tools = get_tool_definitions(
-                                    enabled_toolsets=_enabled_toolsets,
-                                    disabled_toolsets=_disabled_toolsets,
-                                    quiet_mode=True,
-                                )
-                                agent.valid_tool_names = {
-                                    tool["function"]["name"] for tool in agent.tools or []
-                                }
-                                _invalidate = getattr(agent, "_invalidate_system_prompt", None)
-                                if callable(_invalidate):
-                                    _invalidate()
-                                logger.info(
-                                    "[Gateway] Refreshed tool surface after WeCom MCP registration (%d tools)",
-                                    len(agent.tools or []),
-                                )
-                            except Exception:
-                                logger.warning(
-                                    "[Gateway] Failed to refresh tool surface after WeCom MCP registration",
-                                    exc_info=True,
-                                )
+            # WeCom MCP is now handled by the dedicated `wecom_mcp` tool in
+            # tools/wecom_mcp_tool.py. The generic MCP client cannot properly
+            # speak Streamable HTTP, so we skip registering WeCom URLs here.
 
             _bg_review_release = threading.Event()
             _bg_review_pending: list[str] = []

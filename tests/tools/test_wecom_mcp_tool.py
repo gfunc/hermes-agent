@@ -1,0 +1,292 @@
+"""Integration tests for tools/wecom_mcp_tool.py.
+
+Tests the full tool handler with mocked transport layer.
+"""
+
+from __future__ import annotations
+
+import json
+from typing import Any
+from unittest.mock import AsyncMock, patch
+
+import pytest
+
+from tools.wecom_mcp_tool import handle_wecom_mcp, _check_wecom_configured
+
+
+@pytest.fixture(autouse=True)
+def _clear_transport_caches():
+    """Wipe transport caches before each test."""
+    import tools.wecom_mcp.transport as t
+    t._mcp_config_cache.clear()
+    t._mcp_session_cache.clear()
+    t._stateless_categories.clear()
+    t._inflight_init.clear()
+    yield
+
+
+# ------------------------------------------------------------------
+# check_fn
+# ------------------------------------------------------------------
+
+class TestCheckFn:
+    def test_check_fn_true_via_env_bot_id(self, monkeypatch):
+        monkeypatch.setenv("WECOM_BOT_ID", "bot-1")
+        monkeypatch.setenv("WECOM_SECRET", "secret-1")
+        assert _check_wecom_configured() is True
+
+    def test_check_fn_true_via_env_corp_id(self, monkeypatch):
+        monkeypatch.setenv("WECOM_CORP_ID", "corp-1")
+        assert _check_wecom_configured() is True
+
+    def test_check_fn_false_when_nothing_set(self, monkeypatch):
+        monkeypatch.delenv("WECOM_BOT_ID", raising=False)
+        monkeypatch.delenv("WECOM_SECRET", raising=False)
+        monkeypatch.delenv("WECOM_CORP_ID", raising=False)
+        assert _check_wecom_configured() is False
+
+    def test_check_fn_true_via_gateway_config(self, monkeypatch):
+        monkeypatch.delenv("WECOM_BOT_ID", raising=False)
+        monkeypatch.delenv("WECOM_SECRET", raising=False)
+        monkeypatch.delenv("WECOM_CORP_ID", raising=False)
+
+        fake_config = {
+            "platforms": {
+                "wecom": {"enabled": True},
+            }
+        }
+
+        from gateway.config import Platform
+
+        def fake_load():
+            class Cfg:
+                platforms = {
+                    Platform.WECOM: type("P", (), {"enabled": True})(),
+                    Platform.WECOM_CALLBACK: type("P", (), {"enabled": False})(),
+                }
+            return Cfg()
+
+        monkeypatch.setattr(
+            "gateway.config.load_gateway_config",
+            fake_load,
+        )
+        assert _check_wecom_configured() is True
+
+
+# ------------------------------------------------------------------
+# list action
+# ------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_list_action_returns_tools(monkeypatch):
+    tools_result = {
+        "tools": [
+            {"name": "get_userlist", "inputSchema": {"type": "object"}},
+            {"name": "get_user", "inputSchema": {"$defs": {"Foo": {}}, "type": "object"}},
+        ]
+    }
+
+    async def fake_send_json_rpc(category, method, params=None, *, timeout_ms=30000):
+        assert category == "contact"
+        assert method == "tools/list"
+        return tools_result
+
+    monkeypatch.setattr(
+        "tools.wecom_mcp_tool.send_json_rpc",
+        fake_send_json_rpc,
+    )
+
+    result = await handle_wecom_mcp(action="list", category="contact")
+    parsed = json.loads(result)
+    assert parsed["category"] == "contact"
+    assert parsed["count"] == 2
+    assert len(parsed["tools"]) == 2
+    # Schema cleaning should have removed $defs
+    assert "$defs" not in parsed["tools"][1]["inputSchema"]
+
+
+@pytest.mark.asyncio
+async def test_list_action_empty_tools(monkeypatch):
+    async def fake_send_json_rpc(category, method, params=None, *, timeout_ms=30000):
+        return {"tools": []}
+
+    monkeypatch.setattr(
+        "tools.wecom_mcp_tool.send_json_rpc",
+        fake_send_json_rpc,
+    )
+
+    result = await handle_wecom_mcp(action="list", category="msg")
+    parsed = json.loads(result)
+    assert parsed["count"] == 0
+    assert parsed["tools"] == []
+
+
+@pytest.mark.asyncio
+async def test_list_action_non_dict_result(monkeypatch):
+    """If result is not a dict, return empty tools list."""
+    async def fake_send_json_rpc(category, method, params=None, *, timeout_ms=30000):
+        return None
+
+    monkeypatch.setattr(
+        "tools.wecom_mcp_tool.send_json_rpc",
+        fake_send_json_rpc,
+    )
+
+    result = await handle_wecom_mcp(action="list", category="contact")
+    parsed = json.loads(result)
+    assert parsed["count"] == 0
+    assert parsed["tools"] == []
+
+
+# ------------------------------------------------------------------
+# call action
+# ------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_call_action_with_string_args(monkeypatch):
+    rpc_calls: list = []
+
+    async def fake_send_json_rpc(category, method, params=None, *, timeout_ms=30000):
+        rpc_calls.append({"category": category, "method": method, "params": params, "timeout_ms": timeout_ms})
+        return {"content": [{"type": "text", "text": json.dumps({"errcode": 0, "errmsg": "ok"})}]}
+
+    monkeypatch.setattr(
+        "tools.wecom_mcp_tool.send_json_rpc",
+        fake_send_json_rpc,
+    )
+
+    result = await handle_wecom_mcp(
+        action="call",
+        category="contact",
+        method="get_userlist",
+        args='{"department_id": 1}',
+    )
+    parsed = json.loads(result)
+    inner = json.loads(parsed["content"][0]["text"])
+    assert inner["errcode"] == 0
+
+    assert len(rpc_calls) == 1
+    assert rpc_calls[0]["category"] == "contact"
+    assert rpc_calls[0]["method"] == "tools/call"
+    assert rpc_calls[0]["params"]["name"] == "get_userlist"
+    assert rpc_calls[0]["params"]["arguments"]["department_id"] == 1
+
+
+@pytest.mark.asyncio
+async def test_call_action_with_dict_args(monkeypatch):
+    rpc_calls: list = []
+
+    async def fake_send_json_rpc(category, method, params=None, *, timeout_ms=30000):
+        rpc_calls.append({"category": category, "method": method, "params": params, "timeout_ms": timeout_ms})
+        return {"content": [{"type": "text", "text": json.dumps({"errcode": 0, "errmsg": "ok"})}]}
+
+    monkeypatch.setattr(
+        "tools.wecom_mcp_tool.send_json_rpc",
+        fake_send_json_rpc,
+    )
+
+    result = await handle_wecom_mcp(
+        action="call",
+        category="contact",
+        method="get_userlist",
+        args={"department_id": 2},
+    )
+    parsed = json.loads(result)
+    inner = json.loads(parsed["content"][0]["text"])
+    assert inner["errcode"] == 0
+    assert rpc_calls[0]["params"]["arguments"]["department_id"] == 2
+
+
+@pytest.mark.asyncio
+async def test_call_action_with_none_args(monkeypatch):
+    rpc_calls: list = []
+
+    async def fake_send_json_rpc(category, method, params=None, *, timeout_ms=30000):
+        rpc_calls.append({"category": category, "method": method, "params": params, "timeout_ms": timeout_ms})
+        return {"content": [{"type": "text", "text": json.dumps({"errcode": 0, "errmsg": "ok"})}]}
+
+    monkeypatch.setattr(
+        "tools.wecom_mcp_tool.send_json_rpc",
+        fake_send_json_rpc,
+    )
+
+    result = await handle_wecom_mcp(
+        action="call",
+        category="contact",
+        method="get_userlist",
+    )
+    parsed = json.loads(result)
+    inner = json.loads(parsed["content"][0]["text"])
+    assert inner["errcode"] == 0
+    assert rpc_calls[0]["params"]["arguments"] == {}
+
+
+@pytest.mark.asyncio
+async def test_call_action_interceptor_timeout_applied(monkeypatch):
+    """Media interceptor should bump timeout for get_msg_media."""
+    rpc_calls: list = []
+
+    async def fake_send_json_rpc(category, method, params=None, *, timeout_ms=30000):
+        rpc_calls.append({"category": category, "method": method, "params": params, "timeout_ms": timeout_ms})
+        return {"content": [{"type": "text", "text": json.dumps({"errcode": 0, "errmsg": "ok"})}]}
+
+    monkeypatch.setattr(
+        "tools.wecom_mcp_tool.send_json_rpc",
+        fake_send_json_rpc,
+    )
+
+    result = await handle_wecom_mcp(
+        action="call",
+        category="msg",
+        method="get_msg_media",
+        args={"media_id": "mid-1"},
+    )
+    parsed = json.loads(result)
+    inner = json.loads(parsed["content"][0]["text"])
+    assert inner["errcode"] == 0
+    assert rpc_calls[0]["timeout_ms"] == 120_000  # MediaInterceptor timeout
+
+
+@pytest.mark.asyncio
+async def test_call_action_interceptor_after_call(monkeypatch):
+    """BizErrorInterceptor should clear cache on errcode 850002."""
+    import tools.wecom_mcp.transport as t
+    t._mcp_config_cache["contact"] = {"url": "http://example.com"}
+    t._mcp_session_cache["contact"] = t.McpSession(session_id="sess-1", initialized=True)
+
+    async def fake_send_json_rpc(category, method, params=None, *, timeout_ms=30000):
+        return {
+            "content": [
+                {"type": "text", "text": json.dumps({"errcode": 850002, "errmsg": "token expired"})}
+            ]
+        }
+
+    monkeypatch.setattr(
+        "tools.wecom_mcp_tool.send_json_rpc",
+        fake_send_json_rpc,
+    )
+
+    result = await handle_wecom_mcp(
+        action="call",
+        category="contact",
+        method="get_userlist",
+        args={},
+    )
+    parsed = json.loads(result)
+    inner = json.loads(parsed["content"][0]["text"])
+    assert inner["errcode"] == 850002
+    # Cache should have been cleared by biz_error interceptor
+    assert "contact" not in t._mcp_config_cache
+    assert "contact" not in t._mcp_session_cache
+
+
+# ------------------------------------------------------------------
+# Unknown action
+# ------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_unknown_action_returns_error_json():
+    result = await handle_wecom_mcp(action="delete", category="contact")
+    parsed = json.loads(result)
+    assert parsed["error"] == "MCP_UNEXPECTED_ERROR"
+    assert "Unknown action: delete" in parsed["message"]

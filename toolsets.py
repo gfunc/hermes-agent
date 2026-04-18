@@ -58,6 +58,8 @@ _HERMES_CORE_TOOLS = [
     "cronjob",
     # Cross-platform messaging (gated on gateway running via check_fn)
     "send_message",
+    # WeCom MCP (gated on WeCom config via check_fn)
+    "wecom_mcp",
     # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
     "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
 ]
