@@ -1154,7 +1154,10 @@ class WeComAdapter(BasePlatformAdapter):
             text = reply_text
 
         if not text and not media_urls:
-            logger.debug("[%s] Empty WeCom message skipped", self.name)
+            logger.debug(
+                "[%s] Empty WeCom message skipped (msgtype=%s text=%r media_urls=%s)",
+                self.name, msgtype, text, media_urls,
+            )
             return
 
         source = self.build_source(
@@ -1274,6 +1277,10 @@ class WeComAdapter(BasePlatformAdapter):
         media_types: List[str] = []
         refs: List[Tuple[str, Dict[str, Any]]] = []
         msgtype = str(body.get("msgtype") or "").lower()
+        logger.debug(
+            "[%s] _extract_media: msgtype=%s body_keys=%s",
+            self.name, msgtype, list(body.keys()),
+        )
 
         if msgtype == "mixed":
             mixed = body.get("mixed") if isinstance(body.get("mixed"), dict) else {}
@@ -1320,18 +1327,40 @@ class WeComAdapter(BasePlatformAdapter):
         elif quote_type == "file" and isinstance(quote.get("file"), dict):
             refs.append(("file", quote["file"]))
 
+        logger.debug(
+            "[%s] _extract_media: extracted %d refs for msgtype=%s",
+            self.name, len(refs), msgtype,
+        )
         for kind, ref in refs:
+            logger.debug(
+                "[%s] _extract_media: caching kind=%s ref_keys=%s",
+                self.name, kind, list(ref.keys()),
+            )
             cached = await self._cache_media(kind, ref)
             if cached:
                 path, content_type = cached
                 media_paths.append(path)
                 media_types.append(content_type)
+                logger.debug(
+                    "[%s] _extract_media: cached kind=%s path=%s content_type=%s",
+                    self.name, kind, path, content_type,
+                )
+            else:
+                logger.debug(
+                    "[%s] _extract_media: failed to cache kind=%s ref=%s",
+                    self.name, kind, ref,
+                )
 
+        logger.debug(
+            "[%s] _extract_media: done — paths=%s types=%s",
+            self.name, media_paths, media_types,
+        )
         return media_paths, media_types
 
     async def _cache_media(self, kind: str, media: Dict[str, Any]) -> Optional[Tuple[str, str]]:
         """Cache an inbound image/file/media reference to local storage."""
         if "base64" in media and media.get("base64"):
+            logger.debug("[%s] _cache_media: using base64 for kind=%s", self.name, kind)
             try:
                 raw = self._decode_base64(media["base64"])
             except Exception as exc:
@@ -1341,7 +1370,9 @@ class WeComAdapter(BasePlatformAdapter):
             if kind == "image":
                 ext = self._detect_image_ext(raw)
                 try:
-                    return cache_image_from_bytes(raw, ext), self._mime_for_ext(ext, fallback="image/jpeg")
+                    result = cache_image_from_bytes(raw, ext), self._mime_for_ext(ext, fallback="image/jpeg")
+                    logger.debug("[%s] _cache_media: base64 image cached to %s", self.name, result[0])
+                    return result
                 except ValueError as exc:
                     logger.warning("[%s] Rejected non-image bytes: %s", self.name, exc)
                     return None
@@ -1351,8 +1382,10 @@ class WeComAdapter(BasePlatformAdapter):
 
         url = str(media.get("url") or "").strip()
         if not url:
+            logger.debug("[%s] _cache_media: no url or base64 for kind=%s", self.name, kind)
             return None
 
+        logger.debug("[%s] _cache_media: downloading kind=%s url=%s", self.name, kind, url)
         try:
             raw, headers = await self._download_remote_bytes(url, max_bytes=ABSOLUTE_MAX_BYTES)
         except Exception as exc:
@@ -1375,16 +1408,24 @@ class WeComAdapter(BasePlatformAdapter):
                 )
 
         content_type = str(headers.get("content-type") or "").split(";", 1)[0].strip() or "application/octet-stream"
+        logger.debug(
+            "[%s] _cache_media: downloaded %d bytes content_type=%s for kind=%s url=%s",
+            self.name, len(raw), content_type, kind, url,
+        )
         if kind == "image":
             ext = self._guess_extension(url, content_type, fallback=self._detect_image_ext(raw))
             try:
-                return cache_image_from_bytes(raw, ext), content_type or self._mime_for_ext(ext, fallback="image/jpeg")
+                result = cache_image_from_bytes(raw, ext), content_type or self._mime_for_ext(ext, fallback="image/jpeg")
+                logger.debug("[%s] _cache_media: url image cached to %s", self.name, result[0])
+                return result
             except ValueError as exc:
                 logger.warning("[%s] Rejected non-image bytes from %s: %s", self.name, url, exc)
                 return None
 
         filename = self._guess_filename(url, headers.get("content-disposition"), content_type)
-        return cache_document_from_bytes(raw, filename), content_type
+        result = cache_document_from_bytes(raw, filename), content_type
+        logger.debug("[%s] _cache_media: url file cached to %s", self.name, result[0])
+        return result
 
     @staticmethod
     def _decode_base64(data: str) -> bytes:
