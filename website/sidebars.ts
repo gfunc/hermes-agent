@@ -21,6 +21,7 @@ const sidebars: SidebarsConfig = {
       collapsed: true,
       items: [
         'user-guide/cli',
+        'user-guide/tui',
         'user-guide/configuration',
         'user-guide/sessions',
         'user-guide/profiles',
@@ -36,6 +37,7 @@ const sidebars: SidebarsConfig = {
       collapsed: true,
       items: [
         'user-guide/features/overview',
+        'user-guide/features/tool-gateway',
         {
           type: 'category',
           label: 'Core',
