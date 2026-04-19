@@ -757,7 +757,7 @@ class WeComAdapter(BasePlatformAdapter):
                 else:
                     logger.info("[%s] MCP config for '%s': no url returned", self.name, category)
             except Exception as exc:
-                logger.info("[%s] MCP config discovery failed for %s: %s", self.name, category, exc)
+                logger.warning("[%s] MCP config discovery failed for %s: %s", self.name, category, exc)
         self._mcp_configs = configs
         if configs:
             logger.info("[%s] Discovered MCP configs for categories: %s", self.name, list(configs.keys()))
@@ -779,7 +779,7 @@ class WeComAdapter(BasePlatformAdapter):
             body,
             timeout=REQUEST_TIMEOUT_SECONDS,
         )
-        logger.debug("[%s] MCP config response for '%s': errcode=%s body=%s",
+        logger.warning("[%s] MCP config response for '%s': errcode=%s body=%s",
                      self.name, category, response.get("errcode"), response.get("body"))
         if response.get("errcode") not in (0, None):
             errcode = response.get("errcode")
@@ -805,7 +805,7 @@ class WeComAdapter(BasePlatformAdapter):
                 logger.info("[%s] Refreshed MCP config for '%s': %s", self.name, category, url)
             return url
         except Exception as exc:
-            logger.debug("[%s] MCP config refresh failed for %s: %s", self.name, category, exc)
+            logger.warning("[%s] MCP config refresh failed for %s: %s", self.name, category, exc)
             return None
 
     def get_mcp_configs(self) -> Dict[str, str]:

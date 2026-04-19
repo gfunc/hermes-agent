@@ -10311,7 +10311,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # and gateway.log (INFO+, gateway-component records only).
     # Idempotent, so repeated calls from AIAgent.__init__ won't duplicate.
     from hermes_logging import setup_logging
-    setup_logging(hermes_home=_hermes_home, mode="gateway")
+    setup_logging(hermes_home=_hermes_home, mode="gateway", force=True)
 
     # Optional stderr handler — level driven by -v/-q flags on the CLI.
     # verbosity=None (-q/--quiet): no stderr output

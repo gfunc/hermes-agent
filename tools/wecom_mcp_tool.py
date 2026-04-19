@@ -93,24 +93,28 @@ def _build_wecom_mcp_schema() -> dict:
         }
 
     return {
-        "type": "object",
-        "properties": {
-            "action": {
-                "type": "string",
-                "enum": ["list", "call"],
-                "description": "Action: 'list' to enumerate tools or 'call' to invoke a tool. Examples: wecom_mcp list contact, wecom_mcp call contact get_userlist '{}'",
+        "name": "wecom_mcp",
+        "description": _DESCRIPTION,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["list", "call"],
+                    "description": "Action: 'list' to enumerate tools or 'call' to invoke a tool. Examples: wecom_mcp list contact, wecom_mcp call contact get_userlist '{}'",
+                },
+                "category": category_field,
+                "method": {
+                    "type": "string",
+                    "description": "Tool method name (required for action='call'). Example: get_userlist, get_msg_chat_list",
+                },
+                "args": {
+                    "type": ["string", "object"],
+                    "description": "JSON arguments as string or object (required for action='call', default: {}). Example: '{}' or '{\"chat_type\": 1}'",
+                },
             },
-            "category": category_field,
-            "method": {
-                "type": "string",
-                "description": "Tool method name (required for action='call'). Example: get_userlist, get_msg_chat_list",
-            },
-            "args": {
-                "type": ["string", "object"],
-                "description": "JSON arguments as string or object (required for action='call', default: {}). Example: '{}' or '{\"chat_type\": 1}'",
-            },
+            "required": ["action", "category"],
         },
-        "required": ["action", "category"],
     }
 
 
@@ -223,9 +227,17 @@ async def handle_wecom_mcp(args: dict, **kwargs: Any) -> str:
             ensure_ascii=False,
         )
     except RuntimeError as exc:
-        logger.warning("wecom_mcp runtime error: %s", exc)
+        logger.warning("wecom_mcp runtime error: %s", exc, exc_info=True)
         return json.dumps(
-            {"error": "MCP_CONFIG_ERROR", "message": str(exc)},
+            {
+                "error": "MCP_CONFIG_ERROR",
+                "message": (
+                    f"{exc}\n\n"
+                    f"To diagnose: check ~/.hermes/logs/errors.log for the full traceback. "
+                    f"The most common cause is that the WeCom adapter is not connected "
+                    f"or the '{category}' MCP category is not enabled for this bot."
+                ),
+            },
             ensure_ascii=False,
         )
     except Exception as exc:

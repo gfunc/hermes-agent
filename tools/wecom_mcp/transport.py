@@ -116,7 +116,7 @@ async def fetch_mcp_config(category: str) -> dict:
                 logger.info("%s Config from adapter cache '%s': %s", LOG_TAG, category, cfg["url"])
                 return cfg
         except Exception as exc:
-            logger.debug("%s Adapter config cache read failed: %s", LOG_TAG, exc)
+            logger.warning("%s Adapter config cache read failed: %s", LOG_TAG, exc)
 
         # 2. On-demand fetch via active WebSocket (OpenClaw-style dynamic pull)
         if hasattr(adapter, "refresh_mcp_config"):
@@ -128,7 +128,7 @@ async def fetch_mcp_config(category: str) -> dict:
                     logger.info("%s Config from adapter on-demand '%s': %s", LOG_TAG, category, url)
                     return cfg
             except Exception as exc:
-                logger.debug("%s Adapter on-demand fetch failed: %s", LOG_TAG, exc)
+                logger.warning("%s Adapter on-demand fetch failed: %s", LOG_TAG, exc)
 
     env_raw = os.getenv("WECOM_MCP_CONFIG", "")
     if env_raw:
@@ -145,6 +145,10 @@ async def fetch_mcp_config(category: str) -> dict:
         except json.JSONDecodeError:
             logger.warning("%s WECOM_MCP_CONFIG is not valid JSON", LOG_TAG)
 
+    logger.warning(
+        "%s MCP config unavailable for category '%s' — no adapter connection and no WECOM_MCP_CONFIG env var",
+        LOG_TAG, category, exc_info=True,
+    )
     raise RuntimeError(
         f"MCP config unavailable for category '{category}'. "
         f"Ensure WeCom adapter is connected or set WECOM_MCP_CONFIG env var."
