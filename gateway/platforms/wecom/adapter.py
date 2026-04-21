@@ -2620,11 +2620,14 @@ class WeComAdapter(BasePlatformAdapter):
         from ``_process_message_background``'s finally block as a safety net.
 
         When the response is delivered via ``_send_reply_stream``, that method
-        pauses typing and pops the state *before* this runs, so this becomes
-        a harmless no-op in the normal success path.
+        reuses the stream state from ``_streams_pending_close`` (populated by
+        ``pause_typing_for_chat``).  We must **skip** the current chat when
+        draining pending streams, otherwise the close frame races ahead of the
+        actual response and produces an empty "stream closed" message.
         """
-        # Also drain any streams orphaned by pause_typing_for_chat.
-        await self._close_pending_streams()
+        # Drain orphaned streams from OTHER chats only; skip current chat so
+        # _send_reply_stream can reuse its stream_id for the real response.
+        await self._close_pending_streams(skip_chat_id=chat_id)
 
         state = self._typing_stream_state_by_chat.pop(chat_id, None)
         if not state:

@@ -529,7 +529,7 @@ class TestDynamicSchema:
 
         from tools.wecom_mcp_tool import _build_wecom_mcp_schema
         schema = _build_wecom_mcp_schema()
-        category = schema["properties"]["category"]
+        category = schema["parameters"]["properties"]["category"]
         assert category["type"] == "string"
         assert category["enum"] == ["doc", "msg"]
         assert "doc" in category["description"]
@@ -544,7 +544,7 @@ class TestDynamicSchema:
 
         from tools.wecom_mcp_tool import _build_wecom_mcp_schema
         schema = _build_wecom_mcp_schema()
-        category = schema["properties"]["category"]
+        category = schema["parameters"]["properties"]["category"]
         assert category["type"] == "string"
         assert "enum" not in category
         assert "contact" in category["description"]
