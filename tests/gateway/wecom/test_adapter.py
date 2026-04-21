@@ -1188,8 +1188,9 @@ async def test_send_typing_emits_thinking_placeholder():
 
 
 @pytest.mark.asyncio
-async def test_stop_typing_finishes_stream():
-    """stop_typing sends finish=True to close the typing animation."""
+async def test_stop_typing_moves_stream_to_pending():
+    """stop_typing moves the active stream to pending_close so
+    _send_reply_stream can reuse the stream_id for the real response."""
     from gateway.config import PlatformConfig
     from gateway.platforms.wecom import WeComAdapter
 
@@ -1202,15 +1203,22 @@ async def test_stop_typing_finishes_stream():
     assert adapter._send_reply_request.await_count == 1
 
     await adapter.stop_typing("chat-typing")
-    assert adapter._send_reply_request.await_count == 2
-    stop_call = adapter._send_reply_request.await_args_list[1]
-    assert stop_call.args[0] == "req-typing"
-    stop_body = stop_call.args[1]
-    assert stop_body["msgtype"] == "stream"
-    assert stop_body["stream"]["finish"] is True
-    assert stop_body["stream"]["content"] == "\u200b"
-    # State should be cleared
+    # stop_typing should NOT send a close frame — it preserves the stream for
+    # the real response.
+    assert adapter._send_reply_request.await_count == 1
+    typing_stream_id = adapter._send_reply_request.await_args_list[0].args[1]["stream"]["id"]
+    # State moved to pending_close
     assert "chat-typing" not in adapter._typing_stream_state_by_chat
+    assert adapter._streams_pending_close["chat-typing"] == ("req-typing", typing_stream_id)
+
+    # _send_reply_stream reuses the pending stream_id
+    await adapter._send_reply_stream("req-typing", "Hello!", chat_id="chat-typing")
+    assert adapter._send_reply_request.await_count == 2
+    response_call = adapter._send_reply_request.await_args_list[1]
+    assert response_call.args[1]["stream"]["id"] == typing_stream_id
+    assert response_call.args[1]["stream"]["finish"] is True
+    assert response_call.args[1]["stream"]["content"] == "Hello!"
+    assert "chat-typing" not in adapter._streams_pending_close
 
 
 @pytest.mark.asyncio
@@ -2052,13 +2060,13 @@ class TestWeComTyping846608:
         assert "msg-1" not in adapter._reply_req_ids
 
     @pytest.mark.asyncio
-    async def test_stop_typing_clears_reply_cache_on_846608(self):
+    async def test_stop_typing_moves_to_pending_no_send(self):
+        """stop_typing no longer sends finish=True; it moves state to pending."""
         from gateway.config import PlatformConfig
         from gateway.platforms.wecom import WeComAdapter
 
         adapter = WeComAdapter(PlatformConfig(enabled=True))
         adapter._typing_stream_state_by_chat["chat-1"] = ("req-old", "stream-1")
-        # stop_typing clears by req_id key, not message_id
         adapter._reply_req_ids["req-old"] = "stream-1"
         adapter._last_reply_req_id_per_chat["chat-1"] = "req-old"
         adapter._ws = AsyncMock()
@@ -2068,8 +2076,12 @@ class TestWeComTyping846608:
         )
 
         await adapter.stop_typing("chat-1")
-        assert "req-old" not in adapter._reply_req_ids
-        assert "chat-1" not in adapter._last_reply_req_id_per_chat
+        # State moved to pending_close; no WebSocket send attempted
+        assert "chat-1" not in adapter._typing_stream_state_by_chat
+        assert adapter._streams_pending_close["chat-1"] == ("req-old", "stream-1")
+        # Cache is preserved — _send_reply_stream will handle 846608 if needed
+        assert "req-old" in adapter._reply_req_ids
+        assert "chat-1" in adapter._last_reply_req_id_per_chat
 
 
 class TestWeComInboundEdgeCases:

@@ -2613,17 +2613,22 @@ class WeComAdapter(BasePlatformAdapter):
             logger.debug("[%s] Failed to send typing placeholder to %s: %s", self.name, chat_id, exc)
 
     async def stop_typing(self, chat_id: str) -> None:
-        """Close any active WeCom typing stream for this chat.
+        """Move the active WeCom typing stream to pending-close.
 
-        Sends ``finish=True`` with minimal visible content so the three-dot
-        animation disappears.  Called from ``_keep_typing``'s finally block and
-        from ``_process_message_background``'s finally block as a safety net.
+        Instead of sending ``finish=True`` immediately (which would close the
+        bubble with empty content), we move the stream state into
+        ``_streams_pending_close`` so that ``_send_reply_stream`` can reuse
+        the same ``stream_id`` when the actual response is delivered.
 
-        When the response is delivered via ``_send_reply_stream``, that method
-        reuses the stream state from ``_streams_pending_close`` (populated by
-        ``pause_typing_for_chat``).  We must **skip** the current chat when
-        draining pending streams, otherwise the close frame races ahead of the
-        actual response and produces an empty "stream closed" message.
+        This is critical because ``stop_typing`` is called from
+        ``_handle_message_with_agent`` *before* ``send()`` runs in
+        ``_process_message_background``.  If we closed the stream here, the
+        final response would create a brand-new message instead of replacing
+        the bubble.
+
+        Orphaned pending streams are eventually closed by
+        ``_close_pending_streams`` (drained on the next ``send_typing`` call
+        or when ``_send_reply_stream`` finishes for a different chat).
         """
         # Drain orphaned streams from OTHER chats only; skip current chat so
         # _send_reply_stream can reuse its stream_id for the real response.
@@ -2639,38 +2644,10 @@ class WeComAdapter(BasePlatformAdapter):
 
         reply_req_id, stream_id = state
         logger.debug(
-            "[%s] stop_typing: chat=%s closing stream_id=%s for req_id=%s",
+            "[%s] stop_typing: chat=%s moving stream_id=%s for req_id=%s to pending_close",
             self.name, chat_id, stream_id, reply_req_id,
         )
-        try:
-            response = await self._send_reply_request(
-                reply_req_id,
-                {
-                    "msgtype": "stream",
-                    "stream": {
-                        "id": stream_id,
-                        "finish": True,
-                        "content": STREAM_FINISH_CONTENT,
-                    },
-                },
-            )
-            self._raise_for_wecom_error(response, "stop typing stream")
-            logger.debug(
-                "[%s] stop_typing: chat=%s stream_id=%s closed successfully",
-                self.name, chat_id, stream_id,
-            )
-        except RuntimeError as exc:
-            if "846608" in str(exc):
-                logger.warning(
-                    "[%s] Stop-typing stream expired (846608) for req_id=%s, clearing cache",
-                    self.name, reply_req_id,
-                )
-                self._reply_req_ids.pop(state[0], None)
-                self._last_reply_req_id_per_chat.pop(chat_id, None)
-            else:
-                logger.debug("[%s] Failed to stop typing placeholder for %s: %s", self.name, chat_id, exc)
-        except Exception as exc:
-            logger.debug("[%s] Failed to stop typing placeholder for %s: %s", self.name, chat_id, exc)
+        self._streams_pending_close[chat_id] = state
 
     async def _close_pending_streams(self, skip_chat_id: Optional[str] = None) -> None:
         """Send ``finish=True`` for streams orphaned by ``pause_typing_for_chat``."""
