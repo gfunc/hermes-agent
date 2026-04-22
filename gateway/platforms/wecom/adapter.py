@@ -2240,6 +2240,37 @@ class WeComAdapter(BasePlatformAdapter):
             logger.error("[%s] Failed to send media %s: %s", self.name, media_source, exc)
             return SendResult(success=False, error=str(exc))
 
+        # When the agent response contains only media (no text), send() /
+        # _send_reply_stream() is never called and the pending stream from
+        # stop_typing() stays open.  Close it here so the bubble doesn't
+        # linger until the next message arrives.
+        if reply_req_id and chat_id:
+            pending = self._streams_pending_close.pop(chat_id, None)
+            if pending and pending[0] == reply_req_id:
+                try:
+                    await self._send_reply_request(
+                        reply_req_id,
+                        {
+                            "msgtype": "stream",
+                            "stream": {
+                                "id": pending[1],
+                                "finish": True,
+                                "content": "",
+                            },
+                        },
+                    )
+                    logger.debug(
+                        "[%s] Closed orphaned typing stream after media reply: chat=%s stream_id=%s",
+                        self.name, chat_id, pending[1],
+                    )
+                except Exception as exc:
+                    logger.debug(
+                        "[%s] Failed to close orphaned typing stream after media: %s",
+                        self.name, exc,
+                    )
+            elif pending:
+                self._streams_pending_close[chat_id] = pending
+
         caption_result = None
         downgrade_result = None
         if caption:
