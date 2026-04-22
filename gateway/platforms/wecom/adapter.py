@@ -2347,6 +2347,40 @@ class WeComAdapter(BasePlatformAdapter):
             if not chunks:
                 return SendResult(success=False, error="empty content")
 
+            # When a message is split into multiple chunks and we have a
+            # reply_req_id, do not mix proactive sends (APP_CMD_SEND) with
+            # stream replies (APP_CMD_RESPONSE). The two paths have different
+            # latencies through WeCom's infrastructure and can arrive out of
+            # order, causing later chunks to appear before earlier ones.
+            if reply_req_id and len(chunks) > 1:
+                typing_state = self._typing_stream_state_by_chat.pop(chat_id, None)
+                pending = self._streams_pending_close.pop(chat_id, None)
+                stream_to_close = typing_state or pending
+                if stream_to_close:
+                    try:
+                        await self._send_reply_request(
+                            stream_to_close[0],
+                            {
+                                "msgtype": "stream",
+                                "stream": {
+                                    "id": stream_to_close[1],
+                                    "finish": True,
+                                    "content": STREAM_FINISH_CONTENT,
+                                },
+                            },
+                        )
+                        logger.debug(
+                            "[%s] Closed typing stream before multi-chunk proactive send",
+                            self.name,
+                        )
+                    except Exception as exc:
+                        logger.debug(
+                            "[%s] Failed to close typing stream for multi-chunk send: %s",
+                            self.name,
+                            exc,
+                        )
+                reply_req_id = None
+
             last_response: Optional[Dict[str, Any]] = None
             last_error: Optional[str] = None
 
