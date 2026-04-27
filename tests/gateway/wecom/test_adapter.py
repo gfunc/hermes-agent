@@ -1682,8 +1682,9 @@ async def test_send_chunks_long_text():
 
 @pytest.mark.asyncio
 async def test_send_multi_chunk_with_reply_to_uses_proactive_only():
-    """Multi-chunk messages with reply_to must not mix proactive sends and
-    stream replies, which can arrive out of order."""
+    """Multi-chunk messages with reply_to send the first chunk as a stream
+    reply (replacing the typing bubble with real text) and the rest
+    proactively to avoid out-of-order delivery."""
     from gateway.config import PlatformConfig
     from gateway.platforms.wecom import WeComAdapter
 
@@ -1695,23 +1696,23 @@ async def test_send_multi_chunk_with_reply_to_uses_proactive_only():
     adapter._send_reply_request = AsyncMock(
         return_value={"headers": {"req_id": "r1"}, "body": {"errcode": 0}}
     )
-    adapter._send_reply_stream = AsyncMock(
-        return_value={"headers": {"req_id": "r1"}, "body": {"errcode": 0}}
-    )
+    async def _mock_send_reply_stream(req_id, content, chat_id=""):
+        adapter._streams_pending_close.pop(chat_id, None)
+        adapter._typing_stream_state_by_chat.pop(chat_id, None)
+        return {"headers": {"req_id": "r1"}, "body": {"errcode": 0}}
+
+    adapter._send_reply_stream = AsyncMock(side_effect=_mock_send_reply_stream)
     adapter._reply_req_ids = {"msg-1": "req-1"}
     adapter._streams_pending_close = {"chat-1": ("req-1", "stream-1")}
 
     long_text = "A" * 5000 + "\n\n" + "B" * 5000
     result = await adapter.send("chat-1", long_text, reply_to="msg-1")
     assert result.success is True
-    # All chunks must use proactive _send_request, not _send_reply_stream.
-    assert adapter._send_request.await_count >= 2
-    assert adapter._send_reply_stream.await_count == 0
-    # The pending typing stream should have been closed.
-    assert adapter._send_reply_request.await_count == 1
-    close_call = adapter._send_reply_request.await_args_list[0].args[1]
-    assert close_call["msgtype"] == "stream"
-    assert close_call["stream"]["finish"] is True
+    # First chunk goes through _send_reply_stream, remaining chunks proactive.
+    assert adapter._send_reply_stream.await_count == 1
+    assert adapter._send_request.await_count >= 1
+    # The pending typing stream should have been consumed by _send_reply_stream.
+    assert "chat-1" not in adapter._streams_pending_close
 
 
 @pytest.mark.asyncio

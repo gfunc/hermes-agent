@@ -2372,74 +2372,71 @@ class WeComAdapter(BasePlatformAdapter):
             # stream replies (APP_CMD_RESPONSE). The two paths have different
             # latencies through WeCom's infrastructure and can arrive out of
             # order, causing later chunks to appear before earlier ones.
+            original_reply_req_id = reply_req_id
             if reply_req_id and len(chunks) > 1:
-                typing_state = self._typing_stream_state_by_chat.pop(chat_id, None)
-                pending = self._streams_pending_close.pop(chat_id, None)
-                stream_to_close = typing_state or pending
-                if stream_to_close:
-                    try:
-                        await self._send_reply_request(
-                            stream_to_close[0],
-                            {
-                                "msgtype": "stream",
-                                "stream": {
-                                    "id": stream_to_close[1],
-                                    "finish": True,
-                                    "content": STREAM_FINISH_CONTENT,
-                                },
-                            },
-                        )
-                        logger.debug(
-                            "[%s] Closed typing stream before multi-chunk proactive send",
-                            self.name,
-                        )
-                    except Exception as exc:
-                        logger.debug(
-                            "[%s] Failed to close typing stream for multi-chunk send: %s",
-                            self.name,
-                            exc,
-                        )
+                # Send the first chunk as a stream reply so the typing
+                # indicator is replaced with real text instead of an empty
+                # ​ block.  Then send the remaining chunks proactively.
+                try:
+                    await self._send_reply_stream(reply_req_id, chunks[0], chat_id=chat_id)
+                    chunks = chunks[1:]
+                except RuntimeError as exc:
+                    err_text = str(exc)
+                    if "846608" not in err_text:
+                        raise
+                    # Stream expired — fall through and send all chunks proactively.
                 reply_req_id = None
+
+            # Prevent _keep_typing from recreating a stream while proactive
+            # chunks are in-flight.  Without this, send_typing sees no active
+            # stream (it was consumed by _send_reply_stream) and creates an
+            # orphan that is never closed.
+            if original_reply_req_id:
+                self._reply_req_ids_sending_response.add(original_reply_req_id)
 
             last_response: Optional[Dict[str, Any]] = None
             last_error: Optional[str] = None
 
-            for idx, chunk in enumerate(chunks):
-                is_last = idx == len(chunks) - 1
-                if reply_req_id and is_last:
-                    try:
-                        response = await self._send_reply_stream(reply_req_id, chunk, chat_id=chat_id)
-                    except RuntimeError as exc:
-                        err_text = str(exc)
-                        if "846608" in err_text:
-                            logger.warning(
-                                "[%s] Stream reply expired (846608) for req_id=%s, falling back to proactive send",
-                                self.name, reply_req_id,
-                            )
-                            response = await self._send_request(
-                                APP_CMD_SEND,
-                                {
-                                    "chatid": chat_id,
-                                    "msgtype": "markdown",
-                                    "markdown": {"content": chunk},
-                                },
-                            )
-                        else:
-                            raise
-                else:
-                    response = await self._send_request(
-                        APP_CMD_SEND,
-                        {
-                            "chatid": chat_id,
-                            "msgtype": "markdown",
-                            "markdown": {"content": chunk},
-                        },
-                    )
-                last_response = response
-                error = self._response_error(response)
-                if error:
-                    last_error = error
-                    break
+            try:
+                for idx, chunk in enumerate(chunks):
+                    is_last = idx == len(chunks) - 1
+                    if reply_req_id and is_last:
+                        try:
+                            response = await self._send_reply_stream(reply_req_id, chunk, chat_id=chat_id)
+                        except RuntimeError as exc:
+                            err_text = str(exc)
+                            if "846608" in err_text:
+                                logger.warning(
+                                    "[%s] Stream reply expired (846608) for req_id=%s, falling back to proactive send",
+                                    self.name, reply_req_id,
+                                )
+                                response = await self._send_request(
+                                    APP_CMD_SEND,
+                                    {
+                                        "chatid": chat_id,
+                                        "msgtype": "markdown",
+                                        "markdown": {"content": chunk},
+                                    },
+                                )
+                            else:
+                                raise
+                    else:
+                        response = await self._send_request(
+                            APP_CMD_SEND,
+                            {
+                                "chatid": chat_id,
+                                "msgtype": "markdown",
+                                "markdown": {"content": chunk},
+                            },
+                        )
+                    last_response = response
+                    error = self._response_error(response)
+                    if error:
+                        last_error = error
+                        break
+            finally:
+                if original_reply_req_id:
+                    self._reply_req_ids_sending_response.discard(original_reply_req_id)
 
             if last_error:
                 return SendResult(success=False, error=last_error)
