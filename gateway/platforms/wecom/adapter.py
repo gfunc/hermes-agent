@@ -1178,6 +1178,11 @@ class WeComAdapter(BasePlatformAdapter):
                     self._last_reply_req_id_per_chat.pop(next(iter(self._last_reply_req_id_per_chat)))
 
         text, reply_text = self._extract_text(body)
+        # Strip leading @mention in group chats so slash commands like
+        # "@BotName /approve" are correctly recognized as "/approve".
+        # Mirrors what the Telegram adapter does (re.sub @botname).
+        if is_group and text:
+            text = re.sub(r"^@\S+\s*", "", text).strip()
 
         # Template card event: handle gracefully without dispatching as normal message
         msgtype = str(body.get("msgtype") or "").lower()
@@ -1288,13 +1293,16 @@ class WeComAdapter(BasePlatformAdapter):
         msgtype = str(body.get("msgtype") or "").lower()
 
         if msgtype == "mixed":
-            mixed = body.get("mixed") if isinstance(body.get("mixed"), dict) else {}
-            items = mixed.get("msg_item") if isinstance(mixed.get("msg_item"), list) else []
+            _raw_mixed = body.get("mixed")
+            mixed = _raw_mixed if isinstance(_raw_mixed, dict) else {}
+            _raw_items = mixed.get("msg_item")
+            items = _raw_items if isinstance(_raw_items, list) else []
             for item in items:
                 if not isinstance(item, dict):
                     continue
                 if str(item.get("msgtype") or "").lower() == "text":
-                    text_block = item.get("text") if isinstance(item.get("text"), dict) else {}
+                    _raw_text = item.get("text")
+                    text_block = _raw_text if isinstance(_raw_text, dict) else {}
                     content = str(text_block.get("content") or "").strip()
                     if content:
                         text_parts.append(content)
@@ -1340,8 +1348,10 @@ class WeComAdapter(BasePlatformAdapter):
         )
 
         if msgtype == "mixed":
-            mixed = body.get("mixed") if isinstance(body.get("mixed"), dict) else {}
-            items = mixed.get("msg_item") if isinstance(mixed.get("msg_item"), list) else []
+            _raw_mixed = body.get("mixed")
+            mixed = _raw_mixed if isinstance(_raw_mixed, dict) else {}
+            _raw_items = mixed.get("msg_item")
+            items = _raw_items if isinstance(_raw_items, list) else []
             for item in items:
                 if not isinstance(item, dict):
                     continue
@@ -2216,6 +2226,47 @@ class WeComAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=prepared["reject_reason"])
 
         reply_req_id = self._reply_req_id_for_message(reply_to)
+
+        # Close any active typing stream BEFORE sending media.  In the normal
+        # flow stop_typing() runs in base.py's finally block AFTER the response
+        # is sent, so at this point the stream may still be in
+        # _typing_stream_state_by_chat (not yet moved to _streams_pending_close).
+        # We must close it proactively so the typing bubble disappears before
+        # the media arrives and does not linger forever for media-only replies.
+        stream_to_close: Optional[Tuple[str, str]] = None
+        if reply_req_id and chat_id:
+            for store in (self._streams_pending_close, self._typing_stream_state_by_chat):
+                state = store.pop(chat_id, None)
+                if state and state[0] == reply_req_id:
+                    stream_to_close = state
+                    break
+                elif state:
+                    # Belongs to a different message — put it back.
+                    store[chat_id] = state
+
+            if stream_to_close:
+                try:
+                    await self._send_reply_request(
+                        stream_to_close[0],
+                        {
+                            "msgtype": "stream",
+                            "stream": {
+                                "id": stream_to_close[1],
+                                "finish": True,
+                                "content": "",
+                            },
+                        },
+                    )
+                    logger.debug(
+                        "[%s] Closed typing stream before media send: chat=%s stream_id=%s",
+                        self.name, chat_id, stream_to_close[1],
+                    )
+                except Exception as exc:
+                    logger.debug(
+                        "[%s] Failed to close typing stream before media: %s",
+                        self.name, exc,
+                    )
+
         try:
             upload_result = await self._upload_media_bytes(
                 prepared["data"],
@@ -2239,37 +2290,6 @@ class WeComAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.error("[%s] Failed to send media %s: %s", self.name, media_source, exc)
             return SendResult(success=False, error=str(exc))
-
-        # When the agent response contains only media (no text), send() /
-        # _send_reply_stream() is never called and the pending stream from
-        # stop_typing() stays open.  Close it here so the bubble doesn't
-        # linger until the next message arrives.
-        if reply_req_id and chat_id:
-            pending = self._streams_pending_close.pop(chat_id, None)
-            if pending and pending[0] == reply_req_id:
-                try:
-                    await self._send_reply_request(
-                        reply_req_id,
-                        {
-                            "msgtype": "stream",
-                            "stream": {
-                                "id": pending[1],
-                                "finish": True,
-                                "content": STREAM_FINISH_CONTENT,
-                            },
-                        },
-                    )
-                    logger.debug(
-                        "[%s] Closed orphaned typing stream after media reply: chat=%s stream_id=%s",
-                        self.name, chat_id, pending[1],
-                    )
-                except Exception as exc:
-                    logger.debug(
-                        "[%s] Failed to close orphaned typing stream after media: %s",
-                        self.name, exc,
-                    )
-            elif pending:
-                self._streams_pending_close[chat_id] = pending
 
         caption_result = None
         downgrade_result = None
@@ -2757,3 +2777,134 @@ class WeComAdapter(BasePlatformAdapter):
             "name": chat_id,
             "type": "group" if chat_id and chat_id.lower().startswith("group") else "dm",
         }
+
+
+# ------------------------------------------------------------------
+# QR code scan flow for obtaining bot credentials
+# ------------------------------------------------------------------
+
+_QR_GENERATE_URL = "https://work.weixin.qq.com/ai/qc/generate"
+_QR_QUERY_URL = "https://work.weixin.qq.com/ai/qc/query_result"
+_QR_CODE_PAGE = "https://work.weixin.qq.com/ai/qc/gen?source=hermes&scode="
+_QR_POLL_INTERVAL = 3  # seconds
+_QR_POLL_TIMEOUT = 300  # 5 minutes
+
+
+def qr_scan_for_bot_info(
+    *,
+    timeout_seconds: int = _QR_POLL_TIMEOUT,
+) -> Optional[Dict[str, str]]:
+    """Run the WeCom QR scan flow to obtain bot_id and secret.
+
+    Fetches a QR code from WeCom, renders it in the terminal, and polls
+    until the user scans it or the timeout expires.
+
+    Returns ``{"bot_id": ..., "secret": ...}`` on success, ``None`` on
+    failure or timeout.
+
+    Note: the ``work.weixin.qq.com/ai/qc/{generate,query_result}`` endpoints
+    used here are not part of WeCom's public developer API — they back the
+    admin-console web UI's bot-creation flow and may change without notice.
+    The same pattern is used by the feishu/dingtalk QR setup wizards.
+    """
+    try:
+        import urllib.request
+        import urllib.parse
+    except ImportError:  # pragma: no cover
+        logger.error("urllib is required for WeCom QR scan")
+        return None
+
+    generate_url = f"{_QR_GENERATE_URL}?source=hermes"
+
+    # ── Step 1: Fetch QR code ──
+    print("  Connecting to WeCom...", end="", flush=True)
+    try:
+        req = urllib.request.Request(generate_url, headers={"User-Agent": "HermesAgent/1.0"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            raw = json.loads(resp.read().decode("utf-8"))
+    except Exception as exc:
+        logger.error("WeCom QR: failed to fetch QR code: %s", exc)
+        print(f" failed: {exc}")
+        return None
+
+    data = raw.get("data") or {}
+    scode = str(data.get("scode") or "").strip()
+    auth_url = str(data.get("auth_url") or "").strip()
+
+    if not scode or not auth_url:
+        logger.error("WeCom QR: unexpected response format: %s", raw)
+        print(" failed: unexpected response format")
+        return None
+
+    print(" done.")
+
+    # ── Step 2: Render QR code in terminal ──
+    print()
+    qr_rendered = False
+    try:
+        import qrcode as _qrcode
+        qr = _qrcode.QRCode()
+        qr.add_data(auth_url)
+        qr.make(fit=True)
+        qr.print_ascii(invert=True)
+        qr_rendered = True
+    except ImportError:
+        pass
+    except Exception:
+        pass
+
+    page_url = f"{_QR_CODE_PAGE}{urllib.parse.quote(scode)}"
+    if qr_rendered:
+        print(f"\n  Scan the QR code above, or open this URL directly:\n  {page_url}")
+    else:
+        print(f"  Open this URL in WeCom on your phone:\n\n  {page_url}\n")
+        print("  Tip: pip install qrcode  to display a scannable QR code here next time")
+    print()
+    print("  Fetching configuration results...", end="", flush=True)
+
+    # ── Step 3: Poll for result ──
+    import time
+    deadline = time.time() + timeout_seconds
+    query_url = f"{_QR_QUERY_URL}?scode={urllib.parse.quote(scode)}"
+    poll_count = 0
+
+    while time.time() < deadline:
+        try:
+            req = urllib.request.Request(query_url, headers={"User-Agent": "HermesAgent/1.0"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                result = json.loads(resp.read().decode("utf-8"))
+        except Exception as exc:
+            logger.debug("WeCom QR poll error: %s", exc)
+            time.sleep(_QR_POLL_INTERVAL)
+            continue
+
+        poll_count += 1
+        # Print a dot on every poll so progress is visible within 3s.
+        print(".", end="", flush=True)
+
+        result_data = result.get("data") or {}
+        status = str(result_data.get("status") or "").lower()
+
+        if status == "success":
+            print()  # newline after "Fetching configuration results..." dots
+            bot_info = result_data.get("bot_info") or {}
+            bot_id = str(bot_info.get("botid") or bot_info.get("bot_id") or "").strip()
+            secret = str(bot_info.get("secret") or "").strip()
+            if bot_id and secret:
+                return {"bot_id": bot_id, "secret": secret}
+            logger.warning(
+                "WeCom QR: scan reported success but bot_info missing or incomplete: %s",
+                result_data,
+            )
+            print(
+                "  QR scan reported success but no bot credentials were returned.\n"
+                "  This usually means the bot was not actually created on the WeCom side.\n"
+                "  Falling back to manual credential entry."
+            )
+            return None
+
+        time.sleep(_QR_POLL_INTERVAL)
+
+    print()  # newline after dots
+    print(f"  QR scan timed out ({timeout_seconds // 60} minutes). Please try again.")
+    return None
