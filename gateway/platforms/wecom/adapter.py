@@ -2255,7 +2255,7 @@ class WeComAdapter(BasePlatformAdapter):
                             "stream": {
                                 "id": pending[1],
                                 "finish": True,
-                                "content": "",
+                                "content": STREAM_FINISH_CONTENT,
                             },
                         },
                     )
