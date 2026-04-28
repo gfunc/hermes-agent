@@ -2150,3 +2150,33 @@ class TestWeComInboundEdgeCases:
         await adapter._on_message(payload)
         event = adapter.handle_message.await_args.args[0]
         assert event.text == "original question"
+
+
+@pytest.mark.asyncio
+async def test_close_pending_streams_preserves_unprocessed_on_exception():
+    """If _send_reply_request raises mid-loop, remaining items must stay in _streams_pending_close."""
+    from gateway.config import PlatformConfig
+    from gateway.platforms.wecom import WeComAdapter
+
+    adapter = WeComAdapter(PlatformConfig(extra={"bot_id": "b", "secret": "s"}))
+    adapter._streams_pending_close = {
+        "chat-1": ("req-1", "stream-1"),
+        "chat-2": ("req-2", "stream-2"),
+        "chat-3": ("req-3", "stream-3"),
+    }
+
+    call_count = 0
+    async def _failing_send(req_id, payload):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 2:
+            raise RuntimeError("boom")
+        return {"headers": {"req_id": "r1"}, "body": {"errcode": 0}}
+
+    adapter._send_reply_request = _failing_send
+
+    await adapter._close_pending_streams()
+
+    assert "chat-1" not in adapter._streams_pending_close  # succeeded
+    assert "chat-2" in adapter._streams_pending_close  # failed, must remain
+    assert "chat-3" in adapter._streams_pending_close  # never attempted, must remain

@@ -2508,16 +2508,19 @@ class WeComAdapter(BasePlatformAdapter):
 
     async def _close_pending_streams(self, skip_chat_id: Optional[str] = None) -> None:
         """Send ``finish=True`` for streams orphaned by ``pause_typing_for_chat``."""
-        items = list(self._streams_pending_close.items())
-        if items:
+        chat_ids = list(self._streams_pending_close.keys())
+        if chat_ids:
             logger.debug(
                 "[%s] _close_pending_streams: closing %d pending stream(s) skip=%s",
-                self.name, len(items), skip_chat_id,
+                self.name, len(chat_ids), skip_chat_id,
             )
-        self._streams_pending_close.clear()
-        for _chat_id, (req_id, stream_id) in items:
+        for _chat_id in chat_ids:
+            state = self._streams_pending_close.pop(_chat_id, None)
+            if state is None:
+                continue
+            req_id, stream_id = state
             if skip_chat_id and _chat_id == skip_chat_id:
-                self._streams_pending_close[_chat_id] = (req_id, stream_id)
+                self._streams_pending_close[_chat_id] = state
                 logger.debug(
                     "[%s] _close_pending_streams: skipped chat=%s (current response target)",
                     self.name, _chat_id,
@@ -2542,6 +2545,8 @@ class WeComAdapter(BasePlatformAdapter):
                 )
             except Exception as exc:
                 logger.debug("[%s] Failed to close pending stream for %s: %s", self.name, _chat_id, exc)
+                self._streams_pending_close[_chat_id] = state
+                break
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Return minimal chat info."""
