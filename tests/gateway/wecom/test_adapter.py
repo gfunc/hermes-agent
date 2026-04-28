@@ -2223,3 +2223,41 @@ async def test_disconnect_clears_all_state():
     assert not adapter._reply_req_ids_sending_response
     assert not adapter._typing_stream_state_by_chat
     assert not adapter._last_reply_req_id_per_chat
+
+
+@pytest.mark.asyncio
+async def test_send_media_source_blocks_typing_during_upload():
+    """_send_media_source must set _reply_req_ids_sending_response during upload+send."""
+    from gateway.config import PlatformConfig
+    from gateway.platforms.wecom import WeComAdapter
+
+    adapter = WeComAdapter(PlatformConfig(extra={"bot_id": "b", "secret": "s"}))
+    adapter._reply_req_ids["msg-1"] = "req-1"
+    adapter._prepare_outbound_media = AsyncMock(return_value={
+        "data": b"image-bytes",
+        "content_type": "image/png",
+        "file_name": "demo.png",
+        "detected_type": "image",
+        "final_type": "image",
+        "rejected": False,
+        "downgraded": False,
+        "downgrade_note": None,
+    })
+
+    entered_upload = False
+    async def slow_upload(*args, **kwargs):
+        nonlocal entered_upload
+        entered_upload = True
+        # During upload, typing must be blocked
+        assert adapter._reply_req_ids_sending_response.get("req-1", 0) > 0
+        return {"media_id": "media-1", "type": "image"}
+
+    adapter._upload_media_bytes = slow_upload
+    adapter._send_reply_request = AsyncMock(return_value={"headers": {"req_id": "r1"}, "body": {"errcode": 0}})
+    adapter._send_media_message = AsyncMock(return_value={"headers": {"req_id": "r1"}})
+
+    result = await adapter.send_image_file("chat-1", "/tmp/demo.png", reply_to="msg-1")
+    assert result.success is True
+    assert entered_upload
+    # Refcount must be cleared after upload completes
+    assert "req-1" not in adapter._reply_req_ids_sending_response

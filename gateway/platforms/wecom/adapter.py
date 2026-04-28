@@ -2039,6 +2039,13 @@ class WeComAdapter(BasePlatformAdapter):
                         self.name, exc,
                     )
 
+        # Prevent _keep_typing from opening a new stream while the media
+        # upload + send is in-flight.  Without this, the multi-second
+        # download/upload window allows an orphan typing stream to be created.
+        if reply_req_id:
+            self._reply_req_ids_sending_response[reply_req_id] = (
+                self._reply_req_ids_sending_response.get(reply_req_id, 0) + 1
+            )
         try:
             upload_result = await self._upload_media_bytes(
                 prepared["data"],
@@ -2062,6 +2069,13 @@ class WeComAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.error("[%s] Failed to send media %s: %s", self.name, media_source, exc)
             return SendResult(success=False, error=str(exc))
+        finally:
+            if reply_req_id:
+                count = self._reply_req_ids_sending_response.get(reply_req_id, 0) - 1
+                if count <= 0:
+                    self._reply_req_ids_sending_response.pop(reply_req_id, None)
+                else:
+                    self._reply_req_ids_sending_response[reply_req_id] = count
 
         caption_result = None
         downgrade_result = None
