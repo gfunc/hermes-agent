@@ -2431,22 +2431,6 @@ class WeComAdapter(BasePlatformAdapter):
             )
             return
 
-        current_state = self._typing_stream_state_by_chat.get(chat_id)
-        if current_state and current_state[0] == reply_req_id:
-            # Already active for this exact message.
-            logger.debug(
-                "[%s] send_typing: chat=%s stream already active for req_id=%s, skip",
-                self.name, chat_id, reply_req_id,
-            )
-            return
-        if current_state:
-            # Different message: close the old stream before opening a new one.
-            logger.debug(
-                "[%s] send_typing: chat=%s has stream for different req_id=%s, stopping first",
-                self.name, chat_id, current_state[0],
-            )
-            await self.stop_typing(chat_id)
-
         stream_id = self._new_req_id("stream")
         logger.debug(
             "[%s] send_typing: chat=%s opening stream_id=%s for req_id=%s",
