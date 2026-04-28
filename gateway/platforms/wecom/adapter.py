@@ -208,7 +208,10 @@ class WeComAdapter(BasePlatformAdapter):
         # new typing stream while the HTTP request is in-flight, which would
         # create an orphan stream. Once the response is delivered, typing
         # is allowed to resume for the same message (e.g. multi-turn analysis).
-        self._reply_req_ids_sending_response: set[str] = set()
+        # Uses a refcount (dict) because send() and _send_reply_stream() may
+        # both add the same req_id (nested calls); the flag must stay raised
+        # until the outermost caller finishes.
+        self._reply_req_ids_sending_response: Dict[str, int] = {}
         self._reply_queue = WeComReplyQueue(
             send_json_fn=self._send_json,
             pending_responses_dict=self._pending_responses,
@@ -2120,7 +2123,9 @@ class WeComAdapter(BasePlatformAdapter):
         # Block _keep_typing from opening a new stream while this HTTP
         # request is in-flight. Once delivered we allow typing again so
         # multi-turn analysis within the same message shows an indicator.
-        self._reply_req_ids_sending_response.add(reply_req_id)
+        self._reply_req_ids_sending_response[reply_req_id] = (
+            self._reply_req_ids_sending_response.get(reply_req_id, 0) + 1
+        )
         try:
             response = await self._send_reply_request(
                 reply_req_id,
@@ -2134,7 +2139,11 @@ class WeComAdapter(BasePlatformAdapter):
                 },
             )
         finally:
-            self._reply_req_ids_sending_response.discard(reply_req_id)
+            count = self._reply_req_ids_sending_response.get(reply_req_id, 0) - 1
+            if count <= 0:
+                self._reply_req_ids_sending_response.pop(reply_req_id, None)
+            else:
+                self._reply_req_ids_sending_response[reply_req_id] = count
         self._raise_for_wecom_error(response, "send reply stream")
         logger.debug(
             "[%s] _send_reply_stream: response delivered for req_id=%s chat=%s stream_id=%s",
@@ -2392,7 +2401,9 @@ class WeComAdapter(BasePlatformAdapter):
             # stream (it was consumed by _send_reply_stream) and creates an
             # orphan that is never closed.
             if original_reply_req_id:
-                self._reply_req_ids_sending_response.add(original_reply_req_id)
+                self._reply_req_ids_sending_response[original_reply_req_id] = (
+                    self._reply_req_ids_sending_response.get(original_reply_req_id, 0) + 1
+                )
 
             last_response: Optional[Dict[str, Any]] = None
             last_error: Optional[str] = None
@@ -2436,7 +2447,11 @@ class WeComAdapter(BasePlatformAdapter):
                         break
             finally:
                 if original_reply_req_id:
-                    self._reply_req_ids_sending_response.discard(original_reply_req_id)
+                    count = self._reply_req_ids_sending_response.get(original_reply_req_id, 0) - 1
+                    if count <= 0:
+                        self._reply_req_ids_sending_response.pop(original_reply_req_id, None)
+                    else:
+                        self._reply_req_ids_sending_response[original_reply_req_id] = count
 
             if last_error:
                 return SendResult(success=False, error=last_error)

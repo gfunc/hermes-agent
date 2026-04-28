@@ -1523,14 +1523,14 @@ async def test_send_typing_skips_while_response_in_flight():
 
     # Simulate _send_reply_stream in-flight: typing state popped + flag set
     adapter._typing_stream_state_by_chat.pop("chat-typing", None)
-    adapter._reply_req_ids_sending_response.add("req-typing")
+    adapter._reply_req_ids_sending_response["req-typing"] = 1
 
     # A racing send_typing (from _keep_typing) must skip during in-flight
     await adapter.send_typing("chat-typing", metadata={"message_id": "msg-typing"})
     assert adapter._send_reply_request.await_count == 1  # no new stream
 
     # After response is fully delivered (removed from set), send_typing resumes
-    adapter._reply_req_ids_sending_response.discard("req-typing")
+    adapter._reply_req_ids_sending_response.pop("req-typing", None)
     await adapter.send_typing("chat-typing", metadata={"message_id": "msg-typing"})
     assert adapter._send_reply_request.await_count == 2  # new stream opened
 
