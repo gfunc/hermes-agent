@@ -2175,10 +2175,9 @@ class WeComAdapter(BasePlatformAdapter):
             # chunks are in-flight.  Without this, send_typing sees no active
             # stream (it was consumed by _send_reply_stream) and creates an
             # orphan that is never closed.
-            if original_reply_req_id:
-                self._reply_req_ids_sending_response[original_reply_req_id] = (
-                    self._reply_req_ids_sending_response.get(original_reply_req_id, 0) + 1
-                )
+            # Note: _send_reply_stream() above already raised and lowered its
+            # own refcount, so by the time we reach here the count is back to
+            # zero. This increment is solely for the proactive chunk sends.
 
             last_response: Optional[Dict[str, Any]] = None
             last_error: Optional[str] = None
@@ -2543,7 +2542,10 @@ class WeComAdapter(BasePlatformAdapter):
                     self.name, _chat_id, stream_id,
                 )
             except Exception as exc:
-                logger.debug("[%s] Failed to close pending stream for %s: %s", self.name, _chat_id, exc)
+                logger.warning(
+                    "[%s] Failed to close pending stream for %s (will retry): %s",
+                    self.name, _chat_id, exc,
+                )
                 self._streams_pending_close[_chat_id] = state
                 break
 
