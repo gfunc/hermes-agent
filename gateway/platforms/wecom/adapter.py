@@ -2433,7 +2433,6 @@ class WeComAdapter(BasePlatformAdapter):
             await self.stop_typing(chat_id)
 
         stream_id = self._new_req_id("stream")
-        self._typing_stream_state_by_chat[chat_id] = (reply_req_id, stream_id)
         logger.debug(
             "[%s] send_typing: chat=%s opening stream_id=%s for req_id=%s",
             self.name, chat_id, stream_id, reply_req_id,
@@ -2451,6 +2450,7 @@ class WeComAdapter(BasePlatformAdapter):
                 },
             )
             self._raise_for_wecom_error(response, "send typing stream")
+            self._typing_stream_state_by_chat[chat_id] = (reply_req_id, stream_id)
             logger.debug(
                 "[%s] send_typing: chat=%s stream_id=%s opened successfully",
                 self.name, chat_id, stream_id,

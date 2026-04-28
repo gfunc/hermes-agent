@@ -2025,6 +2025,21 @@ class TestWeComTyping846608:
         assert "req-old" in adapter._reply_req_ids
         assert "chat-1" in adapter._last_reply_req_id_per_chat
 
+    @pytest.mark.asyncio
+    async def test_send_typing_clears_state_on_send_failure(self):
+        """If _send_reply_request raises (non-846608), typing state must not leak."""
+        from gateway.config import PlatformConfig
+        from gateway.platforms.wecom import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(extra={"bot_id": "b", "secret": "s"}))
+        adapter._remember_reply_req_id("msg-1", "req-1")
+        adapter._send_reply_request = AsyncMock(side_effect=RuntimeError("network error"))
+
+        await adapter.send_typing("chat-1", metadata={"message_id": "msg-1"})
+
+        # State should NOT remain assigned on failure
+        assert "chat-1" not in adapter._typing_stream_state_by_chat
+
 
 class TestWeComInboundEdgeCases:
     @pytest.mark.asyncio
