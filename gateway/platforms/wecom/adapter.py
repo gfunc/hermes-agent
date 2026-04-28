@@ -421,6 +421,9 @@ class WeComAdapter(BasePlatformAdapter):
         self._dedup.clear()
         self._typing_stream_state_by_chat.clear()
         self._last_reply_req_id_per_chat.clear()
+        self._reply_req_ids.clear()
+        self._streams_pending_close.clear()
+        self._reply_req_ids_sending_response.clear()
         logger.info("[%s] Disconnected", self.name)
 
     async def _cleanup_ws(self) -> None:

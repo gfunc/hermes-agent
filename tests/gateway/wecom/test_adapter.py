@@ -2195,3 +2195,31 @@ async def test_close_pending_streams_preserves_unprocessed_on_exception():
     assert "chat-1" not in adapter._streams_pending_close  # succeeded
     assert "chat-2" in adapter._streams_pending_close  # failed, must remain
     assert "chat-3" in adapter._streams_pending_close  # never attempted, must remain
+
+
+@pytest.mark.asyncio
+async def test_disconnect_clears_all_state():
+    """disconnect() must clear all reply/typing state."""
+    from gateway.platforms.wecom import WeComAdapter
+
+    adapter = WeComAdapter(PlatformConfig(extra={"bot_id": "b", "secret": "s"}))
+    adapter._reply_req_ids["msg-1"] = "req-1"
+    adapter._streams_pending_close["chat-1"] = ("req-1", "stream-1")
+    adapter._reply_req_ids_sending_response["req-1"] = 1
+    adapter._typing_stream_state_by_chat["chat-1"] = ("req-1", "stream-2")
+    adapter._last_reply_req_id_per_chat["chat-1"] = "req-1"
+
+    # Mock to avoid actual task cancellation issues
+    adapter._listen_task = None
+    adapter._heartbeat_task = None
+    adapter._watchdog_task = None
+    adapter._http_client = None
+    adapter._ws_client = AsyncMock()
+
+    await adapter.disconnect()
+
+    assert not adapter._reply_req_ids
+    assert not adapter._streams_pending_close
+    assert not adapter._reply_req_ids_sending_response
+    assert not adapter._typing_stream_state_by_chat
+    assert not adapter._last_reply_req_id_per_chat
