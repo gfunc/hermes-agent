@@ -2292,3 +2292,23 @@ async def test_send_media_source_blocks_typing_during_upload():
     assert entered_upload
     # Refcount must be cleared after upload completes
     assert "req-1" not in adapter._reply_req_ids_sending_response
+
+
+@pytest.mark.asyncio
+async def test_send_does_not_corrupt_pending_close_state():
+    """When send() reads from _streams_pending_close, it must not move it to active."""
+    from gateway.config import PlatformConfig
+    from gateway.platforms.wecom import WeComAdapter
+
+    adapter = WeComAdapter(PlatformConfig(extra={"bot_id": "b", "secret": "s"}))
+    adapter._remember_reply_req_id("msg-1", "req-1")
+    adapter._streams_pending_close["chat-1"] = ("req-1", "stream-pending-1")
+    adapter._send_reply_request = AsyncMock(return_value={"headers": {"req_id": "r1"}, "body": {"errcode": 0}})
+
+    # send() without reply_to should find req_id from pending_close
+    result = await adapter.send(chat_id="chat-1", content="Hello")
+    assert result.success is True
+
+    # After _send_reply_stream consumes the pending state, neither store should have it
+    assert "chat-1" not in adapter._typing_stream_state_by_chat
+    assert "chat-1" not in adapter._streams_pending_close
