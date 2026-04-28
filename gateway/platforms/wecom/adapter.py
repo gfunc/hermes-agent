@@ -228,7 +228,6 @@ class WeComAdapter(BasePlatformAdapter):
         self._webhook_runner: Optional["web.AppRunner"] = None
         self._webhook_site: Optional["web.TCPSite"] = None
         self._webhook_app: Optional["web.Application"] = None
-        self._stream_states: Dict[str, Dict[str, Any]] = {}
         self._stream_store: Optional[StreamStore] = None
         self._mcp_configs: Dict[str, str] = {}
         self._typing_stream_state_by_chat: Dict[str, Tuple[str, str]] = {}
@@ -1552,28 +1551,6 @@ class WeComAdapter(BasePlatformAdapter):
             return MessageType.VOICE
         return MessageType.TEXT
 
-    async def _handle_template_card_event(self, body: Dict[str, Any]) -> None:
-        from gateway.platforms.wecom.template_cards import get_template_card_from_cache
-
-        event = body.get("event") if isinstance(body.get("event"), dict) else {}
-        response_code = str(event.get("response_code") or "").strip()
-        button_replace_name = str(event.get("button_replace_name") or "").strip()
-        selected_options = event.get("selected_options")
-        selected_option_ids = (
-            [str(opt.get("key") or "") for opt in selected_options if isinstance(opt, dict)]
-            if isinstance(selected_options, list)
-            else []
-        )
-
-        account = self._accounts[0] if self._accounts else None
-        if not account:
-            return
-
-        logger.debug(
-            "[%s] Template card event received: response_code=%s selected=%s",
-            self.name, response_code, selected_option_ids,
-        )
-
     # ------------------------------------------------------------------
     # Policy helpers
     # ------------------------------------------------------------------
@@ -1697,152 +1674,6 @@ class WeComAdapter(BasePlatformAdapter):
         return chunks
 
     @staticmethod
-    def _detect_mime_from_bytes(data: bytes) -> Optional[str]:
-        """Detect MIME type from file magic bytes (aligned with OpenClaw detectMimeFromBufferSync)."""
-        if not data or len(data) < 3:
-            return None
-
-        # PNG
-        if (
-            len(data) >= 8
-            and data[0] == 0x89
-            and data[1] == 0x50
-            and data[2] == 0x4E
-            and data[3] == 0x47
-            and data[4] == 0x0D
-            and data[5] == 0x0A
-            and data[6] == 0x1A
-            and data[7] == 0x0A
-        ):
-            return "image/png"
-
-        # JPEG
-        if data[0] == 0xFF and data[1] == 0xD8 and data[2] == 0xFF:
-            return "image/jpeg"
-
-        # GIF
-        if data[:6] == b"GIF87a" or data[:6] == b"GIF89a":
-            return "image/gif"
-
-        # WEBP
-        if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
-            return "image/webp"
-
-        # BMP
-        if data[0] == 0x42 and data[1] == 0x4D:
-            return "image/bmp"
-
-        # PDF
-        if data[:5] == b"%PDF-":
-            return "application/pdf"
-
-        # OGG
-        if data[:4] == b"OggS":
-            return "audio/ogg"
-
-        # WAV
-        if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WAVE":
-            return "audio/wav"
-
-        # MP3
-        if data[:3] == b"ID3" or (data[0] == 0xFF and len(data) > 1 and (data[1] & 0xE0) == 0xE0):
-            return "audio/mpeg"
-
-        # MP4/MOV
-        if len(data) >= 12 and data[4:8] == b"ftyp":
-            return "video/mp4"
-
-        return None
-
-    @staticmethod
-    def _normalize_content_type(content_type: str, filename: str, data: Optional[bytes] = None) -> str:
-        normalized = str(content_type or "").split(";", 1)[0].strip().lower()
-        guessed = WeComAdapter._guess_mime_type(filename)
-        magic = WeComAdapter._detect_mime_from_bytes(data) if data else None
-
-        # Priority: magic bytes > explicit content type > filename guess
-        if magic:
-            return magic
-        if normalized and normalized not in {"application/octet-stream", "text/plain"}:
-            return normalized
-        return guessed
-
-    @staticmethod
-    def _detect_wecom_media_type(content_type: str) -> str:
-        mime_type = str(content_type or "").strip().lower()
-        if mime_type.startswith("image/"):
-            return "image"
-        if mime_type.startswith("video/"):
-            return "video"
-        if mime_type.startswith("audio/") or mime_type == "application/ogg":
-            return "voice"
-        return "file"
-
-    @staticmethod
-    def _apply_file_size_limits(file_size: int, detected_type: str, content_type: Optional[str] = None) -> Dict[str, Any]:
-        file_size_mb = file_size / (1024 * 1024)
-        normalized_type = str(detected_type or "file").lower()
-        normalized_content_type = str(content_type or "").strip().lower()
-
-        if file_size > ABSOLUTE_MAX_BYTES:
-            return {
-                "final_type": normalized_type,
-                "rejected": True,
-                "reject_reason": (
-                    f"文件大小 {file_size_mb:.2f}MB 超过了企业微信允许的最大限制 20MB，无法发送。"
-                    "请尝试压缩文件或减小文件大小。"
-                ),
-                "downgraded": False,
-                "downgrade_note": None,
-            }
-
-        if normalized_type == "image" and file_size > IMAGE_MAX_BYTES:
-            return {
-                "final_type": "file",
-                "rejected": False,
-                "reject_reason": None,
-                "downgraded": True,
-                "downgrade_note": f"图片大小 {file_size_mb:.2f}MB 超过 10MB 限制，已转为文件格式发送",
-            }
-
-        if normalized_type == "video" and file_size > VIDEO_MAX_BYTES:
-            return {
-                "final_type": "file",
-                "rejected": False,
-                "reject_reason": None,
-                "downgraded": True,
-                "downgrade_note": f"视频大小 {file_size_mb:.2f}MB 超过 10MB 限制，已转为文件格式发送",
-            }
-
-        if normalized_type == "voice":
-            if normalized_content_type and normalized_content_type not in VOICE_SUPPORTED_MIMES:
-                return {
-                    "final_type": "file",
-                    "rejected": False,
-                    "reject_reason": None,
-                    "downgraded": True,
-                    "downgrade_note": (
-                        f"语音格式 {normalized_content_type} 不支持，企微仅支持 AMR 格式，已转为文件格式发送"
-                    ),
-                }
-            if file_size > VOICE_MAX_BYTES:
-                return {
-                    "final_type": "file",
-                    "rejected": False,
-                    "reject_reason": None,
-                    "downgraded": True,
-                    "downgrade_note": f"语音大小 {file_size_mb:.2f}MB 超过 2MB 限制，已转为文件格式发送",
-                }
-
-        return {
-            "final_type": normalized_type,
-            "rejected": False,
-            "reject_reason": None,
-            "downgraded": False,
-            "downgrade_note": None,
-        }
-
-    @staticmethod
     def _response_error(response: Dict[str, Any]) -> Optional[str]:
         errcode = response.get("errcode", 0)
         if errcode in (0, None):
@@ -1936,51 +1767,6 @@ class WeComAdapter(BasePlatformAdapter):
     def _looks_like_url(media_source: str) -> bool:
         parsed = urlparse(str(media_source or ""))
         return parsed.scheme in {"http", "https"}
-
-    async def _load_outbound_media(
-        self,
-        media_source: str,
-        file_name: Optional[str] = None,
-    ) -> Tuple[bytes, str, str]:
-        source = str(media_source or "").strip()
-        if not source:
-            raise ValueError("media source is required")
-        if re.fullmatch(r"<[^>\n]+>", source):
-            raise ValueError(f"Media placeholder was not replaced with a real file path: {source}")
-
-        parsed = urlparse(source)
-        if parsed.scheme in {"http", "https"}:
-            data, headers = await self._download_remote_bytes(source, max_bytes=ABSOLUTE_MAX_BYTES)
-            content_disposition = headers.get("content-disposition")
-            resolved_name = file_name or self._guess_filename(source, content_disposition, headers.get("content-type", ""))
-            content_type = self._normalize_content_type(headers.get("content-type", ""), resolved_name, data)
-            return data, content_type, resolved_name
-
-        if parsed.scheme == "file":
-            local_path = Path(unquote(parsed.path)).expanduser()
-        else:
-            local_path = Path(source).expanduser()
-
-        if not local_path.is_absolute():
-            local_path = (Path.cwd() / local_path).resolve()
-
-        if not local_path.exists() or not local_path.is_file():
-            raise FileNotFoundError(f"Media file not found: {local_path}")
-
-        # Enforce media_local_roots whitelist if configured
-        allowed_roots = set()
-        for account in self._accounts:
-            for root in account.media_local_roots:
-                allowed_roots.add(Path(root).expanduser().resolve())
-        if allowed_roots:
-            resolved_local = local_path.resolve()
-            if not any(str(resolved_local).startswith(str(root)) for root in allowed_roots):
-                raise PermissionError(f"Media file {local_path} is outside allowed roots: {allowed_roots}")
-
-        data = local_path.read_bytes()
-        resolved_name = file_name or local_path.name
-        content_type = self._normalize_content_type("", resolved_name, data)
-        return data, content_type, resolved_name
 
     async def _prepare_outbound_media(
         self,
@@ -2151,32 +1937,6 @@ class WeComAdapter(BasePlatformAdapter):
         )
         return response
 
-    async def _send_reply_stream_nonblocking(
-        self,
-        reply_req_id: str,
-        stream_id: str,
-        content: str,
-        finish: bool = False,
-    ) -> str:
-        """Send a stream update, skipping if a prior frame is still pending (unless finish=True)."""
-        if not finish and stream_id in self._pending_stream_acks:
-            logger.debug("[%s] Skipping non-blocking stream %s (pending ack)", self.name, stream_id)
-            return "skipped"
-
-        self._pending_stream_acks.add(stream_id)
-        response = await self._send_reply_request(
-            reply_req_id,
-            {
-                "msgtype": "stream",
-                "stream": {
-                    "id": stream_id,
-                    "finish": finish,
-                    "content": content[:self.MAX_MESSAGE_LENGTH],
-                },
-            },
-        )
-        self._raise_for_wecom_error(response, "send reply stream non-blocking")
-        return stream_id
 
     async def _send_reply_media_message(
         self,
