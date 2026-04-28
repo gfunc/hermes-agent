@@ -318,6 +318,7 @@ class TestWeComReplyMode:
     async def test_send_image_file_closes_orphaned_typing_stream(self):
         """When media is sent via reply and a pending stream exists, close it."""
         from gateway.platforms.wecom import WeComAdapter
+        from gateway.platforms.wecom.adapter import STREAM_FINISH_CONTENT
 
         adapter = WeComAdapter(PlatformConfig(enabled=True))
         adapter._reply_req_ids["msg-1"] = "req-1"
@@ -350,11 +351,41 @@ class TestWeComReplyMode:
         assert calls[0].args[1]["msgtype"] == "stream"
         assert calls[0].args[1]["stream"]["id"] == "stream-orphan-1"
         assert calls[0].args[1]["stream"]["finish"] is True
-        assert calls[0].args[1]["stream"]["content"] == ""
+        assert calls[0].args[1]["stream"]["content"] == STREAM_FINISH_CONTENT
         # Second call: image media message
         assert calls[1].args[0] == "req-1"
         assert calls[1].args[1]["msgtype"] == "image"
         assert "stream-orphan-1" not in str(adapter._streams_pending_close)
+
+    @pytest.mark.asyncio
+    async def test_send_media_source_uses_finish_content_to_close_stream(self):
+        """When closing a typing stream before media, use STREAM_FINISH_CONTENT."""
+        from gateway.config import PlatformConfig
+        from gateway.platforms.wecom import WeComAdapter
+        from gateway.platforms.wecom.adapter import STREAM_FINISH_CONTENT
+
+        adapter = WeComAdapter(PlatformConfig(extra={"bot_id": "b", "secret": "s"}))
+        adapter._reply_req_ids["msg-1"] = "req-1"
+        adapter._streams_pending_close["chat-1"] = ("req-1", "stream-orphan-1")
+        adapter._prepare_outbound_media = AsyncMock(return_value={
+            "data": b"image-bytes",
+            "content_type": "image/png",
+            "file_name": "demo.png",
+            "detected_type": "image",
+            "final_type": "image",
+            "rejected": False,
+            "downgraded": False,
+            "downgrade_note": None,
+        })
+        adapter._upload_media_bytes = AsyncMock(return_value={"media_id": "media-1", "type": "image"})
+        adapter._send_media_message = AsyncMock(return_value={"headers": {"req_id": "r1"}})
+        adapter._send_reply_request = AsyncMock(return_value={"headers": {"req_id": "r1"}, "body": {"errcode": 0}})
+
+        await adapter.send_image_file("chat-1", "/tmp/demo.png", reply_to="msg-1")
+
+        # First call closes the orphan stream
+        close_call = adapter._send_reply_request.await_args_list[0]
+        assert close_call.args[1]["stream"]["content"] == STREAM_FINISH_CONTENT
 
     @pytest.mark.asyncio
     async def test_send_image_file_closes_active_typing_stream(self):

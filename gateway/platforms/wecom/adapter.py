@@ -2025,7 +2025,7 @@ class WeComAdapter(BasePlatformAdapter):
                             "stream": {
                                 "id": stream_to_close[1],
                                 "finish": True,
-                                "content": "",
+                                "content": STREAM_FINISH_CONTENT,
                             },
                         },
                     )
