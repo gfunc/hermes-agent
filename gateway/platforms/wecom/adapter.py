@@ -649,6 +649,13 @@ class WeComAdapter(BasePlatformAdapter):
                     "text": {"content": prompt},
                 })
 
+            # Capture response_url for proactive reply push
+            response_url = decrypted.get("response_url")
+            if response_url and self._stream_store:
+                policy = decrypted.get("active_reply_policy", "once")
+                await self._stream_store.active_reply_store.save(chat_id, response_url, policy=policy)
+                logger.debug("[%s] Stored response_url for chat=%s policy=%s", self.name, chat_id, policy)
+
             if self._stream_store:
                 stream_id, status = self._stream_store.add_pending_message(
                     conversation_key=f"wecom:{account.account_id}:{sender_id}:{chat_id}",
@@ -2349,6 +2356,32 @@ class WeComAdapter(BasePlatformAdapter):
             },
         )
 
+    async def _push_via_response_url(
+        self,
+        chat_id: str,
+        payload: Dict[str, Any],
+    ) -> bool:
+        """Push a reply via webhook response_url if available."""
+        if not self._stream_store:
+            return False
+        reply = await self._stream_store.active_reply_store.retrieve(chat_id)
+        if not reply:
+            return False
+
+        url = reply["url"]
+        try:
+            async with self._http_client.post(url, json=payload) as response:
+                if response.status == 200:
+                    logger.debug("[%s] Pushed reply via response_url for chat=%s", self.name, chat_id)
+                    return True
+                logger.warning(
+                    "[%s] response_url push failed: HTTP %s for chat=%s",
+                    self.name, response.status, chat_id,
+                )
+        except Exception as exc:
+            logger.warning("[%s] response_url push error: %s", self.name, exc)
+        return False
+
     async def send(
         self,
         chat_id: str,
@@ -2447,25 +2480,46 @@ class WeComAdapter(BasePlatformAdapter):
                                     "[%s] Stream reply expired (846608) for req_id=%s, falling back to proactive send",
                                     self.name, reply_req_id,
                                 )
-                                response = await self._send_request(
-                                    APP_CMD_SEND,
+                                pushed = await self._push_via_response_url(
+                                    chat_id,
                                     {
-                                        "chatid": chat_id,
                                         "msgtype": "markdown",
-                                        "markdown": {"content": chunk},
+                                        "markdown": {"content": chunk[:self.MAX_MESSAGE_LENGTH]},
                                     },
                                 )
+                                if pushed:
+                                    response = {"body": {"errcode": 0}}
+                                else:
+                                    response = await self._send_request(
+                                        APP_CMD_SEND,
+                                        {
+                                            "chatid": chat_id,
+                                            "msgtype": "markdown",
+                                            "markdown": {"content": chunk},
+                                        },
+                                    )
                             else:
                                 raise
                     else:
-                        response = await self._send_request(
-                            APP_CMD_SEND,
+                        # Try response_url push before falling back to proactive aibot_send_msg
+                        pushed = await self._push_via_response_url(
+                            chat_id,
                             {
-                                "chatid": chat_id,
                                 "msgtype": "markdown",
-                                "markdown": {"content": chunk},
+                                "markdown": {"content": chunk[:self.MAX_MESSAGE_LENGTH]},
                             },
                         )
+                        if pushed:
+                            response = {"body": {"errcode": 0}}
+                        else:
+                            response = await self._send_request(
+                                APP_CMD_SEND,
+                                {
+                                    "chatid": chat_id,
+                                    "msgtype": "markdown",
+                                    "markdown": {"content": chunk},
+                                },
+                            )
                     last_response = response
                     error = self._response_error(response)
                     if error:

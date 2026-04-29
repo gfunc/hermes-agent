@@ -54,6 +54,41 @@ class PendingInbound:
     batch_key: str
 
 
+class ActiveReplyStore:
+    """Stores response_url for proactive webhook reply push.
+
+    Policy 'once': URL is consumed on first use.
+    Policy 'multi': URL can be used multiple times until expired.
+    """
+
+    def __init__(self) -> None:
+        self._replies: Dict[str, Dict[str, Any]] = {}
+        self._lock = asyncio.Lock()
+
+    async def save(self, chat_id: str, url: str, policy: str = "once") -> None:
+        async with self._lock:
+            self._replies[chat_id] = {"url": url, "policy": policy, "used": False}
+
+    async def retrieve(self, chat_id: str) -> Optional[Dict[str, Any]]:
+        async with self._lock:
+            entry = self._replies.get(chat_id)
+            if not entry:
+                return None
+            if entry["policy"] == "once":
+                if entry["used"]:
+                    return None
+                entry["used"] = True
+            return {"url": entry["url"], "policy": entry["policy"]}
+
+    async def expire(self, chat_id: str) -> None:
+        async with self._lock:
+            self._replies.pop(chat_id, None)
+
+    async def has_reply(self, chat_id: str) -> bool:
+        async with self._lock:
+            return chat_id in self._replies
+
+
 class StreamStore:
     def __init__(
         self,
@@ -69,6 +104,7 @@ class StreamStore:
         self._lock = asyncio.Lock()
         self._prune_task: Optional[asyncio.Task] = None
         self._prune_interval_ms: float = 30000
+        self.active_reply_store = ActiveReplyStore()
 
     async def _acquire(self):
         await self._lock.acquire()

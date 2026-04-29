@@ -4,7 +4,7 @@ import base64
 import os
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -2962,3 +2962,87 @@ async def test_send_masks_template_card_blocks_in_stream_chunks():
         if chunk.get("msgtype") == "stream":
             assert "card_type" not in chunk["stream"]["content"]
             assert "```json" not in chunk["stream"]["content"]
+
+
+@pytest.mark.asyncio
+async def test_webhook_stores_response_url_and_send_uses_it():
+    """Webhook callback should store response_url; send() should push via it."""
+    from gateway.config import PlatformConfig
+    from gateway.platforms.wecom import WeComAdapter
+
+    config = PlatformConfig(extra={"bot_id": "b", "secret": "s"})
+    adapter = WeComAdapter(config)
+    adapter._send_request = AsyncMock(return_value={"headers": {"req_id": "r1"}, "body": {"errcode": 0}})
+
+    # Simulate stream_store with active_reply_store
+    from gateway.platforms.wecom.stream_store import StreamStore
+
+    async def flush_handler(pending):
+        pass
+
+    adapter._stream_store = StreamStore(flush_handler=flush_handler)
+
+    # Simulate webhook callback storing response_url
+    await adapter._stream_store.active_reply_store.save(
+        "chat-1", "https://wecom.example.com/push/abc", policy="once"
+    )
+
+    # Mock http client to simulate successful push
+    mock_response = MagicMock()
+    mock_response.status = 200
+
+    class FakePostContext:
+        async def __aenter__(self):
+            return mock_response
+        async def __aexit__(self, *args):
+            pass
+
+    adapter._http_client = MagicMock()
+    adapter._http_client.post = MagicMock(return_value=FakePostContext())
+
+    result = await adapter.send("chat-1", "Hello from response_url")
+    assert result.success is True
+    adapter._http_client.post.assert_called_once()
+
+    # After once policy, the URL should be consumed
+    assert await adapter._stream_store.active_reply_store.retrieve("chat-1") is None
+
+
+@pytest.mark.asyncio
+async def test_push_via_response_url_posts_to_url():
+    """_push_via_response_url should POST payload to the stored URL."""
+    from gateway.config import PlatformConfig
+    from gateway.platforms.wecom import WeComAdapter
+
+    config = PlatformConfig(extra={"bot_id": "b", "secret": "s"})
+    adapter = WeComAdapter(config)
+
+    from gateway.platforms.wecom.stream_store import StreamStore
+
+    async def flush_handler(pending):
+        pass
+
+    adapter._stream_store = StreamStore(flush_handler=flush_handler)
+    await adapter._stream_store.active_reply_store.save(
+        "chat-1", "https://wecom.example.com/push/abc", policy="once"
+    )
+
+    # Mock the http client post
+    mock_response = MagicMock()
+    mock_response.status = 200
+
+    class FakePostContext:
+        async def __aenter__(self):
+            return mock_response
+        async def __aexit__(self, *args):
+            pass
+
+    adapter._http_client = MagicMock()
+    adapter._http_client.post = MagicMock(return_value=FakePostContext())
+
+    pushed = await adapter._push_via_response_url("chat-1", {"msgtype": "markdown", "markdown": {"content": "hello"}})
+    assert pushed is True
+    adapter._http_client.post.assert_called_once()
+    call_args = adapter._http_client.post.call_args
+    assert call_args[0][0] == "https://wecom.example.com/push/abc"
+    assert call_args[1]["json"]["msgtype"] == "markdown"

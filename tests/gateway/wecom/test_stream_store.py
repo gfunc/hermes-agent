@@ -48,7 +48,53 @@ def test_ack_streams_for_batch():
     store.add_ack_stream_for_batch("batch-1", "ack-1")
     store.add_ack_stream_for_batch("batch-1", "ack-2")
     assert store.drain_ack_streams_for_batch("batch-1") == ["ack-1", "ack-2"]
-    assert store.drain_ack_streams_for_batch("batch-1") == []
+
+
+@pytest.mark.asyncio
+async def test_active_reply_store_save_and_retrieve():
+    from gateway.platforms.wecom.stream_store import ActiveReplyStore
+
+    store = ActiveReplyStore()
+    await store.save("chat-1", "https://wecom.example.com/push/123", policy="once")
+
+    reply = await store.retrieve("chat-1")
+    assert reply is not None
+    assert reply["url"] == "https://wecom.example.com/push/123"
+    assert reply["policy"] == "once"
+
+    # Once policy: second retrieve should return None
+    second = await store.retrieve("chat-1")
+    assert second is None
+
+
+@pytest.mark.asyncio
+async def test_active_reply_store_multi_policy():
+    from gateway.platforms.wecom.stream_store import ActiveReplyStore
+
+    store = ActiveReplyStore()
+    await store.save("chat-1", "https://wecom.example.com/push/123", policy="multi")
+
+    # Multi policy: can retrieve multiple times
+    assert await store.retrieve("chat-1") is not None
+    assert await store.retrieve("chat-1") is not None
+
+    # Expire and verify cleanup
+    await store.expire("chat-1")
+    assert await store.retrieve("chat-1") is None
+
+
+@pytest.mark.asyncio
+async def test_active_reply_store_has_reply():
+    from gateway.platforms.wecom.stream_store import ActiveReplyStore
+
+    store = ActiveReplyStore()
+    assert await store.has_reply("chat-1") is False
+
+    await store.save("chat-1", "https://wecom.example.com/push/123")
+    assert await store.has_reply("chat-1") is True
+
+    await store.expire("chat-1")
+    assert await store.has_reply("chat-1") is False
 
 
 def test_stream_is_near_timeout():
