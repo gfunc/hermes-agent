@@ -544,7 +544,8 @@ class WeComAdapter(BasePlatformAdapter):
         chat_id = str(msg.get("chatid") or sender_id).strip()
         raw_body = str(pending.contents[0]) if pending.contents else ""
 
-        auth = resolve_command_auth(account, raw_body, sender_id)
+        chat_type = str(msg.get("chattype") or "").lower()
+        auth = resolve_command_auth(account, raw_body, sender_id, chat_id=chat_id, chat_type=chat_type)
         if auth.should_compute_auth and not auth.command_authorized:
             prompt = build_unauthorized_command_prompt(sender_id, auth.dm_policy)
             self._stream_store.update_stream(
@@ -633,9 +634,10 @@ class WeComAdapter(BasePlatformAdapter):
             content = ""
             text_block = decrypted.get("text") if isinstance(decrypted.get("text"), dict) else {}
             content = str(text_block.get("content") or "").strip()
+            chat_type = str(decrypted.get("chattype") or "").lower()
 
             # Command authorization check (inline for immediate rejection)
-            auth = resolve_command_auth(account, content, sender_id)
+            auth = resolve_command_auth(account, content, sender_id, chat_id=chat_id, chat_type=chat_type)
             if auth.should_compute_auth and not auth.command_authorized:
                 prompt = build_unauthorized_command_prompt(sender_id, auth.dm_policy)
                 return web.json_response({
@@ -1241,7 +1243,8 @@ class WeComAdapter(BasePlatformAdapter):
 
         # Command authorization check
         account = self._accounts[0] if self._accounts else WeComAccount(account_id="default")
-        auth = resolve_command_auth(account, text, sender_id)
+        chat_type = "group" if is_group else ""
+        auth = resolve_command_auth(account, text, sender_id, chat_id=chat_id, chat_type=chat_type)
         if auth.should_compute_auth and not auth.command_authorized:
             prompt = build_unauthorized_command_prompt(sender_id, auth.dm_policy)
             try:

@@ -36,6 +36,8 @@ def resolve_command_auth(
     account: WeComAccount,
     raw_body: str,
     sender_user_id: str,
+    chat_id: str = "",
+    chat_type: str = "",
 ) -> CommandAuthResult:
     dm_policy = account.dm_policy
     allow_from = account.allow_from
@@ -46,8 +48,48 @@ def resolve_command_auth(
         isinstance(account.groups, dict) and account.groups.get("authorizer")
     )
 
-    should_compute_auth = is_command(raw_body) and dm_policy == "allowlist"
+    is_cmd = is_command(raw_body)
 
+    # Group policy check (for group chats)
+    if chat_type == "group" and chat_id:
+        group_policy = account.group_policy
+        if group_policy == "disabled":
+            return CommandAuthResult(
+                command_authorized=False,
+                should_compute_auth=True,
+                dm_policy=dm_policy,
+                sender_allowed=sender_allowed,
+                authorizer_configured=authorizer_configured,
+            )
+        if group_policy == "allowlist":
+            group_allowed = _entry_matches(account.group_allow_from, chat_id)
+            if not group_allowed:
+                return CommandAuthResult(
+                    command_authorized=False,
+                    should_compute_auth=True,
+                    dm_policy=dm_policy,
+                    sender_allowed=sender_allowed,
+                    authorizer_configured=authorizer_configured,
+                )
+
+    # Per-command allowlist check
+    if is_cmd and isinstance(account.groups, dict):
+        command_rules = account.groups.get("commands")
+        if isinstance(command_rules, dict):
+            command_name = raw_body.strip().split()[0]
+            rule = command_rules.get(command_name)
+            if isinstance(rule, dict) and "allow_from" in rule:
+                command_allowed = _entry_matches(rule["allow_from"], sender_user_id)
+                return CommandAuthResult(
+                    command_authorized=command_allowed,
+                    should_compute_auth=True,
+                    dm_policy=dm_policy,
+                    sender_allowed=sender_allowed,
+                    authorizer_configured=authorizer_configured,
+                )
+
+    # DM policy check
+    should_compute_auth = is_cmd and dm_policy == "allowlist"
     if not should_compute_auth:
         return CommandAuthResult(
             command_authorized=True,
