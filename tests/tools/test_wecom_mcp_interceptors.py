@@ -10,7 +10,7 @@ import json
 import os
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -467,6 +467,65 @@ class TestSmartpageExportInterceptor:
         }
         out = await _intercept_export(result)
         assert out is result
+
+
+# ------------------------------------------------------------------
+# DocAuthErrorInterceptor
+# ------------------------------------------------------------------
+
+class TestDocAuthErrorInterceptor:
+    def test_match_only_doc_category(self):
+        from tools.wecom_mcp.interceptors.doc_auth_error import DocAuthErrorInterceptor
+
+        interceptor = DocAuthErrorInterceptor()
+        assert interceptor.match({"category": "doc", "method": "get_doc_detail", "args": {}}) is True
+        assert interceptor.match({"category": "msg", "method": "get_msg_media", "args": {}}) is False
+
+    @pytest.mark.asyncio
+    async def test_after_call_sends_biz_msg_on_auth_error(self):
+        from tools.wecom_mcp.interceptors.doc_auth_error import DocAuthErrorInterceptor
+
+        interceptor = DocAuthErrorInterceptor()
+
+        mock_adapter = MagicMock()
+        mock_adapter._send_request = AsyncMock(return_value={"body": {"errcode": 0}})
+
+        with patch(
+            "tools.wecom_mcp.interceptors.doc_auth_error._get_wecom_adapter",
+            return_value=mock_adapter,
+        ):
+            result = {
+                "content": [{
+                    "type": "text",
+                    "text": '{"errcode": 851013, "errmsg": "no permission", "help_message": "请授权"}',
+                }]
+            }
+            ctx = {"category": "doc", "method": "get_doc_detail", "args": {}}
+            new_result = await interceptor.after_call(ctx, result)
+
+            mock_adapter._send_request.assert_awaited_once()
+            call_args = mock_adapter._send_request.call_args[0][1]
+            assert call_args["biz_type"] == 1
+
+            text = new_result["content"][0]["text"]
+            parsed = json.loads(text)
+            assert parsed["_biz_msg_sent"] is True
+            assert parsed["errcode"] == 851013
+
+    @pytest.mark.asyncio
+    async def test_after_call_passes_through_non_auth_error(self):
+        from tools.wecom_mcp.interceptors.doc_auth_error import DocAuthErrorInterceptor
+
+        interceptor = DocAuthErrorInterceptor()
+        result = {
+            "content": [{
+                "type": "text",
+                "text": '{"errcode": 0, "data": {"title": "doc"}}',
+            }]
+        }
+        ctx = {"category": "doc", "method": "get_doc_detail", "args": {}}
+        new_result = await interceptor.after_call(ctx, result)
+        assert new_result == result
 
 
 # ------------------------------------------------------------------
