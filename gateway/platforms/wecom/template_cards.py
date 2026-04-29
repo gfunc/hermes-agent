@@ -111,6 +111,31 @@ def _normalize_card(card: Dict[str, Any]) -> Dict[str, Any]:
     # Ensure task_id exists
     if not str(normalized.get("task_id") or "").strip():
         normalized["task_id"] = f"task-{int(time.time() * 1000)}"
+    # Simplified format transforms
+    # vote_interaction: options[] -> checkbox
+    if card_type == "vote_interaction" and "options" in normalized and "checkbox" not in normalized:
+        normalized["checkbox"] = {
+            "question_key": normalized.get("task_id", "vote"),
+            "mode": _coerce_checkbox_mode(normalized.get("mode", "single")),
+            "option_list": [
+                {"id": str(opt.get("key", idx)), "text": str(opt.get("value", ""))}
+                for idx, opt in enumerate(normalized["options"])
+                if isinstance(opt, dict)
+            ],
+        }
+
+    # multiple_interaction: buttons[] -> button_selection
+    if card_type == "multiple_interaction" and "buttons" in normalized and "button_selection" not in normalized:
+        normalized["button_selection"] = {
+            "question_key": normalized.get("task_id", "buttons"),
+            "title": str(normalized.get("title", "")),
+            "option_list": [
+                {"id": str(opt.get("key", idx)), "text": str(opt.get("value", ""))}
+                for idx, opt in enumerate(normalized["buttons"])
+                if isinstance(opt, dict)
+            ],
+        }
+
     # checkbox.mode normalization
     checkbox = normalized.get("checkbox")
     if isinstance(checkbox, dict):
@@ -127,6 +152,10 @@ def _normalize_card(card: Dict[str, Any]) -> Dict[str, Any]:
                     checked = _coerce_bool(opt.get("is_checked"))
                     if checked is not None:
                         opt["is_checked"] = checked
+    # Field type normalization for common string->object fields
+    for key in ["emphasis_content", "main_title", "sub_title_text"]:
+        if key in normalized and isinstance(normalized[key], str):
+            normalized[key] = {"title": normalized[key]}
     # Common integer fields
     for path in [
         ("source", "desc_color"),
