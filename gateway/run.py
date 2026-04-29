@@ -4297,6 +4297,22 @@ class GatewayRunner:
                     )
                 message_text = f"{context_note}\n\n{message_text}"
 
+        if event.media_urls and event.message_type == MessageType.VIDEO:
+            for i, path in enumerate(event.media_urls):
+                mtype = event.media_types[i] if i < len(event.media_types) else ""
+                # Skip first-frame images (handled by image enrichment above)
+                if mtype.startswith("image/"):
+                    continue
+                basename = os.path.basename(path)
+                parts = basename.split("_", 2)
+                display_name = parts[2] if len(parts) >= 3 else basename
+                display_name = re.sub(r'[^\w.\- ]', '_', display_name)
+                context_note = (
+                    f"[The user sent a video: '{display_name}'. "
+                    f"The file is saved at: {path}.]"
+                )
+                message_text = f"{context_note}\n\n{message_text}"
+
         if getattr(event, "reply_to_text", None) and event.reply_to_message_id:
             # Always inject the reply-to pointer — even when the quoted text
             # already appears in history. The prefix isn't deduplication, it's
