@@ -1306,6 +1306,16 @@ async def test_on_message_auth_change_event_empty_auth_list():
     assert event.message_type == MessageType.TEXT
 
 
+def test_build_auth_change_text_with_string_values():
+    """WeCom may send auth_list values as strings — coerce to int for comparison."""
+    from gateway.platforms.wecom import WeComAdapter
+
+    body = {"auth_list": ["1", "2"]}
+    result = WeComAdapter._build_auth_change_text(body)
+    assert "create/edit" in result
+    assert "read content" in result
+
+
 @pytest.mark.asyncio
 async def test_template_card_button_click_dispatched_as_message():
     """Template card button clicks must be routed to the agent as messages."""

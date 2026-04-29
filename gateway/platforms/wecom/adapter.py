@@ -1321,6 +1321,9 @@ class WeComAdapter(BasePlatformAdapter):
             return "[Document permission updated]"
         perms: List[str] = []
         for code in auth_list:
+            # WeCom may send auth_list values as strings
+            if isinstance(code, str) and code.isdigit():
+                code = int(code)
             if code == 1:
                 perms.append("create/edit")
             elif code == 2:
