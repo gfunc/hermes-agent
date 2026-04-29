@@ -1241,6 +1241,72 @@ async def test_derive_message_type_returns_video_by_msgtype_even_without_media_t
 
 
 @pytest.mark.asyncio
+async def test_on_message_dispatches_auth_change_event():
+    """auth_change_event must be recognized and dispatched as a MessageEvent."""
+    from gateway.config import PlatformConfig
+    from gateway.platforms.base import MessageType
+    from gateway.platforms.wecom import WeComAdapter
+
+    config = PlatformConfig(extra={"bot_id": "b", "secret": "s"})
+    adapter = WeComAdapter(config)
+    adapter._dedup.is_duplicate = lambda _msg_id: False
+    adapter._is_dm_allowed = lambda _sender: (True, "")
+    adapter._text_batcher.is_enabled = lambda: False
+    adapter.handle_message = AsyncMock()
+
+    payload = {
+        "cmd": "aibot_msg_callback",
+        "headers": {"req_id": "r1"},
+        "body": {
+            "msgid": "m1",
+            "msgtype": "event",
+            "event": "auth_change_event",
+            "auth_list": [2],
+            "chatid": "c1",
+            "from": {"userid": "bob"},
+        },
+    }
+    await adapter._on_message(payload)
+
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.message_type == MessageType.TEXT
+    assert "permission" in event.text.lower() or "read content" in event.text.lower()
+
+
+@pytest.mark.asyncio
+async def test_on_message_auth_change_event_empty_auth_list():
+    """auth_change_event with empty auth_list should dispatch a generic message."""
+    from gateway.config import PlatformConfig
+    from gateway.platforms.base import MessageType
+    from gateway.platforms.wecom import WeComAdapter
+
+    config = PlatformConfig(extra={"bot_id": "b", "secret": "s"})
+    adapter = WeComAdapter(config)
+    adapter._dedup.is_duplicate = lambda _msg_id: False
+    adapter._is_dm_allowed = lambda _sender: (True, "")
+    adapter._text_batcher.is_enabled = lambda: False
+    adapter.handle_message = AsyncMock()
+
+    payload = {
+        "cmd": "aibot_msg_callback",
+        "headers": {"req_id": "r1"},
+        "body": {
+            "msgid": "m1",
+            "msgtype": "event",
+            "event": "auth_change_event",
+            "chatid": "c1",
+            "from": {"userid": "bob"},
+        },
+    }
+    await adapter._on_message(payload)
+
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.message_type == MessageType.TEXT
+
+
+@pytest.mark.asyncio
 async def test_dispatch_payload_replies_to_enter_check_update():
     from gateway.config import PlatformConfig
     from gateway.platforms.wecom import WeComAdapter

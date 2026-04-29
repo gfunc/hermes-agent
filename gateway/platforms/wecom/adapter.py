@@ -1212,6 +1212,10 @@ class WeComAdapter(BasePlatformAdapter):
             await self._handle_template_card_event(body)
             return
 
+        # Auth change event: build context text and dispatch as normal message
+        if event_name == "auth_change_event":
+            text = self._build_auth_change_text(body)
+
         # Command authorization check
         account = self._accounts[0] if self._accounts else WeComAccount(account_id="default")
         auth = resolve_command_auth(account, text, sender_id)
@@ -1292,6 +1296,23 @@ class WeComAdapter(BasePlatformAdapter):
             "[%s] Template card event received: response_code=%s selected=%s",
             self.name, response_code, selected_option_ids,
         )
+
+    @staticmethod
+    def _build_auth_change_text(body: Dict[str, Any]) -> str:
+        """Build a human-readable text from an auth_change_event payload."""
+        _raw_auth_list = body.get("auth_list")
+        auth_list = _raw_auth_list if isinstance(_raw_auth_list, list) else []
+        if not auth_list:
+            return "[Document permission updated]"
+        perms: List[str] = []
+        for code in auth_list:
+            if code == 1:
+                perms.append("create/edit")
+            elif code == 2:
+                perms.append("read content")
+            else:
+                perms.append(str(code))
+        return f"[Document permission updated: {', '.join(perms)} granted]"
 
     # ------------------------------------------------------------------
     # Text message aggregation (handles WeCom client-side splits)
