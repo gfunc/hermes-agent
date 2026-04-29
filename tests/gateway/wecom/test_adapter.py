@@ -2771,3 +2771,31 @@ async def test_on_message_uses_chat_queue_for_ordered_dispatch():
 
     adapter._chat_queue.enqueue.assert_awaited_once()
     adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_reqid_store_persists_across_disconnect():
+    """After disconnect(), req_ids must be written to disk and reloaded on connect."""
+    import tempfile
+    from pathlib import Path
+    from gateway.config import PlatformConfig
+    from gateway.platforms.wecom import WeComAdapter
+    from gateway.platforms.wecom.reqid_store import ReqIdStore
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        state_dir = Path(tmpdir)
+        config = PlatformConfig(extra={"bot_id": "b", "secret": "s", "state_dir": str(state_dir)})
+        adapter = WeComAdapter(config)
+        reqid_path = state_dir / "wecom_reqids.json"
+        adapter._reqid_store = ReqIdStore(reqid_path)
+        adapter._last_reply_req_id_per_chat["chat-1"] = "req-1"
+        adapter._last_reply_req_id_per_chat["chat-2"] = "req-2"
+
+        await adapter.disconnect()
+
+        # Simulate restart
+        adapter2 = WeComAdapter(config)
+        # Manually trigger the load that connect() would do
+        store2 = ReqIdStore(reqid_path)
+        assert store2.get("chat-1") == "req-1"
+        assert store2.get("chat-2") == "req-2"

@@ -45,6 +45,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import unquote, urlparse
 
 from gateway.platforms.wecom.media import MediaPreparer
+from gateway.platforms.wecom.reqid_store import ReqIdStore
 
 try:
     import aiohttp
@@ -246,6 +247,7 @@ class WeComAdapter(BasePlatformAdapter):
         self._webhook_site: Optional["web.TCPSite"] = None
         self._webhook_app: Optional["web.Application"] = None
         self._stream_store: Optional[StreamStore] = None
+        self._reqid_store: Optional[ReqIdStore] = None
         self._mcp_configs: Dict[str, str] = {}
         self._typing_stream_state_by_chat: Dict[str, Tuple[str, str]] = {}
         # Streams that need a finish=True frame (set by sync pause_typing_for_chat,
@@ -299,6 +301,13 @@ class WeComAdapter(BasePlatformAdapter):
 
         try:
             self._http_client = httpx.AsyncClient(timeout=30.0, follow_redirects=True)
+
+            # ---- ReqId store ----
+            reqid_path = Path(self.config.extra.get("state_dir", ".hermes/state")) / "wecom_reqids.json"
+            self._reqid_store = ReqIdStore(reqid_path)
+            # Hydrate in-memory cache from disk
+            for chat_id, entry in self._reqid_store._data.items():
+                self._last_reply_req_id_per_chat[chat_id] = entry["req_id"]
 
             # ---- WebSocket mode (Bot WS) ----
             if ws_accounts:
@@ -435,6 +444,11 @@ class WeComAdapter(BasePlatformAdapter):
         if self._http_client:
             await self._http_client.aclose()
             self._http_client = None
+
+        if self._reqid_store:
+            for chat_id, req_id in self._last_reply_req_id_per_chat.items():
+                self._reqid_store.set(chat_id, req_id)
+            self._reqid_store.save()
 
         self._dedup.clear()
         self._typing_stream_state_by_chat.clear()
@@ -1740,6 +1754,9 @@ class WeComAdapter(BasePlatformAdapter):
             self.name, normalized_message_id, normalized_req_id,
         )
         self._reply_req_ids[normalized_message_id] = normalized_req_id
+        if self._reqid_store:
+            self._reqid_store.set(normalized_message_id, normalized_req_id)
+            self._reqid_store.save()
         while len(self._reply_req_ids) > DEDUP_MAX_SIZE:
             self._reply_req_ids.pop(next(iter(self._reply_req_ids)))
 
