@@ -49,9 +49,13 @@ class ChatSerialQueue:
                 finally:
                     queue.task_done()
         finally:
-            self._queues.pop(chat_id, None)
-            self._tasks.pop(chat_id, None)
-            self._locks.pop(chat_id, None)
+            # Only clean up if we're still the active worker for this chat.
+            # Prevents a drained worker from clobbering a new enqueue.
+            current_task = asyncio.current_task()
+            if self._tasks.get(chat_id) is current_task:
+                self._queues.pop(chat_id, None)
+                self._tasks.pop(chat_id, None)
+                self._locks.pop(chat_id, None)
 
     async def drain(self, chat_id: str) -> None:
         """Wait until all messages for a chat are processed."""

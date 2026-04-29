@@ -2802,6 +2802,45 @@ async def test_reqid_store_persists_across_disconnect():
 
 
 @pytest.mark.asyncio
+async def test_reqid_flush_is_debounced():
+    """Rapid _remember_reply_req_id calls should batch into one disk write."""
+    import tempfile
+    from pathlib import Path
+    from gateway.config import PlatformConfig
+    from gateway.platforms.wecom import WeComAdapter
+    from gateway.platforms.wecom.reqid_store import ReqIdStore
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        state_dir = Path(tmpdir)
+        config = PlatformConfig(extra={"bot_id": "b", "secret": "s", "state_dir": str(state_dir)})
+        adapter = WeComAdapter(config)
+        reqid_path = state_dir / "wecom_reqids.json"
+        store = ReqIdStore(reqid_path)
+        adapter._reqid_store = store
+
+        # Rapid calls should not write immediately
+        adapter._remember_reply_req_id("msg-1", "req-1")
+        adapter._remember_reply_req_id("msg-2", "req-2")
+        adapter._remember_reply_req_id("msg-3", "req-3")
+
+        assert store.is_dirty is True
+        assert not reqid_path.exists()  # debounced — not flushed yet
+
+        # Flush task should be scheduled
+        assert adapter._reqid_flush_task is not None
+        assert not adapter._reqid_flush_task.done()
+
+        # Cancel the debounced task and flush manually (simulating disconnect)
+        adapter._reqid_flush_task.cancel()
+        store.save()
+
+        store2 = ReqIdStore(reqid_path)
+        assert store2.get("msg-1") == "req-1"
+        assert store2.get("msg-2") == "req-2"
+        assert store2.get("msg-3") == "req-3"
+
+
+@pytest.mark.asyncio
 async def test_send_reply_stream_skips_frame_if_previous_not_acked():
     """Non-blocking mode: if previous frame ack hasn't arrived, skip intermediate."""
     from gateway.config import PlatformConfig

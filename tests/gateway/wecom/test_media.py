@@ -1,3 +1,5 @@
+import pytest
+
 from gateway.platforms.wecom.media import (
     detect_mime_from_bytes,
     apply_file_size_limits,
@@ -65,3 +67,23 @@ def test_media_limits_returns_max_size():
     assert limits.max_size("image") == 10 * 1024 * 1024
     assert limits.max_size("voice") == 2 * 1024 * 1024
     assert limits.max_size("unknown") is None
+
+
+def test_media_preparer_blocks_path_traversal():
+    """Paths outside media_local_roots must be rejected even with startswith-like prefixes."""
+    import tempfile
+    from pathlib import Path
+    from gateway.platforms.wecom.media import MediaPreparer
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir) / "allowed"
+        root.mkdir()
+        # Create a file in a similarly-named but different directory
+        evil_dir = Path(tmpdir) / "allowed-evil"
+        evil_dir.mkdir()
+        evil_file = evil_dir / "secret.txt"
+        evil_file.write_text("secret")
+
+        preparer = MediaPreparer(None, media_local_roots=[str(root)])
+        with pytest.raises(PermissionError):
+            preparer._read_local_file(evil_file, file_name=None)

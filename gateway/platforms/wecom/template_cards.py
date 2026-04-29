@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
@@ -22,6 +23,7 @@ VALID_CARD_TYPES = {
 
 _sent_template_cards: Dict[str, Dict[str, Any]] = {}
 _sent_timestamps: Dict[str, float] = {}
+_cache_lock = threading.Lock()
 
 
 def _cache_key(account_id: str, task_id: str) -> str:
@@ -46,19 +48,21 @@ def save_template_card_to_cache(account_id: str, card: Dict[str, Any]) -> None:
     if not task_id:
         return
     key = _cache_key(account_id, task_id)
-    _sent_template_cards[key] = dict(card)
-    _sent_timestamps[key] = time.time()
-    _prune_cache()
+    with _cache_lock:
+        _sent_template_cards[key] = dict(card)
+        _sent_timestamps[key] = time.time()
+        _prune_cache()
 
 
 def get_template_card_from_cache(account_id: str, task_id: str) -> Optional[Dict[str, Any]]:
     key = _cache_key(account_id, task_id)
-    ts = _sent_timestamps.get(key)
-    if ts is None or time.time() - ts > TEMPLATE_CARD_CACHE_TTL_SECONDS:
-        _sent_template_cards.pop(key, None)
-        _sent_timestamps.pop(key, None)
-        return None
-    return dict(_sent_template_cards.get(key) or {})
+    with _cache_lock:
+        ts = _sent_timestamps.get(key)
+        if ts is None or time.time() - ts > TEMPLATE_CARD_CACHE_TTL_SECONDS:
+            _sent_template_cards.pop(key, None)
+            _sent_timestamps.pop(key, None)
+            return None
+        return dict(_sent_template_cards.get(key) or {})
 
 
 def _coerce_checkbox_mode(value: Any) -> Optional[int]:

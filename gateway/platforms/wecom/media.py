@@ -217,7 +217,7 @@ class MediaPreparer:
 
     def _read_local_file(self, path: Path, file_name: Optional[str]) -> Tuple[bytes, str, str]:
         if self._media_local_roots:
-            if not any(str(path).startswith(str(root)) for root in self._media_local_roots):
+            if not any(path.is_relative_to(root) for root in self._media_local_roots):
                 raise PermissionError(f"Local media path {path} is outside allowed roots")
         if not path.exists() or not path.is_file():
             raise FileNotFoundError(f"Media file not found: {path}")

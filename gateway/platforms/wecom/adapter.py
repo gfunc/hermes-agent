@@ -248,6 +248,7 @@ class WeComAdapter(BasePlatformAdapter):
         self._webhook_app: Optional["web.Application"] = None
         self._stream_store: Optional[StreamStore] = None
         self._reqid_store: Optional[ReqIdStore] = None
+        self._reqid_flush_task: Optional[asyncio.Task] = None
         self._mcp_configs: Dict[str, str] = {}
         self._typing_stream_state_by_chat: Dict[str, Tuple[str, str]] = {}
         # Streams that need a finish=True frame (set by sync pause_typing_for_chat,
@@ -445,6 +446,9 @@ class WeComAdapter(BasePlatformAdapter):
             await self._http_client.aclose()
             self._http_client = None
 
+        if self._reqid_flush_task and not self._reqid_flush_task.done():
+            self._reqid_flush_task.cancel()
+            self._reqid_flush_task = None
         if self._reqid_store:
             for chat_id, req_id in self._last_reply_req_id_per_chat.items():
                 self._reqid_store.set(chat_id, req_id)
@@ -1755,9 +1759,22 @@ class WeComAdapter(BasePlatformAdapter):
         self._reply_req_ids[normalized_message_id] = normalized_req_id
         if self._reqid_store:
             self._reqid_store.set(normalized_message_id, normalized_req_id)
-            self._reqid_store.save()
+            self._schedule_reqid_flush()
         while len(self._reply_req_ids) > DEDUP_MAX_SIZE:
             self._reply_req_ids.pop(next(iter(self._reply_req_ids)))
+
+    def _schedule_reqid_flush(self) -> None:
+        """Debounce disk writes: batch multiple rapid req_id updates into one save."""
+        if self._reqid_flush_task and not self._reqid_flush_task.done():
+            self._reqid_flush_task.cancel()
+        self._reqid_flush_task = asyncio.get_event_loop().create_task(
+            self._debounced_reqid_flush()
+        )
+
+    async def _debounced_reqid_flush(self) -> None:
+        await asyncio.sleep(5.0)
+        if self._reqid_store and self._reqid_store.is_dirty:
+            self._reqid_store.save()
 
     def _reply_req_id_for_message(self, reply_to: Optional[str]) -> Optional[str]:
         normalized = str(reply_to or "").strip()
@@ -2351,6 +2368,10 @@ class WeComAdapter(BasePlatformAdapter):
             # Note: _send_reply_stream() above already raised and lowered its
             # own refcount, so by the time we reach here the count is back to
             # zero. This increment is solely for the proactive chunk sends.
+            if original_reply_req_id:
+                self._reply_req_ids_sending_response[original_reply_req_id] = (
+                    self._reply_req_ids_sending_response.get(original_reply_req_id, 0) + 1
+                )
 
             last_response: Optional[Dict[str, Any]] = None
             last_error: Optional[str] = None

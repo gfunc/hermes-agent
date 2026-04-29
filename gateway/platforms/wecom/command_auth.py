@@ -112,7 +112,6 @@ def resolve_command_auth(
 def build_unauthorized_command_prompt(
     sender_user_id: str,
     dm_policy: str,
-    scope: str = "bot",
 ) -> str:
     return (
         f"抱歉，您没有权限执行该命令。"
