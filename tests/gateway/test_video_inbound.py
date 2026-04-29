@@ -39,7 +39,7 @@ async def test_video_message_includes_file_note():
         text="",
         message_type=MessageType.VIDEO,
         source=source,
-        media_urls=["/home/georgefu/.hermes/cache/documents/doc_ea8abac703e8_meeting_01.mp4"],
+        media_urls=["/tmp/cache/documents/doc_ea8abac703e8_meeting_01.mp4"],
         media_types=["application/octet-stream"],
     )
 

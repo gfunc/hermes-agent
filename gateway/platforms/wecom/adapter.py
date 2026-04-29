@@ -1430,6 +1430,12 @@ class WeComAdapter(BasePlatformAdapter):
             except Exception as exc:
                 logger.debug("[%s] First-frame extraction failed: %s", self.name, exc)
 
+        if video_ref_for_frame and not cached_video_path:
+            logger.warning(
+                "[%s] Failed to cache video (msgtype=video), message will have no media",
+                self.name,
+            )
+
         logger.debug(
             "[%s] _extract_media: done — paths=%s types=%s",
             self.name, media_paths, media_types,

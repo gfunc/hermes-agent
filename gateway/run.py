@@ -4187,6 +4187,14 @@ class GatewayRunner:
                 if hasattr(self, "_busy_ack_ts"):
                     self._busy_ack_ts.pop(_quick_key, None)
 
+    @staticmethod
+    def _display_name_from_path(path: str) -> str:
+        """Extract a clean display name from a cached file path."""
+        basename = os.path.basename(path)
+        parts = basename.split("_", 2)
+        display_name = parts[2] if len(parts) >= 3 else basename
+        return re.sub(r'[^\w.\- ]', '_', display_name)
+
     async def _prepare_inbound_message_text(
         self,
         *,
@@ -4278,11 +4286,7 @@ class GatewayRunner:
                 if not mtype.startswith(("application/", "text/")):
                     continue
 
-                basename = os.path.basename(path)
-                parts = basename.split("_", 2)
-                display_name = parts[2] if len(parts) >= 3 else basename
-                display_name = re.sub(r'[^\w.\- ]', '_', display_name)
-
+                display_name = self._display_name_from_path(path)
                 if mtype.startswith("text/"):
                     context_note = (
                         f"[The user sent a text document: '{display_name}'. "
@@ -4303,10 +4307,7 @@ class GatewayRunner:
                 # Skip first-frame images (handled by image enrichment above)
                 if mtype.startswith("image/"):
                     continue
-                basename = os.path.basename(path)
-                parts = basename.split("_", 2)
-                display_name = parts[2] if len(parts) >= 3 else basename
-                display_name = re.sub(r'[^\w.\- ]', '_', display_name)
+                display_name = self._display_name_from_path(path)
                 context_note = (
                     f"[The user sent a video: '{display_name}'. "
                     f"The file is saved at: {path}.]"
