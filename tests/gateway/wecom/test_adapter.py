@@ -1116,6 +1116,59 @@ async def test_extract_media_extracts_video_frame_from_cached_path():
 
 
 @pytest.mark.asyncio
+async def test_extract_media_caches_quote_video_locally():
+    """Quoted video URLs must go through _cache_media and extract a frame."""
+    from gateway.config import PlatformConfig
+    from gateway.platforms.wecom import WeComAdapter
+
+    config = PlatformConfig(extra={"bot_id": "b", "secret": "s"})
+    adapter = WeComAdapter(config)
+    adapter._cache_media = AsyncMock(return_value=("/cached/quote_video.mp4", "video/mp4"))
+
+    with patch("gateway.platforms.wecom.video.extract_first_video_frame", return_value="/tmp/quote_frame.jpg") as mock_extract:
+        body = {
+            "msgtype": "text",
+            "text": {"content": "check this video"},
+            "quote": {
+                "msgtype": "video",
+                "video": {"url": "https://wecom.example.com/quote.mp4", "sdkfileid": "qv1", "md5sum": "def"},
+            },
+        }
+        urls, types = await adapter._extract_media(body)
+
+    assert "/cached/quote_video.mp4" in urls
+    assert "video/mp4" in types
+    mock_extract.assert_called_once_with("/cached/quote_video.mp4")
+    assert "/tmp/quote_frame.jpg" in urls
+    assert "image/jpeg" in types
+
+
+@pytest.mark.asyncio
+async def test_extract_media_quote_video_without_url_skips_gracefully():
+    """Quoted video without a URL should not crash or add empty refs."""
+    from gateway.config import PlatformConfig
+    from gateway.platforms.wecom import WeComAdapter
+
+    config = PlatformConfig(extra={"bot_id": "b", "secret": "s"})
+    adapter = WeComAdapter(config)
+    adapter._cache_media = AsyncMock(return_value=None)
+
+    body = {
+        "msgtype": "text",
+        "text": {"content": "check this video"},
+        "quote": {
+            "msgtype": "video",
+            "video": {"sdkfileid": "qv1", "md5sum": "def"},
+        },
+    }
+    urls, types = await adapter._extract_media(body)
+
+    assert urls == []
+    assert types == []
+    adapter._cache_media.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_derive_message_type_returns_video_for_video_message():
     from gateway.platforms.wecom import WeComAdapter, MessageType
 

@@ -1380,13 +1380,13 @@ class WeComAdapter(BasePlatformAdapter):
                 elif isinstance(appmsg.get("image"), dict):
                     refs.append(("image", appmsg["image"]))
             # Handle video — route through _cache_media like other file types
-            video_ref_for_frame = None
+            video_refs_for_frame: set = set()
             if msgtype == "video" and isinstance(body.get("video"), dict):
                 video_info = body["video"]
                 video_url = str(video_info.get("url") or "").strip()
                 if video_url:
                     refs.append(("file", video_info))
-                    video_ref_for_frame = video_info
+                    video_refs_for_frame.add(id(video_info))
 
         quote = body.get("quote") if isinstance(body.get("quote"), dict) else {}
         quote_type = str(quote.get("msgtype") or "").lower()
@@ -1394,12 +1394,18 @@ class WeComAdapter(BasePlatformAdapter):
             refs.append(("image", quote["image"]))
         elif quote_type == "file" and isinstance(quote.get("file"), dict):
             refs.append(("file", quote["file"]))
+        elif quote_type == "video" and isinstance(quote.get("video"), dict):
+            video_info = quote["video"]
+            video_url = str(video_info.get("url") or "").strip()
+            if video_url:
+                refs.append(("file", video_info))
+                video_refs_for_frame.add(id(video_info))
 
         logger.debug(
             "[%s] _extract_media: extracted %d refs for msgtype=%s",
             self.name, len(refs), msgtype,
         )
-        cached_video_path = None
+        cached_video_paths: list = []
         for kind, ref in refs:
             logger.debug(
                 "[%s] _extract_media: caching kind=%s ref_keys=%s",
@@ -1410,8 +1416,8 @@ class WeComAdapter(BasePlatformAdapter):
                 path, content_type = cached
                 media_paths.append(path)
                 media_types.append(content_type)
-                if ref is video_ref_for_frame:
-                    cached_video_path = path
+                if id(ref) in video_refs_for_frame:
+                    cached_video_paths.append(path)
                 logger.debug(
                     "[%s] _extract_media: cached kind=%s path=%s content_type=%s",
                     self.name, kind, path, content_type,
@@ -1422,8 +1428,8 @@ class WeComAdapter(BasePlatformAdapter):
                     self.name, kind, ref,
                 )
 
-        # Extract first frame from cached video for LLM preview
-        if cached_video_path:
+        # Extract first frame from cached videos for LLM preview
+        for cached_video_path in cached_video_paths:
             try:
                 from gateway.platforms.wecom.video import extract_first_video_frame
 
@@ -1434,7 +1440,7 @@ class WeComAdapter(BasePlatformAdapter):
             except Exception as exc:
                 logger.debug("[%s] First-frame extraction failed: %s", self.name, exc)
 
-        if video_ref_for_frame and not cached_video_path:
+        if video_refs_for_frame and not cached_video_paths:
             logger.warning(
                 "[%s] Failed to cache video (msgtype=video), message will have no media",
                 self.name,
