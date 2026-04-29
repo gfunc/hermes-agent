@@ -12,6 +12,29 @@ FILE_MAX_BYTES = 20 * 1024 * 1024
 ABSOLUTE_MAX_BYTES = FILE_MAX_BYTES
 VOICE_SUPPORTED_MIMES = {"audio/amr"}
 
+WECOM_MEDIA_LIMITS = {
+    "image": IMAGE_MAX_BYTES,
+    "video": VIDEO_MAX_BYTES,
+    "voice": VOICE_MAX_BYTES,
+    "file": FILE_MAX_BYTES,
+}
+
+
+class WeComMediaLimits:
+    """Enforces WeCom media upload size limits by type."""
+
+    def __init__(self, limits: Optional[Dict[str, int]] = None):
+        self._limits = limits or WECOM_MEDIA_LIMITS
+
+    def is_allowed(self, media_type: str, size_bytes: int) -> bool:
+        max_bytes = self._limits.get(media_type)
+        if max_bytes is None:
+            return True  # Unknown type — let server decide
+        return size_bytes <= max_bytes
+
+    def max_size(self, media_type: str) -> Optional[int]:
+        return self._limits.get(media_type)
+
 _MAGIC_BYTES = [
     ((b"\x89PNG\r\n\x1a\n",), "image/png"),
     ((b"\xff\xd8\xff",), "image/jpeg"),
