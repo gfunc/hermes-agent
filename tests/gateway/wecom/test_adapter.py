@@ -1393,6 +1393,53 @@ async def test_template_card_poll_vote_dispatched_as_message():
 
 
 @pytest.mark.asyncio
+async def test_template_card_event_enriches_with_cached_card_context():
+    """Template card events should include context from the cached card."""
+    from gateway.config import PlatformConfig
+    from gateway.platforms.base import MessageType
+    from gateway.platforms.wecom import WeComAdapter
+    from gateway.platforms.wecom.template_cards import save_template_card_to_cache
+
+    config = PlatformConfig(extra={"bot_id": "b", "secret": "s"})
+    adapter = WeComAdapter(config)
+    adapter._dedup.is_duplicate = lambda _msg_id: False
+    adapter._is_dm_allowed = lambda _sender: (True, "")
+    adapter._text_batcher.is_enabled = lambda: False
+    adapter.handle_message = AsyncMock()
+
+    # Pre-populate cache with a card
+    account_id = adapter._accounts[0].account_id if adapter._accounts else "default"
+    save_template_card_to_cache(account_id, {
+        "task_id": "approve_card_123",
+        "card_type": "button_interaction",
+        "source": {"desc": "Approval Request"},
+    })
+
+    payload = {
+        "cmd": "aibot_msg_callback",
+        "headers": {"req_id": "r1"},
+        "body": {
+            "msgid": "m1",
+            "msgtype": "event",
+            "event": {
+                "event": "template_card_event",
+                "response_code": "approve_card_123",
+                "button_replace_name": "Approve",
+            },
+            "chatid": "c1",
+            "from": {"userid": "bob"},
+        },
+    }
+    await adapter._on_message(payload)
+
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.message_type == MessageType.TEXT
+    # The text should include card context from cache
+    assert "Approval Request" in event.text or "button_interaction" in event.text
+
+
+@pytest.mark.asyncio
 async def test_dispatch_payload_replies_to_enter_check_update():
     from gateway.config import PlatformConfig
     from gateway.platforms.wecom import WeComAdapter

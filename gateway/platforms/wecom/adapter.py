@@ -1215,7 +1215,7 @@ class WeComAdapter(BasePlatformAdapter):
         else:
             event_name = ""
         if event_name == "template_card_event":
-            text = await self._handle_template_card_event(body)
+            text = self._handle_template_card_event(body)
             if not text:
                 return
 
@@ -1282,12 +1282,14 @@ class WeComAdapter(BasePlatformAdapter):
         else:
             await self.handle_message(event)
 
-    async def _handle_template_card_event(self, body: Dict[str, Any]) -> str:
+    def _handle_template_card_event(self, body: Dict[str, Any]) -> str:
         """Build a text representation of a template card event for agent dispatch.
 
         Returns the event description text, or empty string if the event should
         be silently dropped.
         """
+        from gateway.platforms.wecom.template_cards import get_template_card_from_cache
+
         event = body.get("event") if isinstance(body.get("event"), dict) else {}
         response_code = str(event.get("response_code") or "").strip()
         button_replace_name = str(event.get("button_replace_name") or "").strip()
@@ -1303,7 +1305,17 @@ class WeComAdapter(BasePlatformAdapter):
             self.name, response_code, selected_option_ids,
         )
 
+        # Look up cached card context using response_code as task_id
+        account_id = self._accounts[0].account_id if self._accounts else "default"
+        cached_card = get_template_card_from_cache(account_id, response_code) if response_code else None
+        card_type = str(cached_card.get("card_type") or "").strip() if cached_card else ""
+        source_desc = str(cached_card.get("source", {}).get("desc") or "").strip() if cached_card else ""
+
         parts: List[str] = ["[Template card interaction]"]
+        if source_desc:
+            parts.append(f"Card: {source_desc}")
+        elif card_type:
+            parts.append(f"Card type: {card_type}")
         if button_replace_name:
             parts.append(f"Button: {button_replace_name}")
         elif response_code:
