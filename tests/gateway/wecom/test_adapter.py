@@ -898,6 +898,7 @@ class TestInboundMessages:
         }
 
         await adapter._on_message(payload)
+        await adapter._chat_queue.drain("group-1")
 
         adapter.handle_message.assert_awaited_once()
         event = adapter.handle_message.await_args.args[0]
@@ -932,6 +933,7 @@ class TestInboundMessages:
         }
 
         await adapter._on_message(payload)
+        await adapter._chat_queue.drain("group-1")
 
         event = adapter.handle_message.await_args.args[0]
         assert event.reply_to_text == "quoted message"
@@ -1267,6 +1269,7 @@ async def test_on_message_dispatches_auth_change_event():
         },
     }
     await adapter._on_message(payload)
+    await adapter._chat_queue.drain("c1")
 
     adapter.handle_message.assert_awaited_once()
     event = adapter.handle_message.await_args.args[0]
@@ -1300,6 +1303,7 @@ async def test_on_message_auth_change_event_empty_auth_list():
         },
     }
     await adapter._on_message(payload)
+    await adapter._chat_queue.drain("c1")
 
     adapter.handle_message.assert_awaited_once()
     event = adapter.handle_message.await_args.args[0]
@@ -1346,6 +1350,7 @@ async def test_template_card_button_click_dispatched_as_message():
         },
     }
     await adapter._on_message(payload)
+    await adapter._chat_queue.drain("c1")
 
     adapter.handle_message.assert_awaited_once()
     event = adapter.handle_message.await_args.args[0]
@@ -1384,6 +1389,7 @@ async def test_template_card_poll_vote_dispatched_as_message():
         },
     }
     await adapter._on_message(payload)
+    await adapter._chat_queue.drain("c1")
 
     adapter.handle_message.assert_awaited_once()
     event = adapter.handle_message.await_args.args[0]
@@ -1431,6 +1437,7 @@ async def test_template_card_event_enriches_with_cached_card_context():
         },
     }
     await adapter._on_message(payload)
+    await adapter._chat_queue.drain("c1")
 
     adapter.handle_message.assert_awaited_once()
     event = adapter.handle_message.await_args.args[0]
@@ -2494,6 +2501,7 @@ class TestWeComInboundEdgeCases:
         }
         await adapter._on_message(payload)
         await adapter._on_message(payload)
+        await adapter._chat_queue.drain("c1")
         adapter.handle_message.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -2516,6 +2524,7 @@ class TestWeComInboundEdgeCases:
             },
         }
         await adapter._on_message(payload)
+        await adapter._chat_queue.drain("c1")
         event = adapter.handle_message.await_args.args[0]
         assert event.message_type == MessageType.VOICE
 
@@ -2542,6 +2551,7 @@ class TestWeComInboundEdgeCases:
             },
         }
         await adapter._on_message(payload)
+        await adapter._chat_queue.drain("c1")
         event = adapter.handle_message.await_args.args[0]
         assert event.message_type == MessageType.DOCUMENT
 
@@ -2566,6 +2576,7 @@ class TestWeComInboundEdgeCases:
             },
         }
         await adapter._on_message(payload)
+        await adapter._chat_queue.drain("c1")
         adapter.handle_message.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -2593,6 +2604,7 @@ class TestWeComInboundEdgeCases:
             },
         }
         await adapter._on_message(payload)
+        await adapter._chat_queue.drain("c1")
         event = adapter.handle_message.await_args.args[0]
         assert event.text == "original question"
 
@@ -2727,3 +2739,35 @@ async def test_send_does_not_corrupt_pending_close_state():
     # After _send_reply_stream consumes the pending state, neither store should have it
     assert "chat-1" not in adapter._typing_stream_state_by_chat
     assert "chat-1" not in adapter._streams_pending_close
+
+
+@pytest.mark.asyncio
+async def test_on_message_uses_chat_queue_for_ordered_dispatch():
+    """_on_message should enqueue events into the chat queue, not call handle_message directly."""
+    from gateway.config import PlatformConfig
+    from gateway.platforms.wecom import WeComAdapter
+
+    adapter = WeComAdapter(PlatformConfig(extra={"bot_id": "b", "secret": "s"}))
+    adapter._dedup.is_duplicate = lambda _msg_id: False
+    adapter._is_dm_allowed = lambda _sender: (True, "")
+    adapter._text_batcher.is_enabled = lambda: False
+    adapter.handle_message = AsyncMock()
+
+    adapter._chat_queue = AsyncMock()
+    adapter._chat_queue.enqueue = AsyncMock()
+
+    payload = {
+        "cmd": "aibot_msg_callback",
+        "headers": {"req_id": "r1"},
+        "body": {
+            "msgid": "m1",
+            "msgtype": "text",
+            "text": {"content": "Hello"},
+            "chatid": "c1",
+            "from": {"userid": "bob"},
+        },
+    }
+    await adapter._on_message(payload)
+
+    adapter._chat_queue.enqueue.assert_awaited_once()
+    adapter.handle_message.assert_not_awaited()

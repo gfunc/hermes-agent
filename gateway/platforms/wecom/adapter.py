@@ -73,6 +73,7 @@ from gateway.platforms.wecom.command_auth import (
 from gateway.platforms.wecom.stream_store import StreamStore, PendingInbound
 from .reply_queue import WeComReplyQueue
 from .client import WeComWSClient
+from .chat_queue import ChatSerialQueue
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
@@ -260,6 +261,7 @@ class WeComAdapter(BasePlatformAdapter):
             split_delay=split_delay,
             split_threshold=self._SPLIT_THRESHOLD,
         )
+        self._chat_queue = ChatSerialQueue(self._handle_message_sync)
 
     # ------------------------------------------------------------------
     # Connection lifecycle
@@ -1280,7 +1282,11 @@ class WeComAdapter(BasePlatformAdapter):
             key = self._text_batch_key(event)
             self._text_batcher.enqueue(event, key)
         else:
-            await self.handle_message(event)
+            await self._chat_queue.enqueue(chat_id, event)
+
+    async def _handle_message_sync(self, _chat_id: str, event: MessageEvent) -> None:
+        """Adapter-compatible wrapper for ChatSerialQueue handler signature."""
+        await self.handle_message(event)
 
     def _handle_template_card_event(self, body: Dict[str, Any]) -> str:
         """Build a text representation of a template card event for agent dispatch.
