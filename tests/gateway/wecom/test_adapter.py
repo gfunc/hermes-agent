@@ -2835,3 +2835,31 @@ async def test_send_reply_stream_skips_frame_if_previous_not_acked():
     adapter._stream_acked["req-1"] = True
     await adapter._send_reply_stream("req-1", "Frame 3", chat_id="chat-1")
     assert len(sends) == 2
+
+
+@pytest.mark.asyncio
+async def test_send_masks_template_card_blocks_in_stream_chunks():
+    """Template card JSON should not appear in stream text chunks."""
+    from gateway.config import PlatformConfig
+    from gateway.platforms.wecom import WeComAdapter
+
+    adapter = WeComAdapter(PlatformConfig(extra={"bot_id": "b", "secret": "s"}))
+    adapter._reply_req_ids["msg-1"] = "req-1"
+    adapter._typing_stream_state_by_chat["chat-1"] = ("req-1", "stream-1")
+
+    sent_chunks = []
+
+    async def tracking_send(req_id, payload):
+        sent_chunks.append(payload)
+        return {"headers": {"req_id": "r1"}, "body": {"errcode": 0}}
+
+    adapter._send_reply_request = tracking_send
+
+    content = "Hello\n```json\n{\"card_type\": \"text_notice\"}\n```\nWorld"
+    await adapter.send(chat_id="chat-1", content=content, reply_to="msg-1")
+
+    # Stream chunks should NOT contain the JSON block
+    for chunk in sent_chunks:
+        if chunk.get("msgtype") == "stream":
+            assert "card_type" not in chunk["stream"]["content"]
+            assert "```json" not in chunk["stream"]["content"]

@@ -2286,11 +2286,17 @@ class WeComAdapter(BasePlatformAdapter):
         if not chat_id:
             return SendResult(success=False, error="chat_id is required")
 
-        # Extract template cards if present
-        from gateway.platforms.wecom.template_cards import extract_template_cards, save_template_card_to_cache
+        # Extract template cards if present and mask any remaining card blocks
+        # from stream chunks so raw JSON never reaches the user.
+        from gateway.platforms.wecom.template_cards import (
+            extract_template_cards,
+            mask_template_card_blocks,
+            save_template_card_to_cache,
+        )
 
         card_result = extract_template_cards(content)
         content = card_result.remaining_text or content
+        content = mask_template_card_blocks(content)
 
         try:
             reply_req_id = self._reply_req_id_for_message(reply_to)
