@@ -1447,6 +1447,65 @@ async def test_template_card_event_enriches_with_cached_card_context():
 
 
 @pytest.mark.asyncio
+async def test_template_card_event_updates_card_ui():
+    """After receiving a template card event, the adapter should call updateTemplateCard."""
+    from gateway.config import PlatformConfig
+    from gateway.platforms.wecom import WeComAdapter
+    from gateway.platforms.wecom.template_cards import save_template_card_to_cache
+
+    config = PlatformConfig(extra={"bot_id": "b", "secret": "s"})
+    adapter = WeComAdapter(config)
+    adapter._dedup.is_duplicate = lambda _msg_id: False
+    adapter._is_dm_allowed = lambda _sender: (True, "")
+    adapter._text_batcher.is_enabled = lambda: False
+    adapter.handle_message = AsyncMock()
+    adapter._send_request = AsyncMock(return_value={"body": {"errcode": 0}})
+
+    account_id = adapter._accounts[0].account_id if adapter._accounts else "default"
+    save_template_card_to_cache(account_id, {
+        "task_id": "task-abc",
+        "card_type": "vote_interaction",
+        "source": {"desc": "Poll"},
+        "checkbox": {
+            "question_key": "q1",
+            "mode": 1,
+            "option_list": [
+                {"id": "yes", "text": "Yes"},
+                {"id": "no", "text": "No"},
+            ]
+        }
+    })
+
+    payload = {
+        "cmd": "aibot_msg_callback",
+        "headers": {"req_id": "r1"},
+        "body": {
+            "msgid": "m1",
+            "msgtype": "event",
+            "event": {
+                "event": "template_card_event",
+                "response_code": "task-abc",
+                "selected_options": [{"key": "yes", "value": "Yes"}],
+                "button_replace_name": "",
+            },
+            "chatid": "c1",
+            "from": {"userid": "bob"},
+        },
+    }
+    await adapter._on_message(payload)
+    await adapter._chat_queue.drain("c1")
+
+    adapter.handle_message.assert_awaited_once()
+    adapter._send_request.assert_awaited()
+    call_args = adapter._send_request.call_args
+    assert call_args[0][0] == "aibot_update_template_card"
+
+    card = call_args[0][1]["template_card"]
+    assert card["checkbox"]["option_list"][0].get("is_checked") is True
+    assert card["checkbox"]["option_list"][1].get("is_checked") is False
+
+
+@pytest.mark.asyncio
 async def test_dispatch_payload_replies_to_enter_check_update():
     from gateway.config import PlatformConfig
     from gateway.platforms.wecom import WeComAdapter

@@ -1233,7 +1233,7 @@ class WeComAdapter(BasePlatformAdapter):
         else:
             event_name = ""
         if event_name == "template_card_event":
-            text = self._handle_template_card_event(body)
+            text = await self._handle_template_card_event(body)
             if not text:
                 return
 
@@ -1305,8 +1305,11 @@ class WeComAdapter(BasePlatformAdapter):
         """Adapter-compatible wrapper for ChatSerialQueue handler signature."""
         await self.handle_message(event)
 
-    def _handle_template_card_event(self, body: Dict[str, Any]) -> str:
+    async def _handle_template_card_event(self, body: Dict[str, Any]) -> str:
         """Build a text representation of a template card event for agent dispatch.
+
+        Also updates the template card UI to reflect user selections via
+        aibot_update_template_card.
 
         Returns the event description text, or empty string if the event should
         be silently dropped.
@@ -1334,6 +1337,12 @@ class WeComAdapter(BasePlatformAdapter):
         card_type = str(cached_card.get("card_type") or "").strip() if cached_card else ""
         source_desc = str(cached_card.get("source", {}).get("desc") or "").strip() if cached_card else ""
 
+        # Update the card UI to reflect user interaction
+        if response_code:
+            await self._update_template_card_ui(
+                account_id, response_code, selected_options, button_replace_name
+            )
+
         parts: List[str] = ["[Template card interaction]"]
         if source_desc:
             parts.append(f"Card: {source_desc}")
@@ -1346,6 +1355,56 @@ class WeComAdapter(BasePlatformAdapter):
         if selected_option_ids:
             parts.append(f"Selected: {', '.join(selected_option_ids)}")
         return "\n".join(parts)
+
+    async def _update_template_card_ui(
+        self,
+        account_id: str,
+        task_id: str,
+        selected_options: Any,
+        button_replace_name: str,
+    ) -> None:
+        """Update template card to reflect user selections."""
+        from gateway.platforms.wecom.template_cards import get_template_card_from_cache
+
+        card = get_template_card_from_cache(account_id, task_id)
+        if not card:
+            logger.debug("[%s] No cached card for task_id=%s, skipping UI update", self.name, task_id)
+            return
+
+        updated = dict(card)
+
+        # Update checkbox selections
+        if selected_options and isinstance(selected_options, list):
+            checkbox = updated.get("checkbox")
+            if isinstance(checkbox, dict):
+                options = checkbox.get("option_list", [])
+                selected_keys = {str(opt.get("key") or opt.get("id") or "") for opt in selected_options if isinstance(opt, dict)}
+                for opt in options:
+                    if isinstance(opt, dict):
+                        opt_id = str(opt.get("id") or opt.get("key") or "")
+                        opt["is_checked"] = opt_id in selected_keys
+
+        # Update button selection
+        if button_replace_name:
+            btn_sel = updated.get("button_selection")
+            if isinstance(btn_sel, dict):
+                options = btn_sel.get("option_list", [])
+                for opt in options:
+                    if isinstance(opt, dict) and opt.get("id") == button_replace_name:
+                        opt["is_checked"] = True
+
+        try:
+            await self._send_request(
+                "aibot_update_template_card",
+                {
+                    "response_code": task_id,
+                    "button": {"replace_name": button_replace_name} if button_replace_name else {},
+                    "template_card": updated,
+                },
+            )
+            logger.debug("[%s] Updated template card UI for task_id=%s", self.name, task_id)
+        except Exception as exc:
+            logger.warning("[%s] Failed to update template card UI: %s", self.name, exc)
 
     @staticmethod
     def _build_auth_change_text(body: Dict[str, Any]) -> str:
