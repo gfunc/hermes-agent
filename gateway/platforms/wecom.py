@@ -14,6 +14,7 @@ from gateway.platforms.wecom.adapter import (  # noqa: F401
     APP_CMD_UPLOAD_MEDIA_CHUNK,
     APP_CMD_UPLOAD_MEDIA_FINISH,
     APP_CMD_UPLOAD_MEDIA_INIT,
+    MediaOversizeError,
     MessageType,
     REQUEST_TIMEOUT_SECONDS,
     StreamExpiredError,

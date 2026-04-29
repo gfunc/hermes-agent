@@ -137,6 +137,18 @@ class StreamExpiredError(RuntimeError):
     """Raised when WeCom returns errcode 846608 (stream/reply expired)."""
 
 
+class MediaOversizeError(ValueError):
+    """Raised when an inbound media file exceeds the size limit."""
+
+    def __init__(self, filename: str = "", size_bytes: int = 0, max_bytes: int = 0) -> None:
+        self.filename = filename
+        self.size_bytes = size_bytes
+        self.max_bytes = max_bytes
+        super().__init__(
+            f"File too large: {filename} ({size_bytes} bytes > {max_bytes} bytes limit)"
+        )
+
+
 def check_wecom_requirements() -> bool:
     """Check if WeCom runtime dependencies are available."""
     return AIOHTTP_AVAILABLE and HTTPX_AVAILABLE
@@ -1217,7 +1229,7 @@ class WeComAdapter(BasePlatformAdapter):
             except Exception as exc:
                 logger.warning("[%s] Failed to send command rejection: %s", self.name, exc)
             return
-        media_urls, media_types = await self._extract_media(body)
+        media_urls, media_types = await self._extract_media(body, chat_id=chat_id)
         message_type = self._derive_message_type(body, text, media_types)
         has_reply_context = bool(reply_text and (text or media_urls))
 
@@ -1345,11 +1357,14 @@ class WeComAdapter(BasePlatformAdapter):
 
         return "\n".join(part for part in text_parts if part).strip(), reply_text
 
-    async def _extract_media(self, body: Dict[str, Any]) -> Tuple[List[str], List[str]]:
+    async def _extract_media(
+        self, body: Dict[str, Any], chat_id: str = ""
+    ) -> Tuple[List[str], List[str]]:
         """Best-effort extraction of inbound media to local cache paths."""
         media_paths: List[str] = []
         media_types: List[str] = []
         refs: List[Tuple[str, Dict[str, Any]]] = []
+        oversize_files: List[MediaOversizeError] = []
         msgtype = str(body.get("msgtype") or "").lower()
         logger.debug(
             "[%s] _extract_media: msgtype=%s body_keys=%s",
@@ -1411,7 +1426,15 @@ class WeComAdapter(BasePlatformAdapter):
                 "[%s] _extract_media: caching kind=%s ref_keys=%s",
                 self.name, kind, list(ref.keys()),
             )
-            cached = await self._cache_media(kind, ref)
+            try:
+                cached = await self._cache_media(kind, ref)
+            except MediaOversizeError as exc:
+                oversize_files.append(exc)
+                logger.warning(
+                    "[%s] Media oversize: %s (%s bytes > %s bytes limit)",
+                    self.name, exc.filename, exc.size_bytes, exc.max_bytes,
+                )
+                continue
             if cached:
                 path, content_type = cached
                 media_paths.append(path)
@@ -1445,6 +1468,22 @@ class WeComAdapter(BasePlatformAdapter):
                 "[%s] Failed to cache video (msgtype=video), message will have no media",
                 self.name,
             )
+
+        # Send user-facing notice for oversize files
+        if oversize_files and chat_id:
+            try:
+                names = [f.filename or "文件" for f in oversize_files]
+                notice = (
+                    "以下文件过大，无法接收：\n"
+                    + "\n".join(f"- {n}" for n in names)
+                    + "\n\n请压缩后重新发送，或分段发送。"
+                )
+                await self._send_request(
+                    APP_CMD_SEND,
+                    {"chatid": chat_id, "msgtype": "markdown", "markdown": {"content": notice}},
+                )
+            except Exception as exc:
+                logger.warning("[%s] Failed to send oversize notice: %s", self.name, exc)
 
         logger.debug(
             "[%s] _extract_media: done — paths=%s types=%s",
@@ -1483,6 +1522,23 @@ class WeComAdapter(BasePlatformAdapter):
         logger.debug("[%s] _cache_media: downloading kind=%s url=%s", self.name, kind, url)
         try:
             raw, headers = await self._download_remote_bytes(url, max_bytes=ABSOLUTE_MAX_BYTES)
+        except ValueError as exc:
+            if isinstance(exc, MediaOversizeError):
+                raise
+            err_msg = str(exc)
+            if "exceeds" in err_msg.lower() and "limit" in err_msg.lower():
+                filename = self._guess_filename(url, None, "")
+                size_bytes = 0
+                max_bytes = ABSOLUTE_MAX_BYTES
+                # Try to extract size from error message
+                import re as _re
+                m = _re.search(r"(\d+)\s*bytes\s*>\s*(\d+)\s*bytes", err_msg)
+                if m:
+                    size_bytes = int(m.group(1))
+                    max_bytes = int(m.group(2))
+                raise MediaOversizeError(filename=filename, size_bytes=size_bytes, max_bytes=max_bytes) from exc
+            logger.debug("[%s] Failed to download %s from %s: %s", self.name, kind, url, exc)
+            return None
         except Exception as exc:
             logger.debug("[%s] Failed to download %s from %s: %s", self.name, kind, url, exc)
             return None

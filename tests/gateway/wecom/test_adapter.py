@@ -1169,6 +1169,62 @@ async def test_extract_media_quote_video_without_url_skips_gracefully():
 
 
 @pytest.mark.asyncio
+async def test_cache_media_raises_oversize_error():
+    """_cache_media must raise MediaOversizeError when download exceeds limit."""
+    from gateway.config import PlatformConfig
+    from gateway.platforms.wecom import MediaOversizeError, WeComAdapter
+
+    config = PlatformConfig(extra={"bot_id": "b", "secret": "s"})
+    adapter = WeComAdapter(config)
+    adapter._download_remote_bytes = AsyncMock(
+        side_effect=ValueError("Remote media exceeds WeCom limit: 26214400 bytes > 20971520 bytes")
+    )
+
+    with pytest.raises(MediaOversizeError) as exc_info:
+        await adapter._cache_media("file", {"url": "https://wecom.example.com/huge.zip"})
+    assert "huge.zip" in str(exc_info.value)
+    assert "20971520" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_on_message_sends_oversize_notice():
+    """When inbound media exceeds size limit, a user-facing notice must be sent."""
+    from gateway.config import PlatformConfig
+    from gateway.platforms.wecom import APP_CMD_SEND, MediaOversizeError, WeComAdapter
+
+    config = PlatformConfig(extra={"bot_id": "b", "secret": "s"})
+    adapter = WeComAdapter(config)
+    adapter._dedup.is_duplicate = lambda _msg_id: False
+    adapter._is_dm_allowed = lambda _sender: (True, "")
+    adapter._download_remote_bytes = AsyncMock(
+        side_effect=MediaOversizeError(
+            filename="huge.zip", size_bytes=26214400, max_bytes=20971520
+        )
+    )
+    adapter._send_request = AsyncMock(return_value={"headers": {"req_id": "r1"}, "errcode": 0})
+
+    payload = {
+        "cmd": "aibot_msg_callback",
+        "headers": {"req_id": "r1"},
+        "body": {
+            "msgid": "m1",
+            "msgtype": "file",
+            "file": {"url": "https://wecom.example.com/huge.zip", "name": "huge.zip"},
+            "from": {"userid": "bob"},
+            "chatid": "c1",
+        },
+    }
+    await adapter._on_message(payload)
+
+    # Should have sent an oversize notice
+    calls = adapter._send_request.await_args_list
+    assert any(
+        call.args[0] == APP_CMD_SEND and "文件过大" in call.args[1].get("markdown", {}).get("content", "")
+        for call in calls
+    )
+
+
+@pytest.mark.asyncio
 async def test_derive_message_type_returns_video_for_video_message():
     from gateway.platforms.wecom import WeComAdapter, MessageType
 
