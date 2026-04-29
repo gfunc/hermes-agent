@@ -1044,23 +1044,67 @@ async def test_dm_pairing_mode_blocks_and_sends_prompt():
 
 
 @pytest.mark.asyncio
-async def test_extract_media_extracts_video_frame():
+async def test_extract_media_caches_video_locally():
+    """Video URLs must go through _cache_media, not added raw."""
     from gateway.config import PlatformConfig
     from gateway.platforms.wecom import WeComAdapter
 
     config = PlatformConfig(extra={"bot_id": "b", "secret": "s"})
     adapter = WeComAdapter(config)
+    adapter._cache_media = AsyncMock(return_value=("/cached/video.mp4", "video/mp4"))
+
+    with patch("gateway.platforms.wecom.video.extract_first_video_frame", return_value="/tmp/frame.jpg"):
+        body = {
+            "msgtype": "video",
+            "video": {"url": "https://wecom.example.com/video.mp4", "sdkfileid": "v1", "md5sum": "abc"},
+        }
+        urls, types = await adapter._extract_media(body)
+
+    # Should be cached locally, not the raw WeCom URL
+    assert "/cached/video.mp4" in urls
+    assert "video/mp4" in types
+    # Raw URL must NOT appear in results
+    assert "https://wecom.example.com/video.mp4" not in urls
+    adapter._cache_media.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_extract_media_extracts_video_frame_from_cached_path():
+    """First-frame extraction must use the cached local path, not a remote URL."""
+    from gateway.config import PlatformConfig
+    from gateway.platforms.wecom import WeComAdapter
+
+    config = PlatformConfig(extra={"bot_id": "b", "secret": "s"})
+    adapter = WeComAdapter(config)
+    adapter._cache_media = AsyncMock(return_value=("/cached/video.mp4", "video/mp4"))
 
     with patch("gateway.platforms.wecom.video.extract_first_video_frame", return_value="/tmp/frame.jpg") as mock_extract:
         body = {
             "msgtype": "video",
-            "video": {"url": "/tmp/video.mp4", "sdkfileid": "v1", "md5sum": "abc"},
+            "video": {"url": "https://wecom.example.com/video.mp4", "sdkfileid": "v1", "md5sum": "abc"},
         }
         urls, types = await adapter._extract_media(body)
-        mock_extract.assert_called_once()
+        mock_extract.assert_called_once_with("/cached/video.mp4")
         assert "/tmp/frame.jpg" in urls
         assert "image/jpeg" in types
+        assert "/cached/video.mp4" in urls
         assert "video/mp4" in types
+
+
+@pytest.mark.asyncio
+async def test_derive_message_type_returns_video_for_video_message():
+    from gateway.platforms.wecom import WeComAdapter, MessageType
+
+    body = {"msgtype": "video", "video": {"url": "https://example.com/v.mp4"}}
+    assert WeComAdapter._derive_message_type(body, "", ["video/mp4"]) == MessageType.VIDEO
+
+
+@pytest.mark.asyncio
+async def test_derive_message_type_returns_video_by_msgtype_even_without_media_types():
+    from gateway.platforms.wecom import WeComAdapter, MessageType
+
+    body = {"msgtype": "video"}
+    assert WeComAdapter._derive_message_type(body, "", []) == MessageType.VIDEO
 
 
 @pytest.mark.asyncio

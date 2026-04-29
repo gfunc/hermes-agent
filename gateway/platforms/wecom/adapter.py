@@ -1375,22 +1375,14 @@ class WeComAdapter(BasePlatformAdapter):
                     refs.append(("file", appmsg["file"]))
                 elif isinstance(appmsg.get("image"), dict):
                     refs.append(("image", appmsg["image"]))
-            # Handle video with first-frame extraction for LLM preview
+            # Handle video — route through _cache_media like other file types
+            video_ref_for_frame = None
             if msgtype == "video" and isinstance(body.get("video"), dict):
                 video_info = body["video"]
                 video_url = str(video_info.get("url") or "").strip()
                 if video_url:
-                    media_paths.append(video_url)
-                    media_types.append("video/mp4")
-                    try:
-                        from gateway.platforms.wecom.video import extract_first_video_frame
-
-                        frame_path = extract_first_video_frame(video_url)
-                        if frame_path:
-                            media_paths.append(frame_path)
-                            media_types.append("image/jpeg")
-                    except Exception as exc:
-                        logger.debug("[%s] First-frame extraction failed: %s", self.name, exc)
+                    refs.append(("file", video_info))
+                    video_ref_for_frame = video_info
 
         quote = body.get("quote") if isinstance(body.get("quote"), dict) else {}
         quote_type = str(quote.get("msgtype") or "").lower()
@@ -1403,6 +1395,7 @@ class WeComAdapter(BasePlatformAdapter):
             "[%s] _extract_media: extracted %d refs for msgtype=%s",
             self.name, len(refs), msgtype,
         )
+        cached_video_path = None
         for kind, ref in refs:
             logger.debug(
                 "[%s] _extract_media: caching kind=%s ref_keys=%s",
@@ -1413,6 +1406,8 @@ class WeComAdapter(BasePlatformAdapter):
                 path, content_type = cached
                 media_paths.append(path)
                 media_types.append(content_type)
+                if ref is video_ref_for_frame:
+                    cached_video_path = path
                 logger.debug(
                     "[%s] _extract_media: cached kind=%s path=%s content_type=%s",
                     self.name, kind, path, content_type,
@@ -1422,6 +1417,18 @@ class WeComAdapter(BasePlatformAdapter):
                     "[%s] _extract_media: failed to cache kind=%s ref=%s",
                     self.name, kind, ref,
                 )
+
+        # Extract first frame from cached video for LLM preview
+        if cached_video_path:
+            try:
+                from gateway.platforms.wecom.video import extract_first_video_frame
+
+                frame_path = extract_first_video_frame(cached_video_path)
+                if frame_path:
+                    media_paths.append(frame_path)
+                    media_types.append("image/jpeg")
+            except Exception as exc:
+                logger.debug("[%s] First-frame extraction failed: %s", self.name, exc)
 
         logger.debug(
             "[%s] _extract_media: done — paths=%s types=%s",
@@ -1552,6 +1559,8 @@ class WeComAdapter(BasePlatformAdapter):
             return MessageType.TEXT if text else MessageType.PHOTO
         if str(body.get("msgtype") or "").lower() == "voice":
             return MessageType.VOICE
+        if any(mtype.startswith("video/") for mtype in media_types) or str(body.get("msgtype") or "").lower() == "video":
+            return MessageType.VIDEO
         return MessageType.TEXT
 
     # ------------------------------------------------------------------
