@@ -529,6 +529,91 @@ class TestDocAuthErrorInterceptor:
 
 
 # ------------------------------------------------------------------
+# SmartsheetUploadInterceptor
+# ------------------------------------------------------------------
+
+class TestSmartsheetUploadInterceptor:
+    def test_match_only_smartsheet_methods(self):
+        from tools.wecom_mcp.interceptors.smartsheet_upload import SmartsheetUploadInterceptor
+
+        interceptor = SmartsheetUploadInterceptor()
+        assert interceptor.match({"category": "doc", "method": "smartsheet_add_records", "args": {}}) is True
+        assert interceptor.match({"category": "doc", "method": "smartsheet_update_records", "args": {}}) is True
+        assert interceptor.match({"category": "doc", "method": "get_doc_detail", "args": {}}) is False
+        assert interceptor.match({"category": "msg", "method": "smartsheet_add_records", "args": {}}) is False
+
+    @pytest.mark.asyncio
+    async def test_before_call_uploads_local_files(self, tmp_path):
+        from tools.wecom_mcp.interceptors.smartsheet_upload import SmartsheetUploadInterceptor
+
+        interceptor = SmartsheetUploadInterceptor()
+
+        img = tmp_path / "test.png"
+        img.write_bytes(b"fake_image_data")
+        pdf = tmp_path / "test.pdf"
+        pdf.write_bytes(b"fake_pdf_data")
+
+        ctx = {
+            "category": "doc",
+            "method": "smartsheet_add_records",
+            "args": {
+                "docid": "doc-123",
+                "records": [{
+                    "values": {
+                        "图片字段": [{"image_path": str(img), "title": "my pic"}],
+                        "附件字段": [{"file_path": str(pdf)}],
+                    }
+                }]
+            }
+        }
+
+        with patch(
+            "tools.wecom_mcp.interceptors.smartsheet_upload.send_json_rpc",
+            new_callable=AsyncMock,
+        ) as mock_send:
+            mock_send.side_effect = [
+                {"content": [{"type": "text", "text": '{"errcode": 0, "url": "https://example.com/img.png"}'}]},
+                {"content": [{"type": "text", "text": '{"errcode": 0, "fileid": "file-456"}'}]},
+            ]
+
+            result = await interceptor.before_call(ctx)
+
+            assert result is not None
+            args = result["args"]
+            record = args["records"][0]
+
+            image_cell = record["values"]["图片字段"][0]
+            assert image_cell.get("image_url") == "https://example.com/img.png"
+            assert "image_path" not in image_cell
+            assert image_cell.get("title") == "my pic"
+
+            file_cell = record["values"]["附件字段"][0]
+            assert file_cell.get("file_id") == "file-456"
+            assert "file_path" not in file_cell
+
+            assert result["timeout_ms"] == 120_000
+
+    @pytest.mark.asyncio
+    async def test_before_call_returns_none_when_no_local_files(self):
+        from tools.wecom_mcp.interceptors.smartsheet_upload import SmartsheetUploadInterceptor
+
+        interceptor = SmartsheetUploadInterceptor()
+        ctx = {
+            "category": "doc",
+            "method": "smartsheet_add_records",
+            "args": {
+                "records": [{
+                    "values": {
+                        "文本字段": [{"text": "hello"}],
+                    }
+                }]
+            }
+        }
+        result = await interceptor.before_call(ctx)
+        assert result is None
+
+
+# ------------------------------------------------------------------
 # Pipeline dispatch
 # ------------------------------------------------------------------
 

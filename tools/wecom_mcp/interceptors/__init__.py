@@ -7,6 +7,7 @@ from .doc_auth_error import DocAuthErrorInterceptor
 from .msg_media import MediaInterceptor
 from .smartpage_create import SmartpageCreateInterceptor
 from .smartpage_export import SmartpageExportInterceptor
+from .smartsheet_upload import SmartsheetUploadInterceptor
 from .types import BeforeCallResult, CallContext
 
 logger = logging.getLogger(__name__)
@@ -17,6 +18,7 @@ _INTERCEPTORS: list[Any] = [
     MediaInterceptor(),
     SmartpageExportInterceptor(),
     SmartpageCreateInterceptor(),
+    SmartsheetUploadInterceptor(),
 ]
 
 
