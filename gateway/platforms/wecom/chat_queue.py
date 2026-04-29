@@ -55,11 +55,15 @@ class ChatSerialQueue:
 
     async def drain(self, chat_id: str) -> None:
         """Wait until all messages for a chat are processed."""
-        queue = self._queues.get(chat_id)
-        if queue is None:
+        lock = self._locks.get(chat_id)
+        if lock is None:
             return
-        await queue.put(self._SHUTDOWN_SENTINEL)
-        await queue.join()
-        task = self._tasks.get(chat_id)
-        if task and not task.done():
-            await task
+        async with lock:
+            queue = self._queues.get(chat_id)
+            if queue is None:
+                return
+            await queue.put(self._SHUTDOWN_SENTINEL)
+            await queue.join()
+            task = self._tasks.get(chat_id)
+            if task and not task.done():
+                await task

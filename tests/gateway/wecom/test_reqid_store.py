@@ -44,3 +44,14 @@ class TestReqIdStore:
             store2 = ReqIdStore(Path(tmpdir) / "reqids.json")
             assert store2.get("Chat-ABC") == "req-1"
             assert store2.get("chat-abc") is None  # case-sensitive
+
+    def test_save_uses_atomic_write(self):
+        """save() must not leave temp files behind."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "reqids.json"
+            store = ReqIdStore(path)
+            store.set("chat-1", "req-1")
+            store.save()
+
+            assert path.exists()
+            assert not path.with_suffix(".tmp").exists()

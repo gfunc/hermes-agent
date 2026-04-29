@@ -127,3 +127,22 @@ class TestCommandAuthGroups:
         )
         result = resolve_command_auth(account, "/new", "user-1", chat_id="user-1", chat_type="")
         assert result.command_authorized is True
+
+    def test_group_disabled_does_not_block_plain_text(self):
+        """Non-command text in a group with disabled policy should be allowed."""
+        account = WeComAccount(
+            account_id="a1",
+            group_policy="disabled",
+        )
+        result = resolve_command_auth(account, "Hello everyone", "user-1", chat_id="group-1", chat_type="group")
+        assert result.command_authorized is True
+
+    def test_group_allowlist_does_not_block_plain_text(self):
+        """Non-command text in a group with allowlist policy should be allowed."""
+        account = WeComAccount(
+            account_id="a1",
+            group_policy="allowlist",
+            group_allow_from=["group-1"],
+        )
+        result = resolve_command_auth(account, "Hello everyone", "user-1", chat_id="group-2", chat_type="group")
+        assert result.command_authorized is True

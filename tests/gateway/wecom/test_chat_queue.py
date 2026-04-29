@@ -99,3 +99,34 @@ async def test_chat_queue_no_message_loss_under_race():
     # Drain and verify all processed
     await queue.drain("chat-1")
     assert processed == [{"seq": 1, "pause": True}, {"seq": 2}, {"seq": 3}]
+
+
+@pytest.mark.asyncio
+async def test_chat_queue_drain_race_with_concurrent_enqueue():
+    """Concurrent enqueue() and drain() must not deadlock or lose messages."""
+    processed = []
+    barrier = asyncio.Event()
+
+    async def handler(chat_id, payload):
+        if payload.get("pause"):
+            barrier.set()
+            await asyncio.sleep(0.05)
+        processed.append(payload)
+
+    queue = ChatSerialQueue(handler)
+
+    # Start a slow handler
+    await queue.enqueue("chat-1", {"seq": 1, "pause": True})
+    await barrier.wait()
+
+    # Race: enqueue more while drain is in progress
+    async def late_enqueue():
+        await queue.enqueue("chat-1", {"seq": 2})
+
+    async def do_drain():
+        await queue.drain("chat-1")
+
+    await asyncio.gather(late_enqueue(), do_drain())
+
+    # Both messages must be processed
+    assert processed == [{"seq": 1, "pause": True}, {"seq": 2}]

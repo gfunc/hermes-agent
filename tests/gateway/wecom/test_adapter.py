@@ -2828,7 +2828,8 @@ async def test_send_reply_stream_skips_frame_if_previous_not_acked():
     adapter._stream_acked["req-1"] = False
 
     # Second frame should be skipped (non-blocking)
-    await adapter._send_reply_stream("req-1", "Frame 2", chat_id="chat-1")
+    result = await adapter._send_reply_stream("req-1", "Frame 2", chat_id="chat-1")
+    assert result.get("_skipped") is True
     assert len(sends) == 1  # no new send
 
     # After ack, next frame should send

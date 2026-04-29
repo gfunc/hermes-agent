@@ -2,6 +2,7 @@
 
 import json
 import logging
+import os
 import time
 from pathlib import Path
 from typing import Dict, Optional
@@ -44,7 +45,9 @@ class ReqIdStore:
             chat_id: {"req_id": entry["req_id"], "ts": entry["ts"]}
             for chat_id, entry in self._data.items()
         }
-        self._path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        tmp_path = self._path.with_suffix(".tmp")
+        tmp_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp_path, self._path)
 
     def get(self, chat_id: str) -> Optional[str]:
         entry = self._data.get(chat_id)

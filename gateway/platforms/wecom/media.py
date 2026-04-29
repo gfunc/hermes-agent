@@ -143,16 +143,23 @@ def apply_file_size_limits(
 
 
 class MediaPreparer:
-    """Prepare outbound media for WeCom with magic-byte detection and size enforcement."""
+    """Prepare outbound media for WeCom with magic-byte detection and size enforcement.
+
+    Size limits are enforced at two layers:
+    1. WeComMediaLimits for quick pre-flight checks (e.g. Content-Length header).
+    2. apply_file_size_limits for post-download normalization (downgrade to file type).
+    """
 
     def __init__(
         self,
         http_client,
         *,
         media_local_roots: Optional[List[str]] = None,
+        limits: Optional[WeComMediaLimits] = None,
     ):
         self._http_client = http_client
         self._media_local_roots = [Path(r).expanduser().resolve() for r in (media_local_roots or [])]
+        self._limits = limits or WeComMediaLimits()
 
     async def prepare(
         self,

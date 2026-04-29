@@ -2018,7 +2018,7 @@ class WeComAdapter(BasePlatformAdapter):
                 "[%s] _send_reply_stream: skipping frame for chat=%s req_id=%s — previous not acked",
                 self.name, chat_id, reply_req_id,
             )
-            return {}
+            return {"errcode": 0, "_skipped": True}
         # Reuse the typing stream_id if one is active for this chat.
         # This mirrors the plugin pattern: thinking stream (finish=false)
         # and final response (finish=true) share the same stream_id.

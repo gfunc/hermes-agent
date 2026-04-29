@@ -50,8 +50,8 @@ def resolve_command_auth(
 
     is_cmd = is_command(raw_body)
 
-    # Group policy check (for group chats)
-    if chat_type == "group" and chat_id:
+    # Group policy check (for group chats, commands only)
+    if is_cmd and chat_type == "group" and chat_id:
         group_policy = account.group_policy
         if group_policy == "disabled":
             return CommandAuthResult(
