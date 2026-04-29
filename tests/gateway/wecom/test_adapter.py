@@ -2799,3 +2799,39 @@ async def test_reqid_store_persists_across_disconnect():
         store2 = ReqIdStore(reqid_path)
         assert store2.get("chat-1") == "req-1"
         assert store2.get("chat-2") == "req-2"
+
+
+@pytest.mark.asyncio
+async def test_send_reply_stream_skips_frame_if_previous_not_acked():
+    """Non-blocking mode: if previous frame ack hasn't arrived, skip intermediate."""
+    from gateway.config import PlatformConfig
+    from gateway.platforms.wecom import WeComAdapter
+
+    adapter = WeComAdapter(PlatformConfig(extra={"bot_id": "b", "secret": "s"}))
+    adapter._reply_req_ids["msg-1"] = "req-1"
+    adapter._typing_stream_state_by_chat["chat-1"] = ("req-1", "stream-1")
+
+    # Track sends
+    sends = []
+
+    async def tracking_send(req_id, payload):
+        sends.append(payload)
+        return {"headers": {"req_id": "r1"}, "body": {"errcode": 0}}
+
+    adapter._send_reply_request = tracking_send
+
+    # First frame should send
+    await adapter._send_reply_stream("req-1", "Frame 1", chat_id="chat-1")
+    assert len(sends) == 1
+
+    # Mark previous as not yet acked
+    adapter._stream_acked["req-1"] = False
+
+    # Second frame should be skipped (non-blocking)
+    await adapter._send_reply_stream("req-1", "Frame 2", chat_id="chat-1")
+    assert len(sends) == 1  # no new send
+
+    # After ack, next frame should send
+    adapter._stream_acked["req-1"] = True
+    await adapter._send_reply_stream("req-1", "Frame 3", chat_id="chat-1")
+    assert len(sends) == 2

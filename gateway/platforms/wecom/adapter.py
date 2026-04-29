@@ -220,7 +220,7 @@ class WeComAdapter(BasePlatformAdapter):
         self._reply_req_ids: Dict[str, str] = {}
         self._last_reply_req_id_per_chat: Dict[str, str] = {}
         self._device_id = uuid.uuid4().hex
-        self._pending_stream_acks: set[str] = set()
+        self._stream_acked: Dict[str, bool] = {}
         # Tracks req_ids currently in the process of sending a response via
         # _send_reply_stream. Prevents the _keep_typing loop from opening a
         # new typing stream while the HTTP request is in-flight, which would
@@ -1036,10 +1036,6 @@ class WeComAdapter(BasePlatformAdapter):
         # Ping/pong tracking: any inbound frame for a ping req_id counts as a pong.
         if req_id and await self._ws_client.on_pong(req_id):
             return
-
-        # Clear pending stream ack on successful response
-        if body.get("errcode") in (0, None):
-            self._pending_stream_acks.discard(req_id)
 
         if req_id and req_id in self._pending_responses and cmd not in NON_RESPONSE_COMMANDS:
             future = self._pending_responses.get(req_id)
@@ -2016,6 +2012,13 @@ class WeComAdapter(BasePlatformAdapter):
             "[%s] _send_reply_stream: start chat=%s req_id=%s",
             self.name, chat_id, reply_req_id,
         )
+        # Non-blocking: skip intermediate frames if previous not yet acked
+        if reply_req_id and not self._stream_acked.get(reply_req_id, True):
+            logger.debug(
+                "[%s] _send_reply_stream: skipping frame for chat=%s req_id=%s — previous not acked",
+                self.name, chat_id, reply_req_id,
+            )
+            return {}
         # Reuse the typing stream_id if one is active for this chat.
         # This mirrors the plugin pattern: thinking stream (finish=false)
         # and final response (finish=true) share the same stream_id.
@@ -2076,6 +2079,8 @@ class WeComAdapter(BasePlatformAdapter):
         self._reply_req_ids_sending_response[reply_req_id] = (
             self._reply_req_ids_sending_response.get(reply_req_id, 0) + 1
         )
+        if reply_req_id:
+            self._stream_acked[reply_req_id] = False
         try:
             response = await self._send_reply_request(
                 reply_req_id,
@@ -2089,6 +2094,8 @@ class WeComAdapter(BasePlatformAdapter):
                 },
             )
         finally:
+            if reply_req_id:
+                self._stream_acked[reply_req_id] = True
             count = self._reply_req_ids_sending_response.get(reply_req_id, 0) - 1
             if count <= 0:
                 self._reply_req_ids_sending_response.pop(reply_req_id, None)
