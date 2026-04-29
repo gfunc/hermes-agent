@@ -2273,6 +2273,22 @@ async def test_close_pending_streams_preserves_unprocessed_on_exception():
 
 
 @pytest.mark.asyncio
+async def test_close_pending_streams_does_not_retry_on_stream_expired():
+    """When 846608 (StreamExpiredError) occurs, the stream is gone — do not retry."""
+    from gateway.config import PlatformConfig
+    from gateway.platforms.wecom import WeComAdapter, StreamExpiredError
+
+    adapter = WeComAdapter(PlatformConfig(extra={"bot_id": "b", "secret": "s"}))
+    adapter._streams_pending_close["chat-1"] = ("req-1", "stream-1")
+    adapter._send_reply_request = AsyncMock(side_effect=StreamExpiredError("846608: expired"))
+
+    await adapter._close_pending_streams()
+
+    # Stream should be removed, NOT re-added for retry
+    assert "chat-1" not in adapter._streams_pending_close
+
+
+@pytest.mark.asyncio
 async def test_disconnect_clears_all_state():
     """disconnect() must clear all reply/typing state."""
     from gateway.platforms.wecom import WeComAdapter

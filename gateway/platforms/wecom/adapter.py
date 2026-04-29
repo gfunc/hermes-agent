@@ -2556,6 +2556,12 @@ class WeComAdapter(BasePlatformAdapter):
                     "[%s] _close_pending_streams: closed chat=%s stream_id=%s successfully",
                     self.name, _chat_id, stream_id,
                 )
+            except StreamExpiredError:
+                logger.debug(
+                    "[%s] _close_pending_streams: stream already expired for chat=%s stream_id=%s, removing",
+                    self.name, _chat_id, stream_id,
+                )
+                continue
             except Exception as exc:
                 logger.warning(
                     "[%s] Failed to close pending stream for %s (will retry): %s",
