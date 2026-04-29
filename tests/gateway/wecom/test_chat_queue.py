@@ -72,3 +72,30 @@ async def test_chat_queue_continues_on_handler_failure():
     await queue.drain("chat-1")
 
     assert processed == [{"seq": 1}, {"seq": 3}]
+
+
+@pytest.mark.asyncio
+async def test_chat_queue_no_message_loss_under_race():
+    """Messages enqueued while worker is active must not be lost."""
+    processed = []
+    barrier = asyncio.Event()
+
+    async def handler(chat_id, payload):
+        if payload.get("pause"):
+            barrier.set()
+            await asyncio.sleep(0.1)
+        processed.append(payload)
+
+    queue = ChatSerialQueue(handler)
+
+    # First message starts the worker and pauses it
+    await queue.enqueue("chat-1", {"seq": 1, "pause": True})
+    await barrier.wait()  # Worker is now sleeping
+
+    # Enqueue more messages while worker is busy
+    await queue.enqueue("chat-1", {"seq": 2})
+    await queue.enqueue("chat-1", {"seq": 3})
+
+    # Drain and verify all processed
+    await queue.drain("chat-1")
+    assert processed == [{"seq": 1, "pause": True}, {"seq": 2}, {"seq": 3}]

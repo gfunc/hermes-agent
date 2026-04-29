@@ -12,6 +12,8 @@ Handler = Callable[[str, Any], Awaitable[None]]
 class ChatSerialQueue:
     """Ensures ordered processing of messages within a chat, parallel across chats."""
 
+    _SHUTDOWN_SENTINEL = object()
+
     def __init__(self, handler: Handler):
         self._handler = handler
         self._queues: Dict[str, asyncio.Queue] = {}
@@ -27,7 +29,7 @@ class ChatSerialQueue:
                 queue = asyncio.Queue()
                 self._queues[chat_id] = queue
                 self._tasks[chat_id] = asyncio.create_task(self._worker(chat_id))
-            queue.put_nowait(payload)
+            await queue.put(payload)
 
     async def _worker(self, chat_id: str) -> None:
         """Process messages for a single chat serially."""
@@ -36,15 +38,16 @@ class ChatSerialQueue:
             return
         try:
             while True:
-                try:
-                    payload = queue.get_nowait()
-                except asyncio.QueueEmpty:
+                payload = await queue.get()
+                if payload is self._SHUTDOWN_SENTINEL:
+                    queue.task_done()
                     break
                 try:
                     await self._handler(chat_id, payload)
                 except Exception:
-                    logger.exception("[%s] Chat handler failed for chat=%s", __name__, chat_id)
-                    # Continue processing remaining messages
+                    logger.exception("[wecom][chat_queue] Handler failed for chat=%s", chat_id)
+                finally:
+                    queue.task_done()
         finally:
             self._queues.pop(chat_id, None)
             self._tasks.pop(chat_id, None)
@@ -52,6 +55,11 @@ class ChatSerialQueue:
 
     async def drain(self, chat_id: str) -> None:
         """Wait until all messages for a chat are processed."""
+        queue = self._queues.get(chat_id)
+        if queue is None:
+            return
+        await queue.put(self._SHUTDOWN_SENTINEL)
+        await queue.join()
         task = self._tasks.get(chat_id)
         if task and not task.done():
             await task
