@@ -133,6 +133,10 @@ MAX_UPLOAD_CHUNKS = 100
 VOICE_SUPPORTED_MIMES = {"audio/amr"}
 
 
+class StreamExpiredError(RuntimeError):
+    """Raised when WeCom returns errcode 846608 (stream/reply expired)."""
+
+
 def check_wecom_requirements() -> bool:
     """Check if WeCom runtime dependencies are available."""
     return AIOHTTP_AVAILABLE and HTTPX_AVAILABLE
@@ -1703,6 +1707,9 @@ class WeComAdapter(BasePlatformAdapter):
     def _raise_for_wecom_error(cls, response: Dict[str, Any], operation: str) -> None:
         error = cls._response_error(response)
         if error:
+            errcode = response.get("errcode", 0)
+            if errcode == 846608:
+                raise StreamExpiredError(f"{operation} failed: {error}")
             raise RuntimeError(f"{operation} failed: {error}")
 
     @staticmethod
@@ -2180,8 +2187,7 @@ class WeComAdapter(BasePlatformAdapter):
                     await self._send_reply_stream(reply_req_id, chunks[0], chat_id=chat_id)
                     chunks = chunks[1:]
                 except RuntimeError as exc:
-                    err_text = str(exc)
-                    if "846608" not in err_text:
+                    if not isinstance(exc, StreamExpiredError):
                         raise
                     # Stream expired — fall through and send all chunks proactively.
                 reply_req_id = None
@@ -2204,8 +2210,7 @@ class WeComAdapter(BasePlatformAdapter):
                         try:
                             response = await self._send_reply_stream(reply_req_id, chunk, chat_id=chat_id)
                         except RuntimeError as exc:
-                            err_text = str(exc)
-                            if "846608" in err_text:
+                            if isinstance(exc, StreamExpiredError):
                                 logger.warning(
                                     "[%s] Stream reply expired (846608) for req_id=%s, falling back to proactive send",
                                     self.name, reply_req_id,
@@ -2469,8 +2474,7 @@ class WeComAdapter(BasePlatformAdapter):
                 self.name, chat_id, stream_id,
             )
         except RuntimeError as exc:
-            err_text = str(exc)
-            if "846608" in err_text:
+            if isinstance(exc, StreamExpiredError):
                 logger.warning(
                     "[%s] Typing stream expired (846608) for req_id=%s, clearing cache",
                     self.name, reply_req_id,

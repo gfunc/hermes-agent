@@ -778,12 +778,36 @@ class TestSend:
 
     @pytest.mark.asyncio
     async def test_send_falls_back_to_proactive_on_846608(self):
-        from gateway.platforms.wecom import APP_CMD_SEND, WeComAdapter
+        from gateway.platforms.wecom import APP_CMD_SEND, StreamExpiredError, WeComAdapter
 
         adapter = WeComAdapter(PlatformConfig(enabled=True))
         adapter._reply_req_ids["msg-1"] = "req-1"
         adapter._send_reply_stream = AsyncMock(
-            side_effect=RuntimeError("send reply stream failed: errcode=846608")
+            side_effect=StreamExpiredError("send reply stream failed: errcode=846608")
+        )
+        adapter._send_request = AsyncMock(return_value={"headers": {"req_id": "req-2"}, "errcode": 0})
+
+        result = await adapter.send("chat-123", "stream expired", reply_to="msg-1")
+
+        assert result.success is True
+        adapter._send_reply_stream.assert_awaited_once()
+        adapter._send_request.assert_awaited_once_with(
+            APP_CMD_SEND,
+            {
+                "chatid": "chat-123",
+                "msgtype": "markdown",
+                "markdown": {"content": "stream expired"},
+            },
+        )
+
+    @pytest.mark.asyncio
+    async def test_send_falls_back_to_proactive_on_stream_expired_error(self):
+        from gateway.platforms.wecom import APP_CMD_SEND, StreamExpiredError, WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._reply_req_ids["msg-1"] = "req-1"
+        adapter._send_reply_stream = AsyncMock(
+            side_effect=StreamExpiredError("send reply stream failed: errcode=846608")
         )
         adapter._send_request = AsyncMock(return_value={"headers": {"req_id": "req-2"}, "errcode": 0})
 
@@ -2057,11 +2081,34 @@ class TestWeComSendGuards:
             await adapter._send_reply_request("req-1", {})
 
 
+class TestStreamExpiredError:
+    def test_raise_for_wecom_error_raises_stream_expired_for_846608(self):
+        from gateway.platforms.wecom import WeComAdapter, StreamExpiredError
+
+        with pytest.raises(StreamExpiredError) as exc_info:
+            WeComAdapter._raise_for_wecom_error({"errcode": 846608, "errmsg": "message expired"}, "send typing stream")
+        assert "846608" in str(exc_info.value)
+        assert "send typing stream" in str(exc_info.value)
+
+    def test_raise_for_wecom_error_raises_runtime_error_for_other_errors(self):
+        from gateway.platforms.wecom import WeComAdapter, StreamExpiredError
+
+        with pytest.raises(RuntimeError) as exc_info:
+            WeComAdapter._raise_for_wecom_error({"errcode": 40001, "errmsg": "bad request"}, "send message")
+        assert "40001" in str(exc_info.value)
+        assert not isinstance(exc_info.value, StreamExpiredError)
+
+    def test_stream_expired_error_is_runtime_error_subclass(self):
+        from gateway.platforms.wecom import StreamExpiredError
+
+        assert issubclass(StreamExpiredError, RuntimeError)
+
+
 class TestWeComTyping846608:
     @pytest.mark.asyncio
     async def test_send_typing_clears_reply_cache_on_846608(self):
         from gateway.config import PlatformConfig
-        from gateway.platforms.wecom import WeComAdapter
+        from gateway.platforms.wecom import StreamExpiredError, WeComAdapter
 
         adapter = WeComAdapter(PlatformConfig(enabled=True))
         adapter._last_reply_req_id_per_chat["chat-1"] = "req-old"
@@ -2069,7 +2116,7 @@ class TestWeComTyping846608:
         adapter._ws = AsyncMock()
         adapter._ws.closed = False
         adapter._ws.send_json = AsyncMock(
-            side_effect=RuntimeError("846608: message expired")
+            side_effect=StreamExpiredError("846608: message expired")
         )
 
         await adapter.send_typing("chat-1", metadata={"message_id": "msg-1"})

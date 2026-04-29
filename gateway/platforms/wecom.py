@@ -16,6 +16,7 @@ from gateway.platforms.wecom.adapter import (  # noqa: F401
     APP_CMD_UPLOAD_MEDIA_INIT,
     MessageType,
     REQUEST_TIMEOUT_SECONDS,
+    StreamExpiredError,
     WeComAdapter,
     check_wecom_requirements,
 )
