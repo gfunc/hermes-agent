@@ -1207,10 +1207,17 @@ class WeComAdapter(BasePlatformAdapter):
 
         # Template card event: handle gracefully without dispatching as normal message
         msgtype = str(body.get("msgtype") or "").lower()
-        event_name = str(body.get("event") or "").lower() if msgtype == "event" else ""
+        _raw_event = body.get("event")
+        if msgtype == "event" and isinstance(_raw_event, dict):
+            event_name = str(_raw_event.get("event") or "").lower()
+        elif msgtype == "event":
+            event_name = str(_raw_event or "").lower()
+        else:
+            event_name = ""
         if event_name == "template_card_event":
-            await self._handle_template_card_event(body)
-            return
+            text = await self._handle_template_card_event(body)
+            if not text:
+                return
 
         # Auth change event: build context text and dispatch as normal message
         if event_name == "auth_change_event":
@@ -1275,9 +1282,12 @@ class WeComAdapter(BasePlatformAdapter):
         else:
             await self.handle_message(event)
 
-    async def _handle_template_card_event(self, body: Dict[str, Any]) -> None:
-        from gateway.platforms.wecom.template_cards import get_template_card_from_cache
+    async def _handle_template_card_event(self, body: Dict[str, Any]) -> str:
+        """Build a text representation of a template card event for agent dispatch.
 
+        Returns the event description text, or empty string if the event should
+        be silently dropped.
+        """
         event = body.get("event") if isinstance(body.get("event"), dict) else {}
         response_code = str(event.get("response_code") or "").strip()
         button_replace_name = str(event.get("button_replace_name") or "").strip()
@@ -1288,14 +1298,19 @@ class WeComAdapter(BasePlatformAdapter):
             else []
         )
 
-        account = self._accounts[0] if self._accounts else None
-        if not account:
-            return
-
         logger.debug(
             "[%s] Template card event received: response_code=%s selected=%s",
             self.name, response_code, selected_option_ids,
         )
+
+        parts: List[str] = ["[Template card interaction]"]
+        if button_replace_name:
+            parts.append(f"Button: {button_replace_name}")
+        elif response_code:
+            parts.append(f"Action: {response_code}")
+        if selected_option_ids:
+            parts.append(f"Selected: {', '.join(selected_option_ids)}")
+        return "\n".join(parts)
 
     @staticmethod
     def _build_auth_change_text(body: Dict[str, Any]) -> str:

@@ -1307,6 +1307,82 @@ async def test_on_message_auth_change_event_empty_auth_list():
 
 
 @pytest.mark.asyncio
+async def test_template_card_button_click_dispatched_as_message():
+    """Template card button clicks must be routed to the agent as messages."""
+    from gateway.config import PlatformConfig
+    from gateway.platforms.base import MessageType
+    from gateway.platforms.wecom import WeComAdapter
+
+    config = PlatformConfig(extra={"bot_id": "b", "secret": "s"})
+    adapter = WeComAdapter(config)
+    adapter._dedup.is_duplicate = lambda _msg_id: False
+    adapter._is_dm_allowed = lambda _sender: (True, "")
+    adapter._text_batcher.is_enabled = lambda: False
+    adapter.handle_message = AsyncMock()
+
+    payload = {
+        "cmd": "aibot_msg_callback",
+        "headers": {"req_id": "r1"},
+        "body": {
+            "msgid": "m1",
+            "msgtype": "event",
+            "event": {
+                "event": "template_card_event",
+                "response_code": "approve_btn",
+                "button_replace_name": "Approve",
+            },
+            "chatid": "c1",
+            "from": {"userid": "bob"},
+        },
+    }
+    await adapter._on_message(payload)
+
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.message_type == MessageType.TEXT
+    assert "template card" in event.text.lower()
+    assert "Approve" in event.text
+
+
+@pytest.mark.asyncio
+async def test_template_card_poll_vote_dispatched_as_message():
+    """Template card poll votes must include selected options in the message."""
+    from gateway.config import PlatformConfig
+    from gateway.platforms.base import MessageType
+    from gateway.platforms.wecom import WeComAdapter
+
+    config = PlatformConfig(extra={"bot_id": "b", "secret": "s"})
+    adapter = WeComAdapter(config)
+    adapter._dedup.is_duplicate = lambda _msg_id: False
+    adapter._is_dm_allowed = lambda _sender: (True, "")
+    adapter._text_batcher.is_enabled = lambda: False
+    adapter.handle_message = AsyncMock()
+
+    payload = {
+        "cmd": "aibot_msg_callback",
+        "headers": {"req_id": "r1"},
+        "body": {
+            "msgid": "m1",
+            "msgtype": "event",
+            "event": {
+                "event": "template_card_event",
+                "response_code": "vote_option",
+                "selected_options": [{"key": "opt_1", "value": "Yes"}, {"key": "opt_2", "value": "Maybe"}],
+            },
+            "chatid": "c1",
+            "from": {"userid": "bob"},
+        },
+    }
+    await adapter._on_message(payload)
+
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.message_type == MessageType.TEXT
+    assert "opt_1" in event.text
+    assert "opt_2" in event.text
+
+
+@pytest.mark.asyncio
 async def test_dispatch_payload_replies_to_enter_check_update():
     from gateway.config import PlatformConfig
     from gateway.platforms.wecom import WeComAdapter
