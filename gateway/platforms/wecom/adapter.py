@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import copy
 import hashlib
 import json
 import logging
@@ -1378,7 +1379,7 @@ class WeComAdapter(BasePlatformAdapter):
             logger.debug("[%s] No cached card for task_id=%s, skipping UI update", self.name, task_id)
             return
 
-        updated = dict(card)
+        updated = copy.deepcopy(card)
 
         # Update checkbox selections
         if selected_options and isinstance(selected_options, list):

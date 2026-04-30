@@ -3046,3 +3046,104 @@ async def test_push_via_response_url_posts_to_url():
     call_args = adapter._http_client.post.call_args
     assert call_args[0][0] == "https://wecom.example.com/push/abc"
     assert call_args[1]["json"]["msgtype"] == "markdown"
+
+
+@pytest.mark.asyncio
+async def test_push_via_response_url_falls_back_on_http_error():
+    """Non-200 response should return False and not crash."""
+    from gateway.config import PlatformConfig
+    from gateway.platforms.wecom import WeComAdapter
+    from gateway.platforms.wecom.stream_store import StreamStore
+
+    config = PlatformConfig(extra={"bot_id": "b", "secret": "s"})
+    adapter = WeComAdapter(config)
+
+    async def flush_handler(pending):
+        pass
+
+    adapter._stream_store = StreamStore(flush_handler=flush_handler)
+    await adapter._stream_store.active_reply_store.save(
+        "chat-1", "https://wecom.example.com/push/abc", policy="once"
+    )
+
+    mock_response = MagicMock()
+    mock_response.status = 500
+
+    class FakePostContext:
+        async def __aenter__(self):
+            return mock_response
+        async def __aexit__(self, *args):
+            pass
+
+    adapter._http_client = MagicMock()
+    adapter._http_client.post = MagicMock(return_value=FakePostContext())
+
+    pushed = await adapter._push_via_response_url("chat-1", {"msgtype": "markdown", "markdown": {"content": "hello"}})
+    assert pushed is False
+
+
+@pytest.mark.asyncio
+async def test_send_falls_back_to_proactive_when_response_url_fails():
+    """When response_url push fails, send() should fall back to aibot_send_msg."""
+    from gateway.config import PlatformConfig
+    from gateway.platforms.wecom import WeComAdapter
+    from gateway.platforms.wecom.stream_store import StreamStore
+
+    config = PlatformConfig(extra={"bot_id": "b", "secret": "s"})
+    adapter = WeComAdapter(config)
+    adapter._send_request = AsyncMock(return_value={"headers": {"req_id": "r1"}, "body": {"errcode": 0}})
+
+    async def flush_handler(pending):
+        pass
+
+    adapter._stream_store = StreamStore(flush_handler=flush_handler)
+    await adapter._stream_store.active_reply_store.save(
+        "chat-1", "https://wecom.example.com/push/abc", policy="once"
+    )
+
+    # Simulate response_url push failure (no http client)
+    adapter._http_client = None
+
+    result = await adapter.send("chat-1", "Hello fallback")
+    assert result.success is True
+    adapter._send_request.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_template_card_event_skips_ui_update_on_cache_miss():
+    """When no cached card exists, _update_template_card_ui should return early without calling _send_request."""
+    from gateway.config import PlatformConfig
+    from gateway.platforms.wecom import WeComAdapter
+
+    config = PlatformConfig(extra={"bot_id": "b", "secret": "s"})
+    adapter = WeComAdapter(config)
+    adapter._dedup.is_duplicate = lambda _msg_id: False
+    adapter._is_dm_allowed = lambda _sender: (True, "")
+    adapter._text_batcher.is_enabled = lambda: False
+    adapter.handle_message = AsyncMock()
+    adapter._send_request = AsyncMock(return_value={"body": {"errcode": 0}})
+
+    payload = {
+        "cmd": "aibot_msg_callback",
+        "headers": {"req_id": "r1"},
+        "body": {
+            "msgid": "m1",
+            "msgtype": "event",
+            "event": {
+                "event": "template_card_event",
+                "response_code": "nonexistent-task",
+                "selected_options": [{"key": "yes", "value": "Yes"}],
+                "button_replace_name": "",
+            },
+            "chatid": "c1",
+            "from": {"userid": "bob"},
+        },
+    }
+    await adapter._on_message(payload)
+    await adapter._chat_queue.drain("c1")
+
+    adapter.handle_message.assert_awaited_once()
+    # _send_request should NOT be called for aibot_update_template_card
+    # because there is no cached card
+    for call in adapter._send_request.call_args_list:
+        assert call[0][0] != "aibot_update_template_card"

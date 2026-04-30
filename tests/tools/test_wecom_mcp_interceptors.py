@@ -527,6 +527,31 @@ class TestDocAuthErrorInterceptor:
         new_result = await interceptor.after_call(ctx, result)
         assert new_result == result
 
+    @pytest.mark.asyncio
+    async def test_after_call_returns_simplified_when_no_adapter(self):
+        """When _get_wecom_adapter returns None, simplified response is still returned."""
+        from tools.wecom_mcp.interceptors.doc_auth_error import DocAuthErrorInterceptor
+
+        interceptor = DocAuthErrorInterceptor()
+
+        with patch(
+            "tools.wecom_mcp.interceptors.doc_auth_error._get_wecom_adapter",
+            return_value=None,
+        ):
+            result = {
+                "content": [{
+                    "type": "text",
+                    "text": '{"errcode": 851014, "errmsg": "unauthorized"}',
+                }]
+            }
+            ctx = {"category": "doc", "method": "get_doc_detail", "args": {}}
+            new_result = await interceptor.after_call(ctx, result)
+
+            text = new_result["content"][0]["text"]
+            parsed = json.loads(text)
+            assert parsed["_biz_msg_sent"] is True
+            assert parsed["errcode"] == 851014
+
 
 # ------------------------------------------------------------------
 # SmartsheetUploadInterceptor
@@ -611,6 +636,82 @@ class TestSmartsheetUploadInterceptor:
         }
         result = await interceptor.before_call(ctx)
         assert result is None
+
+    @pytest.mark.asyncio
+    async def test_before_call_rejects_oversize_file(self, tmp_path):
+        from tools.wecom_mcp.interceptors.smartsheet_upload import SmartsheetUploadInterceptor
+
+        big = tmp_path / "big.png"
+        big.write_bytes(b"x" * (10 * 1024 * 1024 + 1))
+
+        interceptor = SmartsheetUploadInterceptor()
+        ctx = {
+            "category": "doc",
+            "method": "smartsheet_add_records",
+            "args": {
+                "docid": "doc-123",
+                "records": [{
+                    "values": {
+                        "图片字段": [{"image_path": str(big), "title": "big pic"}],
+                    }
+                }]
+            }
+        }
+        with pytest.raises(ValueError, match="exceeds single file limit"):
+            await interceptor.before_call(ctx)
+
+    @pytest.mark.asyncio
+    async def test_before_call_rejects_oversize_total(self, tmp_path):
+        from tools.wecom_mcp.interceptors.smartsheet_upload import SmartsheetUploadInterceptor
+
+        f1 = tmp_path / "a.png"
+        f1.write_bytes(b"x" * (7 * 1024 * 1024))
+        f2 = tmp_path / "b.png"
+        f2.write_bytes(b"x" * (7 * 1024 * 1024))
+        f3 = tmp_path / "c.png"
+        f3.write_bytes(b"x" * (7 * 1024 * 1024))
+
+        interceptor = SmartsheetUploadInterceptor()
+        ctx = {
+            "category": "doc",
+            "method": "smartsheet_add_records",
+            "args": {
+                "docid": "doc-123",
+                "records": [{
+                    "values": {
+                        "图片字段": [
+                            {"image_path": str(f1), "title": "p1"},
+                            {"image_path": str(f2), "title": "p2"},
+                            {"image_path": str(f3), "title": "p3"},
+                        ],
+                    }
+                }]
+            }
+        }
+        with pytest.raises(ValueError, match="exceeds limit 20MB"):
+            await interceptor.before_call(ctx)
+
+    @pytest.mark.asyncio
+    async def test_before_call_rejects_missing_doc_locator(self, tmp_path):
+        from tools.wecom_mcp.interceptors.smartsheet_upload import SmartsheetUploadInterceptor
+
+        img = tmp_path / "test.png"
+        img.write_bytes(b"fake_image_data")
+
+        interceptor = SmartsheetUploadInterceptor()
+        ctx = {
+            "category": "doc",
+            "method": "smartsheet_add_records",
+            "args": {
+                "records": [{
+                    "values": {
+                        "图片字段": [{"image_path": str(img), "title": "pic"}],
+                    }
+                }]
+            }
+        }
+        with pytest.raises(ValueError, match="missing docid or url"):
+            await interceptor.before_call(ctx)
 
 
 # ------------------------------------------------------------------
