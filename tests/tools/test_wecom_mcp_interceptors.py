@@ -500,12 +500,13 @@ class TestDocAuthErrorInterceptor:
                     "text": '{"errcode": 851013, "errmsg": "no permission", "help_message": "请授权"}',
                 }]
             }
-            ctx = {"category": "doc", "method": "get_doc_detail", "args": {}}
+            ctx = {"category": "doc", "method": "get_doc_detail", "args": {"chat_id": "c1"}}
             new_result = await interceptor.after_call(ctx, result)
 
             mock_adapter._send_request.assert_awaited_once()
             call_args = mock_adapter._send_request.call_args[0][1]
             assert call_args["biz_type"] == 1
+            assert call_args["chat_id"] == "c1"
 
             text = new_result["content"][0]["text"]
             parsed = json.loads(text)
@@ -568,9 +569,10 @@ class TestSmartsheetUploadInterceptor:
         assert interceptor.match({"category": "msg", "method": "smartsheet_add_records", "args": {}}) is False
 
     @pytest.mark.asyncio
-    async def test_before_call_uploads_local_files(self, tmp_path):
+    async def test_before_call_uploads_local_files(self, tmp_path, monkeypatch):
         from tools.wecom_mcp.interceptors.smartsheet_upload import SmartsheetUploadInterceptor
 
+        monkeypatch.setenv("WECOM_MCP_UPLOAD_ROOT", str(tmp_path))
         interceptor = SmartsheetUploadInterceptor()
 
         img = tmp_path / "test.png"
@@ -638,9 +640,10 @@ class TestSmartsheetUploadInterceptor:
         assert result is None
 
     @pytest.mark.asyncio
-    async def test_before_call_rejects_oversize_file(self, tmp_path):
+    async def test_before_call_rejects_oversize_file(self, tmp_path, monkeypatch):
         from tools.wecom_mcp.interceptors.smartsheet_upload import SmartsheetUploadInterceptor
 
+        monkeypatch.setenv("WECOM_MCP_UPLOAD_ROOT", str(tmp_path))
         big = tmp_path / "big.png"
         big.write_bytes(b"x" * (10 * 1024 * 1024 + 1))
 
@@ -661,9 +664,10 @@ class TestSmartsheetUploadInterceptor:
             await interceptor.before_call(ctx)
 
     @pytest.mark.asyncio
-    async def test_before_call_rejects_oversize_total(self, tmp_path):
+    async def test_before_call_rejects_oversize_total(self, tmp_path, monkeypatch):
         from tools.wecom_mcp.interceptors.smartsheet_upload import SmartsheetUploadInterceptor
 
+        monkeypatch.setenv("WECOM_MCP_UPLOAD_ROOT", str(tmp_path))
         f1 = tmp_path / "a.png"
         f1.write_bytes(b"x" * (7 * 1024 * 1024))
         f2 = tmp_path / "b.png"
@@ -692,9 +696,10 @@ class TestSmartsheetUploadInterceptor:
             await interceptor.before_call(ctx)
 
     @pytest.mark.asyncio
-    async def test_before_call_rejects_missing_doc_locator(self, tmp_path):
+    async def test_before_call_rejects_missing_doc_locator(self, tmp_path, monkeypatch):
         from tools.wecom_mcp.interceptors.smartsheet_upload import SmartsheetUploadInterceptor
 
+        monkeypatch.setenv("WECOM_MCP_UPLOAD_ROOT", str(tmp_path))
         img = tmp_path / "test.png"
         img.write_bytes(b"fake_image_data")
 
@@ -711,6 +716,48 @@ class TestSmartsheetUploadInterceptor:
             }
         }
         with pytest.raises(ValueError, match="missing docid or url"):
+            await interceptor.before_call(ctx)
+
+    @pytest.mark.asyncio
+    async def test_before_call_rejects_path_traversal(self, tmp_path, monkeypatch):
+        from tools.wecom_mcp.interceptors.smartsheet_upload import SmartsheetUploadInterceptor
+
+        monkeypatch.setenv("WECOM_MCP_UPLOAD_ROOT", str(tmp_path))
+        interceptor = SmartsheetUploadInterceptor()
+        ctx = {
+            "category": "doc",
+            "method": "smartsheet_add_records",
+            "args": {
+                "docid": "doc-123",
+                "records": [{
+                    "values": {
+                        "图片字段": [{"image_path": "../outside.png", "title": "bad"}],
+                    }
+                }]
+            }
+        }
+        with pytest.raises(ValueError, match="traversal attempt"):
+            await interceptor.before_call(ctx)
+
+    @pytest.mark.asyncio
+    async def test_before_call_rejects_path_outside_root(self, tmp_path, monkeypatch):
+        from tools.wecom_mcp.interceptors.smartsheet_upload import SmartsheetUploadInterceptor
+
+        monkeypatch.setenv("WECOM_MCP_UPLOAD_ROOT", str(tmp_path))
+        interceptor = SmartsheetUploadInterceptor()
+        ctx = {
+            "category": "doc",
+            "method": "smartsheet_add_records",
+            "args": {
+                "docid": "doc-123",
+                "records": [{
+                    "values": {
+                        "附件字段": [{"file_path": "/etc/passwd"}],
+                    }
+                }]
+            }
+        }
+        with pytest.raises(ValueError, match="outside allowed root"):
             await interceptor.before_call(ctx)
 
 

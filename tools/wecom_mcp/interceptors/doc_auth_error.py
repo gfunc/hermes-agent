@@ -122,6 +122,12 @@ async def _send_auth_biz_msg(adapter: Any, ctx: CallContext) -> None:
             else AIBOT_BIZ_MSG_CHAT_TYPE_SINGLE
         )
 
+    if not chat_id and not userid:
+        logger.warning(
+            "[wecom_mcp] doc-auth-error: no chat_id or userid available, skipping biz msg"
+        )
+        return
+
     try:
         await adapter._send_request(APP_CMD_SEND_BIZ_MSG, body)
         logger.info("[wecom_mcp] doc-auth-error: biz msg sent successfully")

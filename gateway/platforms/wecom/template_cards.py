@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import re
@@ -62,7 +63,7 @@ def get_template_card_from_cache(account_id: str, task_id: str) -> Optional[Dict
             _sent_template_cards.pop(key, None)
             _sent_timestamps.pop(key, None)
             return None
-        return dict(_sent_template_cards.get(key) or {})
+        return copy.deepcopy(_sent_template_cards.get(key) or {})
 
 
 def _coerce_checkbox_mode(value: Any) -> Optional[int]:

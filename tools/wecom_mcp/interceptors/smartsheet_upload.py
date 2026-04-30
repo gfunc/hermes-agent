@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +23,36 @@ MAX_SINGLE_FILE_SIZE = 10 * 1024 * 1024
 MAX_TOTAL_FILE_SIZE = 20 * 1024 * 1024
 UPLOAD_TIMEOUT_MS = 60_000
 INTERCEPTOR_TIMEOUT_MS = 120_000
+
+
+def _get_allowed_root() -> Path:
+    """Return the allowed filesystem root for smartsheet file uploads."""
+    env_root = os.getenv("WECOM_MCP_UPLOAD_ROOT", "").strip()
+    if env_root:
+        return Path(env_root).resolve()
+    return Path(os.getcwd()).resolve()
+
+
+def _resolve_upload_path(raw_path: str) -> str:
+    """Resolve and validate that *raw_path* stays inside the allowed root.
+
+    Raises ``ValueError`` on traversal attempts or paths outside the root.
+    Returns the resolved absolute path.
+    """
+    allowed_root = _get_allowed_root()
+    if ".." in raw_path:
+        raise ValueError(
+            f"smartsheet_upload: path contains '..' (traversal attempt): {raw_path}"
+        )
+    resolved = Path(raw_path).resolve()
+    try:
+        resolved.relative_to(allowed_root)
+    except ValueError:
+        raise ValueError(
+            f"smartsheet_upload: path '{raw_path}' resolves to '{resolved}' "
+            f"which is outside allowed root '{allowed_root}'"
+        )
+    return str(resolved)
 
 
 class SmartsheetUploadInterceptor:
@@ -85,7 +116,8 @@ def _collect_upload_tasks(records: list[dict]) -> list[dict]:
 def _validate_file_sizes(tasks: list[dict]) -> None:
     total = 0
     for task in tasks:
-        path = Path(task["file_path"])
+        resolved = _resolve_upload_path(task["file_path"])
+        path = Path(resolved)
         if not path.exists() or not path.is_file():
             raise FileNotFoundError(f"Smartsheet upload: file not found: {path}")
         size = path.stat().st_size
@@ -100,6 +132,7 @@ def _validate_file_sizes(tasks: list[dict]) -> None:
                 f"Smartsheet upload: total size ({total / 1024 / 1024:.1f}MB) "
                 f"exceeds limit 20MB"
             )
+        task["resolved_path"] = resolved
 
 
 def _extract_doc_locator(args: dict) -> dict:
@@ -112,7 +145,7 @@ def _extract_doc_locator(args: dict) -> dict:
 
 async def _execute_uploads(tasks: list[dict], doc_locator: dict) -> None:
     for task in tasks:
-        path = Path(task["file_path"])
+        path = Path(task["resolved_path"])
         data = path.read_bytes()
         base64_content = base64.b64encode(data).decode("ascii")
         filename = path.name
