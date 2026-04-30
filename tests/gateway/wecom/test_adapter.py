@@ -1,0 +1,3149 @@
+"""Tests for the WeCom platform adapter."""
+
+import base64
+import os
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+from gateway.config import Platform, PlatformConfig
+from gateway.platforms.base import SendResult
+
+
+class TestWeComRequirements:
+    def test_returns_false_without_aiohttp(self, monkeypatch):
+        monkeypatch.setattr("gateway.platforms.wecom.adapter.AIOHTTP_AVAILABLE", False)
+        monkeypatch.setattr("gateway.platforms.wecom.adapter.HTTPX_AVAILABLE", True)
+        from gateway.platforms.wecom import check_wecom_requirements
+
+        assert check_wecom_requirements() is False
+
+    def test_returns_false_without_httpx(self, monkeypatch):
+        monkeypatch.setattr("gateway.platforms.wecom.adapter.AIOHTTP_AVAILABLE", True)
+        monkeypatch.setattr("gateway.platforms.wecom.adapter.HTTPX_AVAILABLE", False)
+        from gateway.platforms.wecom import check_wecom_requirements
+
+        assert check_wecom_requirements() is False
+
+    def test_returns_true_when_available(self, monkeypatch):
+        monkeypatch.setattr("gateway.platforms.wecom.adapter.AIOHTTP_AVAILABLE", True)
+        monkeypatch.setattr("gateway.platforms.wecom.adapter.HTTPX_AVAILABLE", True)
+        from gateway.platforms.wecom import check_wecom_requirements
+
+        assert check_wecom_requirements() is True
+
+
+class TestWeComAdapterInit:
+    def test_reads_config_from_extra(self):
+        from gateway.platforms.wecom import WeComAdapter
+
+        config = PlatformConfig(
+            enabled=True,
+            extra={
+                "bot_id": "cfg-bot",
+                "secret": "cfg-secret",
+                "websocket_url": "wss://custom.wecom.example/ws",
+                "group_policy": "allowlist",
+                "group_allow_from": ["group-1"],
+            },
+        )
+        adapter = WeComAdapter(config)
+
+        assert adapter._bot_id == "cfg-bot"
+        assert adapter._secret == "cfg-secret"
+        assert adapter._ws_url == "wss://custom.wecom.example/ws"
+        assert adapter._group_policy == "allowlist"
+        assert adapter._group_allow_from == ["group-1"]
+
+    def test_falls_back_to_env_vars(self, monkeypatch):
+        monkeypatch.setenv("WECOM_BOT_ID", "env-bot")
+        monkeypatch.setenv("WECOM_SECRET", "env-secret")
+        monkeypatch.setenv("WECOM_WEBSOCKET_URL", "wss://env.example/ws")
+        from gateway.platforms.wecom import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        assert adapter._bot_id == "env-bot"
+        assert adapter._secret == "env-secret"
+        assert adapter._ws_url == "wss://env.example/ws"
+
+
+class TestWeComConnect:
+    @pytest.mark.asyncio
+    async def test_connect_records_missing_credentials(self, monkeypatch):
+        import gateway.platforms.wecom.adapter as wecom_module
+        from gateway.platforms.wecom import WeComAdapter
+
+        monkeypatch.setattr(wecom_module, "AIOHTTP_AVAILABLE", True)
+        monkeypatch.setattr(wecom_module, "HTTPX_AVAILABLE", True)
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+
+        success = await adapter.connect()
+
+        assert success is False
+        assert adapter.has_fatal_error is True
+        assert adapter.fatal_error_code == "wecom_missing_credentials"
+        assert "WECOM_BOT_ID" in (adapter.fatal_error_message or "")
+
+    @pytest.mark.asyncio
+    async def test_connect_records_handshake_failure_details(self, monkeypatch):
+        import gateway.platforms.wecom.adapter as wecom_module
+        from gateway.platforms.wecom import WeComAdapter
+
+        class DummyClient:
+            async def aclose(self):
+                return None
+
+        monkeypatch.setattr(wecom_module, "AIOHTTP_AVAILABLE", True)
+        monkeypatch.setattr(wecom_module, "HTTPX_AVAILABLE", True)
+        monkeypatch.setattr(
+            wecom_module,
+            "httpx",
+            SimpleNamespace(AsyncClient=lambda **kwargs: DummyClient()),
+        )
+
+        adapter = WeComAdapter(
+            PlatformConfig(enabled=True, extra={"bot_id": "bot-1", "secret": "secret-1"})
+        )
+        adapter._open_connection = AsyncMock(side_effect=RuntimeError("invalid secret (errcode=40013)"))
+
+        success = await adapter.connect()
+
+        assert success is False
+        assert adapter.has_fatal_error is True
+        assert adapter.fatal_error_code == "wecom_connect_error"
+        assert "invalid secret" in (adapter.fatal_error_message or "")
+
+    @pytest.mark.asyncio
+    async def test_connect_discovers_mcp_configs_after_websocket_success(self, monkeypatch):
+        import gateway.platforms.wecom.adapter as wecom_module
+        from gateway.platforms.wecom import WeComAdapter
+
+        class DummyClient:
+            async def aclose(self):
+                return None
+
+        monkeypatch.setattr(wecom_module, "AIOHTTP_AVAILABLE", True)
+        monkeypatch.setattr(wecom_module, "HTTPX_AVAILABLE", True)
+        monkeypatch.setattr(
+            wecom_module,
+            "httpx",
+            SimpleNamespace(AsyncClient=lambda **kwargs: DummyClient()),
+        )
+
+        adapter = WeComAdapter(
+            PlatformConfig(enabled=True, extra={"bot_id": "bot-1", "secret": "secret-1"})
+        )
+        adapter._open_connection = AsyncMock()
+
+        async def fake_send_request(cmd, body, timeout=0):
+            category = body.get("biz_type")
+            return {"errcode": 0, "body": {"url": f"https://mcp.example/{category}"}}
+
+        adapter._send_request = AsyncMock(side_effect=fake_send_request)
+
+        success = await adapter.connect()
+
+        assert success is True
+        assert adapter.get_mcp_configs() == {
+            "contact": "https://mcp.example/contact",
+            "meeting": "https://mcp.example/meeting",
+            "todo": "https://mcp.example/todo",
+            "schedule": "https://mcp.example/schedule",
+            "doc": "https://mcp.example/doc",
+            "msg": "https://mcp.example/msg",
+            "smartsheet": "https://mcp.example/smartsheet",
+        }
+        # Verify _send_request was called for each category with aibot_get_mcp_config
+        assert adapter._send_request.await_count == 7
+        calls = adapter._send_request.await_args_list
+        categories = [c.args[1]["biz_type"] for c in calls]
+        assert categories == ["contact", "meeting", "todo", "schedule", "doc", "msg", "smartsheet"]
+        assert all(c.args[0] == "aibot_get_mcp_config" for c in calls)
+
+    @pytest.mark.asyncio
+    async def test_connect_mcp_config_failure_is_non_fatal(self, monkeypatch):
+        import gateway.platforms.wecom.adapter as wecom_module
+        from gateway.platforms.wecom import WeComAdapter
+
+        class DummyClient:
+            async def aclose(self):
+                return None
+
+        monkeypatch.setattr(wecom_module, "AIOHTTP_AVAILABLE", True)
+        monkeypatch.setattr(wecom_module, "HTTPX_AVAILABLE", True)
+        monkeypatch.setattr(
+            wecom_module,
+            "httpx",
+            SimpleNamespace(AsyncClient=lambda **kwargs: DummyClient()),
+        )
+
+        adapter = WeComAdapter(
+            PlatformConfig(enabled=True, extra={"bot_id": "bot-1", "secret": "secret-1"})
+        )
+        adapter._open_connection = AsyncMock()
+
+        async def fake_send_request(cmd, body, timeout=0):
+            if body.get("biz_type") == "contact":
+                return {"errcode": 0, "body": {"url": "https://mcp.example/contact"}}
+            return {"errcode": 50001, "errmsg": "internal error"}
+
+        adapter._send_request = AsyncMock(side_effect=fake_send_request)
+
+        success = await adapter.connect()
+
+        assert success is True
+        assert adapter.get_mcp_configs() == {"contact": "https://mcp.example/contact"}
+
+    @pytest.mark.asyncio
+    async def test_connect_mcp_config_missing_url_is_skipped(self, monkeypatch):
+        import gateway.platforms.wecom.adapter as wecom_module
+        from gateway.platforms.wecom import WeComAdapter
+
+        class DummyClient:
+            async def aclose(self):
+                return None
+
+        monkeypatch.setattr(wecom_module, "AIOHTTP_AVAILABLE", True)
+        monkeypatch.setattr(wecom_module, "HTTPX_AVAILABLE", True)
+        monkeypatch.setattr(
+            wecom_module,
+            "httpx",
+            SimpleNamespace(AsyncClient=lambda **kwargs: DummyClient()),
+        )
+
+        adapter = WeComAdapter(
+            PlatformConfig(enabled=True, extra={"bot_id": "bot-1", "secret": "secret-1"})
+        )
+        adapter._open_connection = AsyncMock()
+
+        async def fake_send_request(cmd, body, timeout=0):
+            if body.get("biz_type") == "contact":
+                return {"errcode": 0, "body": {"url": "https://mcp.example/contact"}}
+            # Missing url field
+            return {"errcode": 0, "body": {}}
+
+        adapter._send_request = AsyncMock(side_effect=fake_send_request)
+
+        success = await adapter.connect()
+
+        assert success is True
+        assert adapter.get_mcp_configs() == {"contact": "https://mcp.example/contact"}
+
+    @pytest.mark.asyncio
+    async def test_connect_mcp_config_exception_is_non_fatal(self, monkeypatch):
+        import gateway.platforms.wecom.adapter as wecom_module
+        from gateway.platforms.wecom import WeComAdapter
+
+        class DummyClient:
+            async def aclose(self):
+                return None
+
+        monkeypatch.setattr(wecom_module, "AIOHTTP_AVAILABLE", True)
+        monkeypatch.setattr(wecom_module, "HTTPX_AVAILABLE", True)
+        monkeypatch.setattr(
+            wecom_module,
+            "httpx",
+            SimpleNamespace(AsyncClient=lambda **kwargs: DummyClient()),
+        )
+
+        adapter = WeComAdapter(
+            PlatformConfig(enabled=True, extra={"bot_id": "bot-1", "secret": "secret-1"})
+        )
+        adapter._open_connection = AsyncMock()
+        adapter._send_request = AsyncMock(side_effect=RuntimeError("websocket timeout"))
+
+        success = await adapter.connect()
+
+        assert success is True
+        assert adapter.get_mcp_configs() == {}
+
+
+class TestWeComReplyMode:
+    @pytest.mark.asyncio
+    async def test_send_uses_passive_reply_stream_when_reply_context_exists(self):
+        from gateway.platforms.wecom import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._reply_req_ids["msg-1"] = "req-1"
+        adapter._send_reply_request = AsyncMock(
+            return_value={"headers": {"req_id": "req-1"}, "errcode": 0}
+        )
+
+        result = await adapter.send("chat-123", "hello from reply", reply_to="msg-1")
+
+        assert result.success is True
+        adapter._send_reply_request.assert_awaited_once()
+        args = adapter._send_reply_request.await_args.args
+        assert args[0] == "req-1"
+        assert args[1]["msgtype"] == "stream"
+        assert args[1]["stream"]["finish"] is True
+        assert args[1]["stream"]["content"] == "hello from reply"
+
+    @pytest.mark.asyncio
+    async def test_send_image_file_uses_passive_reply_media_when_reply_context_exists(self):
+        from gateway.platforms.wecom import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._reply_req_ids["msg-1"] = "req-1"
+        adapter._prepare_outbound_media = AsyncMock(
+            return_value={
+                "data": b"image-bytes",
+                "content_type": "image/png",
+                "file_name": "demo.png",
+                "detected_type": "image",
+                "final_type": "image",
+                "rejected": False,
+                "reject_reason": None,
+                "downgraded": False,
+                "downgrade_note": None,
+            }
+        )
+        adapter._upload_media_bytes = AsyncMock(return_value={"media_id": "media-1", "type": "image"})
+        adapter._send_reply_request = AsyncMock(
+            return_value={"headers": {"req_id": "req-1"}, "errcode": 0}
+        )
+
+        result = await adapter.send_image_file("chat-123", "/tmp/demo.png", reply_to="msg-1")
+
+        assert result.success is True
+        adapter._send_reply_request.assert_awaited_once()
+        args = adapter._send_reply_request.await_args.args
+        assert args[0] == "req-1"
+        assert args[1] == {"msgtype": "image", "image": {"media_id": "media-1"}}
+
+    @pytest.mark.asyncio
+    async def test_send_image_file_closes_orphaned_typing_stream(self):
+        """When media is sent via reply and a pending stream exists, close it."""
+        from gateway.platforms.wecom import WeComAdapter
+        from gateway.platforms.wecom.adapter import STREAM_FINISH_CONTENT
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._reply_req_ids["msg-1"] = "req-1"
+        adapter._streams_pending_close["chat-123"] = ("req-1", "stream-orphan-1")
+        adapter._prepare_outbound_media = AsyncMock(
+            return_value={
+                "data": b"image-bytes",
+                "content_type": "image/png",
+                "file_name": "demo.png",
+                "detected_type": "image",
+                "final_type": "image",
+                "rejected": False,
+                "reject_reason": None,
+                "downgraded": False,
+                "downgrade_note": None,
+            }
+        )
+        adapter._upload_media_bytes = AsyncMock(return_value={"media_id": "media-1", "type": "image"})
+        adapter._send_reply_request = AsyncMock(
+            return_value={"headers": {"req_id": "req-1"}, "errcode": 0}
+        )
+
+        result = await adapter.send_image_file("chat-123", "/tmp/demo.png", reply_to="msg-1")
+
+        assert result.success is True
+        assert adapter._send_reply_request.await_count == 2
+        calls = adapter._send_reply_request.await_args_list
+        # First call: stream finish to close the orphan BEFORE media
+        assert calls[0].args[0] == "req-1"
+        assert calls[0].args[1]["msgtype"] == "stream"
+        assert calls[0].args[1]["stream"]["id"] == "stream-orphan-1"
+        assert calls[0].args[1]["stream"]["finish"] is True
+        assert calls[0].args[1]["stream"]["content"] == STREAM_FINISH_CONTENT
+        # Second call: image media message
+        assert calls[1].args[0] == "req-1"
+        assert calls[1].args[1]["msgtype"] == "image"
+        assert "stream-orphan-1" not in str(adapter._streams_pending_close)
+
+    @pytest.mark.asyncio
+    async def test_send_media_source_uses_finish_content_to_close_stream(self):
+        """When closing a typing stream before media, use STREAM_FINISH_CONTENT."""
+        from gateway.config import PlatformConfig
+        from gateway.platforms.wecom import WeComAdapter
+        from gateway.platforms.wecom.adapter import STREAM_FINISH_CONTENT
+
+        adapter = WeComAdapter(PlatformConfig(extra={"bot_id": "b", "secret": "s"}))
+        adapter._reply_req_ids["msg-1"] = "req-1"
+        adapter._streams_pending_close["chat-1"] = ("req-1", "stream-orphan-1")
+        adapter._prepare_outbound_media = AsyncMock(return_value={
+            "data": b"image-bytes",
+            "content_type": "image/png",
+            "file_name": "demo.png",
+            "detected_type": "image",
+            "final_type": "image",
+            "rejected": False,
+            "downgraded": False,
+            "downgrade_note": None,
+        })
+        adapter._upload_media_bytes = AsyncMock(return_value={"media_id": "media-1", "type": "image"})
+        adapter._send_media_message = AsyncMock(return_value={"headers": {"req_id": "r1"}})
+        adapter._send_reply_request = AsyncMock(return_value={"headers": {"req_id": "r1"}, "body": {"errcode": 0}})
+
+        await adapter.send_image_file("chat-1", "/tmp/demo.png", reply_to="msg-1")
+
+        # First call closes the orphan stream
+        close_call = adapter._send_reply_request.await_args_list[0]
+        assert close_call.args[1]["stream"]["content"] == STREAM_FINISH_CONTENT
+
+    @pytest.mark.asyncio
+    async def test_send_image_file_closes_active_typing_stream(self):
+        """When the stream is still in _typing_stream_state_by_chat it must be closed."""
+        from gateway.platforms.wecom import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._reply_req_ids["msg-1"] = "req-1"
+        adapter._typing_stream_state_by_chat["chat-123"] = ("req-1", "stream-active-1")
+        adapter._prepare_outbound_media = AsyncMock(
+            return_value={
+                "data": b"image-bytes",
+                "content_type": "image/png",
+                "file_name": "demo.png",
+                "detected_type": "image",
+                "final_type": "image",
+                "rejected": False,
+                "reject_reason": None,
+                "downgraded": False,
+                "downgrade_note": None,
+            }
+        )
+        adapter._upload_media_bytes = AsyncMock(return_value={"media_id": "media-1", "type": "image"})
+        adapter._send_reply_request = AsyncMock(
+            return_value={"headers": {"req_id": "req-1"}, "errcode": 0}
+        )
+
+        result = await adapter.send_image_file("chat-123", "/tmp/demo.png", reply_to="msg-1")
+
+        assert result.success is True
+        assert adapter._send_reply_request.await_count == 2
+        calls = adapter._send_reply_request.await_args_list
+        # First call closes the active typing stream
+        assert calls[0].args[1]["msgtype"] == "stream"
+        assert calls[0].args[1]["stream"]["id"] == "stream-active-1"
+        assert calls[0].args[1]["stream"]["finish"] is True
+        assert "stream-active-1" not in str(adapter._typing_stream_state_by_chat)
+        # Second call sends the image
+        assert calls[1].args[1]["msgtype"] == "image"
+
+    @pytest.mark.asyncio
+    async def test_send_image_file_leaves_unmatched_pending_stream(self):
+        """Pending stream for a different req_id should not be touched."""
+        from gateway.platforms.wecom import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._reply_req_ids["msg-1"] = "req-1"
+        adapter._streams_pending_close["chat-123"] = ("req-OTHER", "stream-other-1")
+        adapter._prepare_outbound_media = AsyncMock(
+            return_value={
+                "data": b"image-bytes",
+                "content_type": "image/png",
+                "file_name": "demo.png",
+                "detected_type": "image",
+                "final_type": "image",
+                "rejected": False,
+                "reject_reason": None,
+                "downgraded": False,
+                "downgrade_note": None,
+            }
+        )
+        adapter._upload_media_bytes = AsyncMock(return_value={"media_id": "media-1", "type": "image"})
+        adapter._send_reply_request = AsyncMock(
+            return_value={"headers": {"req_id": "req-1"}, "errcode": 0}
+        )
+
+        result = await adapter.send_image_file("chat-123", "/tmp/demo.png", reply_to="msg-1")
+
+        assert result.success is True
+        adapter._send_reply_request.assert_awaited_once()
+        # Unmatched pending stream should be left intact
+        assert adapter._streams_pending_close.get("chat-123") == ("req-OTHER", "stream-other-1")
+
+
+class TestExtractText:
+    def test_extracts_plain_text(self):
+        from gateway.platforms.wecom import WeComAdapter
+
+        body = {
+            "msgtype": "text",
+            "text": {"content": "  hello world  "},
+        }
+        text, reply_text = WeComAdapter._extract_text(body)
+        assert text == "hello world"
+        assert reply_text is None
+
+    def test_extracts_mixed_text(self):
+        from gateway.platforms.wecom import WeComAdapter
+
+        body = {
+            "msgtype": "mixed",
+            "mixed": {
+                "msg_item": [
+                    {"msgtype": "text", "text": {"content": "part1"}},
+                    {"msgtype": "image", "image": {"url": "https://example.com/x.png"}},
+                    {"msgtype": "text", "text": {"content": "part2"}},
+                ]
+            },
+        }
+        text, _reply_text = WeComAdapter._extract_text(body)
+        assert text == "part1\npart2"
+
+    def test_extracts_voice_and_quote(self):
+        from gateway.platforms.wecom import WeComAdapter
+
+        body = {
+            "msgtype": "voice",
+            "voice": {"content": "spoken text"},
+            "quote": {"msgtype": "text", "text": {"content": "quoted"}},
+        }
+        text, reply_text = WeComAdapter._extract_text(body)
+        assert text == "spoken text"
+        assert reply_text == "quoted"
+
+
+class TestCallbackDispatch:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("cmd", ["aibot_msg_callback", "aibot_callback"])
+    async def test_dispatch_accepts_new_and_legacy_callback_cmds(self, cmd):
+        from gateway.platforms.wecom import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._on_message = AsyncMock()
+
+        await adapter._dispatch_payload({"cmd": cmd, "headers": {"req_id": "req-1"}, "body": {}})
+
+        adapter._on_message.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_routes_event_callback(self):
+        from gateway.platforms.wecom import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._on_message = AsyncMock()
+
+        await adapter._dispatch_payload(
+            {"cmd": "aibot_event_callback", "headers": {"req_id": "req-event"}, "body": {"msgtype": "event"}}
+        )
+
+        adapter._on_message.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_event_callback_does_not_store_reply_req_id(self):
+        from gateway.platforms.wecom import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter.handle_message = AsyncMock()
+
+        payload = {
+            "cmd": "aibot_event_callback",
+            "headers": {"req_id": "req-event"},
+            "body": {
+                "msgid": "msg-event",
+                "msgtype": "event",
+                "chatid": "group-1",
+                "chattype": "group",
+                "from": {"userid": "user-1"},
+            },
+        }
+
+        await adapter._on_message(payload)
+
+        assert adapter._reply_req_ids.get("msg-event") is None
+
+
+class TestPolicyHelpers:
+    def test_dm_allowlist(self):
+        from gateway.platforms.wecom import WeComAdapter
+
+        adapter = WeComAdapter(
+            PlatformConfig(enabled=True, extra={"dm_policy": "allowlist", "allow_from": ["user-1"]})
+        )
+        allowed, _ = adapter._is_dm_allowed("user-1")
+        assert allowed is True
+        allowed, _ = adapter._is_dm_allowed("user-2")
+        assert allowed is False
+
+    def test_group_allowlist_and_per_group_sender_allowlist(self):
+        from gateway.platforms.wecom import WeComAdapter
+
+        adapter = WeComAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={
+                    "group_policy": "allowlist",
+                    "group_allow_from": ["group-1"],
+                    "groups": {"group-1": {"allow_from": ["user-1"]}},
+                },
+            )
+        )
+
+
+class TestMediaUpload:
+    @pytest.mark.asyncio
+    async def test_upload_media_bytes_uses_sdk_sequence(self, monkeypatch):
+        import gateway.platforms.wecom.adapter as wecom_module
+        from gateway.platforms.wecom import (
+            APP_CMD_UPLOAD_MEDIA_CHUNK,
+            APP_CMD_UPLOAD_MEDIA_FINISH,
+            APP_CMD_UPLOAD_MEDIA_INIT,
+            WeComAdapter,
+        )
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        calls = []
+
+        async def fake_send_request(cmd, body, timeout=0):
+            calls.append((cmd, body))
+            if cmd == APP_CMD_UPLOAD_MEDIA_INIT:
+                return {"errcode": 0, "body": {"upload_id": "upload-1"}}
+            if cmd == APP_CMD_UPLOAD_MEDIA_CHUNK:
+                return {"errcode": 0}
+            if cmd == APP_CMD_UPLOAD_MEDIA_FINISH:
+                return {
+                    "errcode": 0,
+                    "body": {
+                        "media_id": "media-1",
+                        "type": "file",
+                        "created_at": "2026-03-18T00:00:00Z",
+                    },
+                }
+            raise AssertionError(f"unexpected cmd {cmd}")
+
+        monkeypatch.setattr(wecom_module, "UPLOAD_CHUNK_SIZE", 4)
+        adapter._send_request = fake_send_request
+
+        result = await adapter._upload_media_bytes(b"abcdefghij", "file", "demo.bin")
+
+        assert result["media_id"] == "media-1"
+        assert [cmd for cmd, _body in calls] == [
+            APP_CMD_UPLOAD_MEDIA_INIT,
+            APP_CMD_UPLOAD_MEDIA_CHUNK,
+            APP_CMD_UPLOAD_MEDIA_CHUNK,
+            APP_CMD_UPLOAD_MEDIA_CHUNK,
+            APP_CMD_UPLOAD_MEDIA_FINISH,
+        ]
+        assert calls[1][1]["chunk_index"] == 0
+        assert calls[2][1]["chunk_index"] == 1
+        assert calls[3][1]["chunk_index"] == 2
+
+    @pytest.mark.asyncio
+    @patch("tools.url_safety.is_safe_url", return_value=True)
+    async def test_download_remote_bytes_rejects_large_content_length(self, _mock_safe):
+        from gateway.platforms.wecom import WeComAdapter
+
+        class FakeResponse:
+            headers = {"content-length": "10"}
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return None
+
+            def raise_for_status(self):
+                return None
+
+            async def aiter_bytes(self):
+                yield b"abc"
+
+        class FakeClient:
+            def stream(self, method, url, headers=None):
+                return FakeResponse()
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._http_client = FakeClient()
+
+        with pytest.raises(ValueError, match="exceeds WeCom limit"):
+            await adapter._download_remote_bytes("https://example.com/file.bin", max_bytes=4)
+
+    @pytest.mark.asyncio
+    async def test_cache_media_decrypts_url_payload_before_writing(self):
+        from gateway.platforms.wecom import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        plaintext = b"secret document bytes"
+        key = os.urandom(32)
+        pad_len = 32 - (len(plaintext) % 32)
+        padded = plaintext + bytes([pad_len]) * pad_len
+
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+        encryptor = Cipher(algorithms.AES(key), modes.CBC(key[:16])).encryptor()
+        encrypted = encryptor.update(padded) + encryptor.finalize()
+        adapter._download_remote_bytes = AsyncMock(
+            return_value=(
+                encrypted,
+                {
+                    "content-type": "application/octet-stream",
+                    "content-disposition": 'attachment; filename="secret.bin"',
+                },
+            )
+        )
+
+        cached = await adapter._cache_media(
+            "file",
+            {
+                "url": "https://example.com/secret.bin",
+                "aeskey": base64.b64encode(key).decode("ascii"),
+            },
+        )
+
+        assert cached is not None
+        cached_path, content_type = cached
+        assert Path(cached_path).read_bytes() == plaintext
+        assert content_type == "application/octet-stream"
+
+    @pytest.mark.asyncio
+    async def test_cache_media_falls_back_to_raw_bytes_on_decrypt_failure(self):
+        from gateway.platforms.wecom import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        png_header = b"\x89PNG\r\n\x1a\n"
+        adapter._download_remote_bytes = AsyncMock(
+            return_value=(
+                png_header,
+                {"content-type": "image/png"},
+            )
+        )
+
+        with patch.object(adapter, "_decrypt_file_bytes", side_effect=ValueError("Incorrect padding")):
+            cached = await adapter._cache_media(
+                "image",
+                {
+                    "url": "https://example.com/img.png",
+                    "aeskey": "invalid-key-for-fallback-test",
+                },
+            )
+
+        assert cached is not None
+        cached_path, content_type = cached
+        assert Path(cached_path).read_bytes() == png_header
+        assert content_type == "image/png"
+
+    @pytest.mark.asyncio
+    async def test_cache_media_returns_none_when_decrypt_fails_and_data_is_invalid(self):
+        from gateway.platforms.wecom import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._download_remote_bytes = AsyncMock(
+            return_value=(
+                b"not an image",
+                {"content-type": "application/octet-stream"},
+            )
+        )
+
+        with patch.object(adapter, "_decrypt_file_bytes", side_effect=ValueError("Incorrect padding")):
+            cached = await adapter._cache_media(
+                "image",
+                {
+                    "url": "https://example.com/corrupt.bin",
+                    "aeskey": "invalid-key-for-fallback-test",
+                },
+            )
+
+        assert cached is None
+
+
+class TestSend:
+    @pytest.mark.asyncio
+    async def test_send_uses_proactive_payload(self):
+        from gateway.platforms.wecom import APP_CMD_SEND, WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._send_request = AsyncMock(return_value={"headers": {"req_id": "req-1"}, "errcode": 0})
+
+        result = await adapter.send("chat-123", "Hello WeCom")
+
+        assert result.success is True
+        adapter._send_request.assert_awaited_once_with(
+            APP_CMD_SEND,
+            {
+                "chatid": "chat-123",
+                "msgtype": "markdown",
+                "markdown": {"content": "Hello WeCom"},
+            },
+        )
+
+    @pytest.mark.asyncio
+    async def test_send_reports_wecom_errors(self):
+        from gateway.platforms.wecom import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._send_request = AsyncMock(return_value={"errcode": 40001, "errmsg": "bad request"})
+
+        result = await adapter.send("chat-123", "Hello WeCom")
+
+        assert result.success is False
+        assert "40001" in (result.error or "")
+
+    @pytest.mark.asyncio
+    async def test_send_falls_back_to_proactive_on_846608(self):
+        from gateway.platforms.wecom import APP_CMD_SEND, StreamExpiredError, WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._reply_req_ids["msg-1"] = "req-1"
+        adapter._send_reply_stream = AsyncMock(
+            side_effect=StreamExpiredError("send reply stream failed: errcode=846608")
+        )
+        adapter._send_request = AsyncMock(return_value={"headers": {"req_id": "req-2"}, "errcode": 0})
+
+        result = await adapter.send("chat-123", "stream expired", reply_to="msg-1")
+
+        assert result.success is True
+        adapter._send_reply_stream.assert_awaited_once()
+        adapter._send_request.assert_awaited_once_with(
+            APP_CMD_SEND,
+            {
+                "chatid": "chat-123",
+                "msgtype": "markdown",
+                "markdown": {"content": "stream expired"},
+            },
+        )
+
+    @pytest.mark.asyncio
+    async def test_send_falls_back_to_proactive_on_stream_expired_error(self):
+        from gateway.platforms.wecom import APP_CMD_SEND, StreamExpiredError, WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._reply_req_ids["msg-1"] = "req-1"
+        adapter._send_reply_stream = AsyncMock(
+            side_effect=StreamExpiredError("send reply stream failed: errcode=846608")
+        )
+        adapter._send_request = AsyncMock(return_value={"headers": {"req_id": "req-2"}, "errcode": 0})
+
+        result = await adapter.send("chat-123", "stream expired", reply_to="msg-1")
+
+        assert result.success is True
+        adapter._send_reply_stream.assert_awaited_once()
+        adapter._send_request.assert_awaited_once_with(
+            APP_CMD_SEND,
+            {
+                "chatid": "chat-123",
+                "msgtype": "markdown",
+                "markdown": {"content": "stream expired"},
+            },
+        )
+
+    @pytest.mark.asyncio
+    async def test_send_image_falls_back_to_text_for_remote_url(self):
+        from gateway.platforms.wecom import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._send_media_source = AsyncMock(return_value=SendResult(success=False, error="upload failed"))
+        adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="msg-1"))
+
+        result = await adapter.send_image("chat-123", "https://example.com/demo.png", caption="demo")
+
+        assert result.success is True
+        adapter.send.assert_awaited_once_with(chat_id="chat-123", content="demo\nhttps://example.com/demo.png", reply_to=None)
+
+    @pytest.mark.asyncio
+    async def test_send_voice_sends_caption_and_downgrade_note(self):
+        from gateway.platforms.wecom import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._prepare_outbound_media = AsyncMock(
+            return_value={
+                "data": b"voice-bytes",
+                "content_type": "audio/mpeg",
+                "file_name": "voice.mp3",
+                "detected_type": "voice",
+                "final_type": "file",
+                "rejected": False,
+                "reject_reason": None,
+                "downgraded": True,
+                "downgrade_note": "语音格式 audio/mpeg 不支持，企微仅支持 AMR 格式，已转为文件格式发送",
+            }
+        )
+        adapter._upload_media_bytes = AsyncMock(return_value={"media_id": "media-1", "type": "file"})
+        adapter._send_media_message = AsyncMock(return_value={"headers": {"req_id": "req-media"}, "errcode": 0})
+        adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="msg-1"))
+
+        result = await adapter.send_voice("chat-123", "/tmp/voice.mp3", caption="listen")
+
+        assert result.success is True
+        adapter._send_media_message.assert_awaited_once_with("chat-123", "file", "media-1")
+        assert adapter.send.await_count == 2
+        adapter.send.assert_any_await(chat_id="chat-123", content="listen", reply_to=None)
+        adapter.send.assert_any_await(
+            chat_id="chat-123",
+            content="ℹ️ 语音格式 audio/mpeg 不支持，企微仅支持 AMR 格式，已转为文件格式发送",
+            reply_to=None,
+        )
+
+
+class TestInboundMessages:
+    @pytest.mark.asyncio
+    async def test_on_message_builds_event(self):
+        from gateway.platforms.wecom import WeComAdapter
+
+        from gateway.platforms.helpers import TextBatchAggregator
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter.handle_message = AsyncMock()
+        adapter._text_batcher = TextBatchAggregator(handler=adapter.handle_message, batch_delay=0)
+        adapter._extract_media = AsyncMock(return_value=(["/tmp/test.png"], ["image/png"]))
+
+        payload = {
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": "req-1"},
+            "body": {
+                "msgid": "msg-1",
+                "chatid": "group-1",
+                "chattype": "group",
+                "from": {"userid": "user-1"},
+                "msgtype": "text",
+                "text": {"content": "hello"},
+            },
+        }
+
+        await adapter._on_message(payload)
+        await adapter._chat_queue.drain("group-1")
+
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.await_args.args[0]
+        assert event.text == "hello"
+        assert event.source.chat_id == "group-1"
+        assert event.source.user_id == "user-1"
+        assert event.media_urls == ["/tmp/test.png"]
+        assert event.media_types == ["image/png"]
+
+    @pytest.mark.asyncio
+    async def test_on_message_preserves_quote_context(self):
+        from gateway.platforms.helpers import TextBatchAggregator
+        from gateway.platforms.wecom import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter.handle_message = AsyncMock()
+        adapter._text_batcher = TextBatchAggregator(handler=adapter.handle_message, batch_delay=0)
+        adapter._extract_media = AsyncMock(return_value=([], []))
+
+        payload = {
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": "req-1"},
+            "body": {
+                "msgid": "msg-1",
+                "chatid": "group-1",
+                "chattype": "group",
+                "from": {"userid": "user-1"},
+                "msgtype": "text",
+                "text": {"content": "follow up"},
+                "quote": {"msgtype": "text", "text": {"content": "quoted message"}},
+            },
+        }
+
+        await adapter._on_message(payload)
+        await adapter._chat_queue.drain("group-1")
+
+        event = adapter.handle_message.await_args.args[0]
+        assert event.reply_to_text == "quoted message"
+        assert event.reply_to_message_id == "quote:msg-1"
+
+    @pytest.mark.asyncio
+    async def test_on_message_respects_group_policy(self):
+        from gateway.platforms.wecom import WeComAdapter
+
+        adapter = WeComAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={"group_policy": "allowlist", "group_allow_from": ["group-allowed"]},
+            )
+        )
+        adapter.handle_message = AsyncMock()
+        adapter._extract_media = AsyncMock(return_value=([], []))
+
+        payload = {
+            "cmd": "aibot_callback",
+            "headers": {"req_id": "req-1"},
+            "body": {
+                "msgid": "msg-1",
+                "chatid": "group-blocked",
+                "chattype": "group",
+                "from": {"userid": "user-1"},
+                "msgtype": "text",
+                "text": {"content": "hello"},
+            },
+        }
+
+        await adapter._on_message(payload)
+        adapter.handle_message.assert_not_awaited()
+
+
+class TestCommandAuthIntegration:
+    @pytest.mark.asyncio
+    async def test_on_message_blocks_unauthorized_command(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.wecom import WeComAdapter
+
+        config = PlatformConfig(extra={
+            "bot_id": "b",
+            "secret": "s",
+            "dm_policy": "allowlist",
+            "allow_from": ["alice"],
+        })
+        adapter = WeComAdapter(config)
+        adapter.handle_message = AsyncMock()
+        adapter._send_request = AsyncMock(return_value={"headers": {"req_id": "r1"}, "body": {"errcode": 0}})
+
+        payload = {
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": "r1"},
+            "body": {
+                "msgid": "m1",
+                "msgtype": "text",
+                "text": {"content": "/reset"},
+                "from": {"userid": "bob"},
+                "chatid": "c1",
+            },
+        }
+        await adapter._on_message(payload)
+        adapter.handle_message.assert_not_awaited()
+
+
+
+class TestMediaPreparerIntegration:
+    @pytest.mark.asyncio
+    async def test_send_image_file_uses_media_preparer(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.wecom import WeComAdapter
+
+        config = PlatformConfig(extra={"bot_id": "b", "secret": "s"})
+        adapter = WeComAdapter(config)
+
+        with patch("gateway.platforms.wecom.adapter.MediaPreparer") as mock_prep_cls:
+            mock_prep = mock_prep_cls.return_value
+            mock_prep.prepare = AsyncMock(return_value={
+                "data": b"fakepng",
+                "content_type": "image/png",
+                "file_name": "img.png",
+                "detected_type": "image",
+                "final_type": "image",
+                "rejected": False,
+                "downgraded": False,
+                "downgrade_note": None,
+            })
+            with patch.object(adapter, "_upload_media_bytes", new_callable=AsyncMock) as mock_upload:
+                mock_upload.return_value = {"media_id": "mid-1", "type": "image"}
+                with patch.object(adapter, "_send_media_message", new_callable=AsyncMock) as mock_send_media:
+                    mock_send_media.return_value = {"headers": {"req_id": "r1"}}
+                    result = await adapter.send_image_file("chat-1", "/tmp/img.png")
+                    assert result.success is True
+                    mock_prep.prepare.assert_awaited_once_with("/tmp/img.png", file_name=None)
+
+
+class TestPlatformEnum:
+    def test_wecom_in_platform_enum(self):
+        assert Platform.WECOM.value == "wecom"
+
+
+@pytest.mark.asyncio
+async def test_dm_pairing_mode_blocks_and_sends_prompt():
+    from gateway.config import PlatformConfig
+    from gateway.platforms.wecom import WeComAdapter
+
+    config = PlatformConfig(extra={
+        "bot_id": "b",
+        "secret": "s",
+        "dm_policy": "pairing",
+        "allow_from": [],
+    })
+    adapter = WeComAdapter(config)
+    adapter.handle_message = AsyncMock()
+    adapter._send_request = AsyncMock(return_value={"headers": {"req_id": "r1"}, "body": {"errcode": 0}})
+
+    payload = {
+        "cmd": "aibot_msg_callback",
+        "headers": {"req_id": "r1"},
+        "body": {
+            "msgid": "m1",
+            "msgtype": "text",
+            "text": {"content": "hello"},
+            "from": {"userid": "bob"},
+            "chatid": "c1",
+        },
+    }
+    await adapter._on_message(payload)
+    adapter.handle_message.assert_not_awaited()
+    adapter._send_request.assert_awaited_once()
+    call_args = adapter._send_request.await_args.args[1]
+    assert call_args["markdown"]["content"] == "您尚未完成配对，请联系管理员进行配对后重试。"
+
+
+@pytest.mark.asyncio
+async def test_extract_media_caches_video_locally():
+    """Video URLs must go through _cache_media, not added raw."""
+    from gateway.config import PlatformConfig
+    from gateway.platforms.wecom import WeComAdapter
+
+    config = PlatformConfig(extra={"bot_id": "b", "secret": "s"})
+    adapter = WeComAdapter(config)
+    adapter._cache_media = AsyncMock(return_value=("/cached/video.mp4", "video/mp4"))
+
+    with patch("gateway.platforms.wecom.video.extract_first_video_frame", return_value="/tmp/frame.jpg"):
+        body = {
+            "msgtype": "video",
+            "video": {"url": "https://wecom.example.com/video.mp4", "sdkfileid": "v1", "md5sum": "abc"},
+        }
+        urls, types = await adapter._extract_media(body)
+
+    # Should be cached locally, not the raw WeCom URL
+    assert "/cached/video.mp4" in urls
+    assert "video/mp4" in types
+    # Raw URL must NOT appear in results
+    assert "https://wecom.example.com/video.mp4" not in urls
+    adapter._cache_media.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_extract_media_extracts_video_frame_from_cached_path():
+    """First-frame extraction must use the cached local path, not a remote URL."""
+    from gateway.config import PlatformConfig
+    from gateway.platforms.wecom import WeComAdapter
+
+    config = PlatformConfig(extra={"bot_id": "b", "secret": "s"})
+    adapter = WeComAdapter(config)
+    adapter._cache_media = AsyncMock(return_value=("/cached/video.mp4", "video/mp4"))
+
+    with patch("gateway.platforms.wecom.video.extract_first_video_frame", return_value="/tmp/frame.jpg") as mock_extract:
+        body = {
+            "msgtype": "video",
+            "video": {"url": "https://wecom.example.com/video.mp4", "sdkfileid": "v1", "md5sum": "abc"},
+        }
+        urls, types = await adapter._extract_media(body)
+        mock_extract.assert_called_once_with("/cached/video.mp4")
+        assert "/tmp/frame.jpg" in urls
+        assert "image/jpeg" in types
+        assert "/cached/video.mp4" in urls
+        assert "video/mp4" in types
+
+
+@pytest.mark.asyncio
+async def test_extract_media_caches_quote_video_locally():
+    """Quoted video URLs must go through _cache_media and extract a frame."""
+    from gateway.config import PlatformConfig
+    from gateway.platforms.wecom import WeComAdapter
+
+    config = PlatformConfig(extra={"bot_id": "b", "secret": "s"})
+    adapter = WeComAdapter(config)
+    adapter._cache_media = AsyncMock(return_value=("/cached/quote_video.mp4", "video/mp4"))
+
+    with patch("gateway.platforms.wecom.video.extract_first_video_frame", return_value="/tmp/quote_frame.jpg") as mock_extract:
+        body = {
+            "msgtype": "text",
+            "text": {"content": "check this video"},
+            "quote": {
+                "msgtype": "video",
+                "video": {"url": "https://wecom.example.com/quote.mp4", "sdkfileid": "qv1", "md5sum": "def"},
+            },
+        }
+        urls, types = await adapter._extract_media(body)
+
+    assert "/cached/quote_video.mp4" in urls
+    assert "video/mp4" in types
+    mock_extract.assert_called_once_with("/cached/quote_video.mp4")
+    assert "/tmp/quote_frame.jpg" in urls
+    assert "image/jpeg" in types
+
+
+@pytest.mark.asyncio
+async def test_extract_media_quote_video_without_url_skips_gracefully():
+    """Quoted video without a URL should not crash or add empty refs."""
+    from gateway.config import PlatformConfig
+    from gateway.platforms.wecom import WeComAdapter
+
+    config = PlatformConfig(extra={"bot_id": "b", "secret": "s"})
+    adapter = WeComAdapter(config)
+    adapter._cache_media = AsyncMock(return_value=None)
+
+    body = {
+        "msgtype": "text",
+        "text": {"content": "check this video"},
+        "quote": {
+            "msgtype": "video",
+            "video": {"sdkfileid": "qv1", "md5sum": "def"},
+        },
+    }
+    urls, types = await adapter._extract_media(body)
+
+    assert urls == []
+    assert types == []
+    adapter._cache_media.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cache_media_raises_oversize_error():
+    """_cache_media must raise MediaOversizeError when download exceeds limit."""
+    from gateway.config import PlatformConfig
+    from gateway.platforms.wecom import MediaOversizeError, WeComAdapter
+
+    config = PlatformConfig(extra={"bot_id": "b", "secret": "s"})
+    adapter = WeComAdapter(config)
+    adapter._download_remote_bytes = AsyncMock(
+        side_effect=ValueError("Remote media exceeds WeCom limit: 26214400 bytes > 20971520 bytes")
+    )
+
+    with pytest.raises(MediaOversizeError) as exc_info:
+        await adapter._cache_media("file", {"url": "https://wecom.example.com/huge.zip"})
+    assert "huge.zip" in str(exc_info.value)
+    assert "20971520" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_on_message_sends_oversize_notice():
+    """When inbound media exceeds size limit, a user-facing notice must be sent."""
+    from gateway.config import PlatformConfig
+    from gateway.platforms.wecom import APP_CMD_SEND, MediaOversizeError, WeComAdapter
+
+    config = PlatformConfig(extra={"bot_id": "b", "secret": "s"})
+    adapter = WeComAdapter(config)
+    adapter._dedup.is_duplicate = lambda _msg_id: False
+    adapter._is_dm_allowed = lambda _sender: (True, "")
+    adapter._download_remote_bytes = AsyncMock(
+        side_effect=MediaOversizeError(
+            filename="huge.zip", size_bytes=26214400, max_bytes=20971520
+        )
+    )
+    adapter._send_request = AsyncMock(return_value={"headers": {"req_id": "r1"}, "errcode": 0})
+
+    payload = {
+        "cmd": "aibot_msg_callback",
+        "headers": {"req_id": "r1"},
+        "body": {
+            "msgid": "m1",
+            "msgtype": "file",
+            "file": {"url": "https://wecom.example.com/huge.zip", "name": "huge.zip"},
+            "from": {"userid": "bob"},
+            "chatid": "c1",
+        },
+    }
+    await adapter._on_message(payload)
+
+    # Should have sent an oversize notice
+    calls = adapter._send_request.await_args_list
+    assert any(
+        call.args[0] == APP_CMD_SEND and "文件过大" in call.args[1].get("markdown", {}).get("content", "")
+        for call in calls
+    )
+
+
+@pytest.mark.asyncio
+async def test_derive_message_type_returns_video_for_video_message():
+    from gateway.platforms.wecom import WeComAdapter, MessageType
+
+    body = {"msgtype": "video", "video": {"url": "https://example.com/v.mp4"}}
+    assert WeComAdapter._derive_message_type(body, "", ["video/mp4"]) == MessageType.VIDEO
+
+
+@pytest.mark.asyncio
+async def test_derive_message_type_returns_video_by_msgtype_even_without_media_types():
+    from gateway.platforms.wecom import WeComAdapter, MessageType
+
+    body = {"msgtype": "video"}
+    assert WeComAdapter._derive_message_type(body, "", []) == MessageType.VIDEO
+
+
+@pytest.mark.asyncio
+async def test_on_message_dispatches_auth_change_event():
+    """auth_change_event must be recognized and dispatched as a MessageEvent."""
+    from gateway.config import PlatformConfig
+    from gateway.platforms.base import MessageType
+    from gateway.platforms.wecom import WeComAdapter
+
+    config = PlatformConfig(extra={"bot_id": "b", "secret": "s"})
+    adapter = WeComAdapter(config)
+    adapter._dedup.is_duplicate = lambda _msg_id: False
+    adapter._is_dm_allowed = lambda _sender: (True, "")
+    adapter._text_batcher.is_enabled = lambda: False
+    adapter.handle_message = AsyncMock()
+
+    payload = {
+        "cmd": "aibot_msg_callback",
+        "headers": {"req_id": "r1"},
+        "body": {
+            "msgid": "m1",
+            "msgtype": "event",
+            "event": "auth_change_event",
+            "auth_list": [2],
+            "chatid": "c1",
+            "from": {"userid": "bob"},
+        },
+    }
+    await adapter._on_message(payload)
+    await adapter._chat_queue.drain("c1")
+
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.message_type == MessageType.TEXT
+    assert "permission" in event.text.lower() or "read content" in event.text.lower()
+
+
+@pytest.mark.asyncio
+async def test_on_message_auth_change_event_empty_auth_list():
+    """auth_change_event with empty auth_list should dispatch a generic message."""
+    from gateway.config import PlatformConfig
+    from gateway.platforms.base import MessageType
+    from gateway.platforms.wecom import WeComAdapter
+
+    config = PlatformConfig(extra={"bot_id": "b", "secret": "s"})
+    adapter = WeComAdapter(config)
+    adapter._dedup.is_duplicate = lambda _msg_id: False
+    adapter._is_dm_allowed = lambda _sender: (True, "")
+    adapter._text_batcher.is_enabled = lambda: False
+    adapter.handle_message = AsyncMock()
+
+    payload = {
+        "cmd": "aibot_msg_callback",
+        "headers": {"req_id": "r1"},
+        "body": {
+            "msgid": "m1",
+            "msgtype": "event",
+            "event": "auth_change_event",
+            "chatid": "c1",
+            "from": {"userid": "bob"},
+        },
+    }
+    await adapter._on_message(payload)
+    await adapter._chat_queue.drain("c1")
+
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.message_type == MessageType.TEXT
+
+
+def test_build_auth_change_text_with_string_values():
+    """WeCom may send auth_list values as strings — coerce to int for comparison."""
+    from gateway.platforms.wecom import WeComAdapter
+
+    body = {"auth_list": ["1", "2"]}
+    result = WeComAdapter._build_auth_change_text(body)
+    assert "create/edit" in result
+    assert "read content" in result
+
+
+@pytest.mark.asyncio
+async def test_template_card_button_click_dispatched_as_message():
+    """Template card button clicks must be routed to the agent as messages."""
+    from gateway.config import PlatformConfig
+    from gateway.platforms.base import MessageType
+    from gateway.platforms.wecom import WeComAdapter
+
+    config = PlatformConfig(extra={"bot_id": "b", "secret": "s"})
+    adapter = WeComAdapter(config)
+    adapter._dedup.is_duplicate = lambda _msg_id: False
+    adapter._is_dm_allowed = lambda _sender: (True, "")
+    adapter._text_batcher.is_enabled = lambda: False
+    adapter.handle_message = AsyncMock()
+
+    payload = {
+        "cmd": "aibot_msg_callback",
+        "headers": {"req_id": "r1"},
+        "body": {
+            "msgid": "m1",
+            "msgtype": "event",
+            "event": {
+                "event": "template_card_event",
+                "response_code": "approve_btn",
+                "button_replace_name": "Approve",
+            },
+            "chatid": "c1",
+            "from": {"userid": "bob"},
+        },
+    }
+    await adapter._on_message(payload)
+    await adapter._chat_queue.drain("c1")
+
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.message_type == MessageType.TEXT
+    assert "template card" in event.text.lower()
+    assert "Approve" in event.text
+
+
+@pytest.mark.asyncio
+async def test_template_card_poll_vote_dispatched_as_message():
+    """Template card poll votes must include selected options in the message."""
+    from gateway.config import PlatformConfig
+    from gateway.platforms.base import MessageType
+    from gateway.platforms.wecom import WeComAdapter
+
+    config = PlatformConfig(extra={"bot_id": "b", "secret": "s"})
+    adapter = WeComAdapter(config)
+    adapter._dedup.is_duplicate = lambda _msg_id: False
+    adapter._is_dm_allowed = lambda _sender: (True, "")
+    adapter._text_batcher.is_enabled = lambda: False
+    adapter.handle_message = AsyncMock()
+
+    payload = {
+        "cmd": "aibot_msg_callback",
+        "headers": {"req_id": "r1"},
+        "body": {
+            "msgid": "m1",
+            "msgtype": "event",
+            "event": {
+                "event": "template_card_event",
+                "response_code": "vote_option",
+                "selected_options": [{"key": "opt_1", "value": "Yes"}, {"key": "opt_2", "value": "Maybe"}],
+            },
+            "chatid": "c1",
+            "from": {"userid": "bob"},
+        },
+    }
+    await adapter._on_message(payload)
+    await adapter._chat_queue.drain("c1")
+
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.message_type == MessageType.TEXT
+    assert "opt_1" in event.text
+    assert "opt_2" in event.text
+
+
+@pytest.mark.asyncio
+async def test_template_card_event_enriches_with_cached_card_context():
+    """Template card events should include context from the cached card."""
+    from gateway.config import PlatformConfig
+    from gateway.platforms.base import MessageType
+    from gateway.platforms.wecom import WeComAdapter
+    from gateway.platforms.wecom.template_cards import save_template_card_to_cache
+
+    config = PlatformConfig(extra={"bot_id": "b", "secret": "s"})
+    adapter = WeComAdapter(config)
+    adapter._dedup.is_duplicate = lambda _msg_id: False
+    adapter._is_dm_allowed = lambda _sender: (True, "")
+    adapter._text_batcher.is_enabled = lambda: False
+    adapter.handle_message = AsyncMock()
+
+    # Pre-populate cache with a card
+    account_id = adapter._accounts[0].account_id if adapter._accounts else "default"
+    save_template_card_to_cache(account_id, {
+        "task_id": "approve_card_123",
+        "card_type": "button_interaction",
+        "source": {"desc": "Approval Request"},
+    })
+
+    payload = {
+        "cmd": "aibot_msg_callback",
+        "headers": {"req_id": "r1"},
+        "body": {
+            "msgid": "m1",
+            "msgtype": "event",
+            "event": {
+                "event": "template_card_event",
+                "response_code": "approve_card_123",
+                "button_replace_name": "Approve",
+            },
+            "chatid": "c1",
+            "from": {"userid": "bob"},
+        },
+    }
+    await adapter._on_message(payload)
+    await adapter._chat_queue.drain("c1")
+
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.message_type == MessageType.TEXT
+    # The text should include card context from cache
+    assert "Approval Request" in event.text or "button_interaction" in event.text
+
+
+@pytest.mark.asyncio
+async def test_template_card_event_updates_card_ui():
+    """After receiving a template card event, the adapter should call updateTemplateCard."""
+    from gateway.config import PlatformConfig
+    from gateway.platforms.wecom import WeComAdapter
+    from gateway.platforms.wecom.template_cards import save_template_card_to_cache
+
+    config = PlatformConfig(extra={"bot_id": "b", "secret": "s"})
+    adapter = WeComAdapter(config)
+    adapter._dedup.is_duplicate = lambda _msg_id: False
+    adapter._is_dm_allowed = lambda _sender: (True, "")
+    adapter._text_batcher.is_enabled = lambda: False
+    adapter.handle_message = AsyncMock()
+    adapter._send_request = AsyncMock(return_value={"body": {"errcode": 0}})
+
+    account_id = adapter._accounts[0].account_id if adapter._accounts else "default"
+    save_template_card_to_cache(account_id, {
+        "task_id": "task-abc",
+        "card_type": "vote_interaction",
+        "source": {"desc": "Poll"},
+        "checkbox": {
+            "question_key": "q1",
+            "mode": 1,
+            "option_list": [
+                {"id": "yes", "text": "Yes"},
+                {"id": "no", "text": "No"},
+            ]
+        }
+    })
+
+    payload = {
+        "cmd": "aibot_msg_callback",
+        "headers": {"req_id": "r1"},
+        "body": {
+            "msgid": "m1",
+            "msgtype": "event",
+            "event": {
+                "event": "template_card_event",
+                "response_code": "task-abc",
+                "selected_options": [{"key": "yes", "value": "Yes"}],
+                "button_replace_name": "",
+            },
+            "chatid": "c1",
+            "from": {"userid": "bob"},
+        },
+    }
+    await adapter._on_message(payload)
+    await adapter._chat_queue.drain("c1")
+
+    adapter.handle_message.assert_awaited_once()
+    adapter._send_request.assert_awaited()
+    call_args = adapter._send_request.call_args
+    assert call_args[0][0] == "aibot_update_template_card"
+
+    card = call_args[0][1]["template_card"]
+    assert card["checkbox"]["option_list"][0].get("is_checked") is True
+    assert card["checkbox"]["option_list"][1].get("is_checked") is False
+
+
+@pytest.mark.asyncio
+async def test_dispatch_payload_replies_to_enter_check_update():
+    from gateway.config import PlatformConfig
+    from gateway.platforms.wecom import WeComAdapter
+
+    config = PlatformConfig(extra={"bot_id": "b", "secret": "s"})
+    adapter = WeComAdapter(config)
+    adapter._send_request = AsyncMock(return_value={"headers": {"req_id": "r1"}, "body": {"errcode": 0}})
+
+    payload = {
+        "cmd": "aibot_msg_callback",
+        "headers": {"req_id": "req-1"},
+        "body": {
+            "msgtype": "event",
+            "event": "enter_check_update",
+            "chatid": "c1",
+        },
+    }
+    await adapter._dispatch_payload(payload)
+    adapter._send_request.assert_awaited_once()
+    call_args = adapter._send_request.await_args.args
+    assert call_args[0] == "aibot_send_msg"
+    assert "version" in call_args[1]["text"]["content"].lower()
+
+
+@pytest.mark.asyncio
+async def test_send_thinking_placeholder():
+    from gateway.config import PlatformConfig
+    from gateway.platforms.wecom import WeComAdapter
+
+    config = PlatformConfig(extra={"bot_id": "b", "secret": "s"})
+    adapter = WeComAdapter(config)
+    adapter._send_request = AsyncMock(return_value={"headers": {"req_id": "r1"}, "body": {"errcode": 0}})
+
+    result = await adapter.send_thinking("chat-1")
+    assert result.success is True
+    adapter._send_request.assert_awaited_once()
+    call_args = adapter._send_request.await_args.args[1]
+    assert call_args["msgtype"] == "markdown"
+    assert call_args["markdown"]["content"] == "<think></think>"
+
+
+@pytest.mark.asyncio
+async def test_send_typing_emits_thinking_placeholder():
+    from gateway.config import PlatformConfig
+    from gateway.platforms.wecom import WeComAdapter
+
+    config = PlatformConfig(extra={"bot_id": "b", "secret": "s"})
+    adapter = WeComAdapter(config)
+    adapter._send_reply_request = AsyncMock(return_value={"headers": {"req_id": "r1"}, "body": {"errcode": 0}})
+    adapter._remember_reply_req_id("msg-typing", "req-typing")
+
+    await adapter.send_typing("chat-typing", metadata={"message_id": "msg-typing"})
+
+    adapter._send_reply_request.assert_awaited_once()
+    assert adapter._send_reply_request.await_args.args[0] == "req-typing"
+    call_args = adapter._send_reply_request.await_args.args[1]
+    assert call_args["msgtype"] == "stream"
+    assert call_args["stream"]["finish"] is False
+    assert call_args["stream"]["content"] == "<think></think>"
+
+
+@pytest.mark.asyncio
+async def test_stop_typing_moves_stream_to_pending():
+    """stop_typing moves the active stream to pending_close so
+    _send_reply_stream can reuse the stream_id for the real response."""
+    from gateway.config import PlatformConfig
+    from gateway.platforms.wecom import WeComAdapter
+
+    config = PlatformConfig(extra={"bot_id": "b", "secret": "s"})
+    adapter = WeComAdapter(config)
+    adapter._send_reply_request = AsyncMock(return_value={"headers": {"req_id": "r1"}, "body": {"errcode": 0}})
+    adapter._remember_reply_req_id("msg-typing", "req-typing")
+
+    await adapter.send_typing("chat-typing", metadata={"message_id": "msg-typing"})
+    assert adapter._send_reply_request.await_count == 1
+
+    await adapter.stop_typing("chat-typing")
+    # stop_typing should NOT send a close frame — it preserves the stream for
+    # the real response.
+    assert adapter._send_reply_request.await_count == 1
+    typing_stream_id = adapter._send_reply_request.await_args_list[0].args[1]["stream"]["id"]
+    # State moved to pending_close
+    assert "chat-typing" not in adapter._typing_stream_state_by_chat
+    assert adapter._streams_pending_close["chat-typing"] == ("req-typing", typing_stream_id)
+
+    # _send_reply_stream reuses the pending stream_id
+    await adapter._send_reply_stream("req-typing", "Hello!", chat_id="chat-typing")
+    assert adapter._send_reply_request.await_count == 2
+    response_call = adapter._send_reply_request.await_args_list[1]
+    assert response_call.args[1]["stream"]["id"] == typing_stream_id
+    assert response_call.args[1]["stream"]["finish"] is True
+    assert response_call.args[1]["stream"]["content"] == "Hello!"
+    assert "chat-typing" not in adapter._streams_pending_close
+
+
+@pytest.mark.asyncio
+async def test_send_reply_stream_reuses_typing_stream_id():
+    """_send_reply_stream should reuse the typing stream_id for the response."""
+    from gateway.config import PlatformConfig
+    from gateway.platforms.wecom import WeComAdapter
+
+    config = PlatformConfig(extra={"bot_id": "b", "secret": "s"})
+    adapter = WeComAdapter(config)
+    adapter._send_reply_request = AsyncMock(return_value={"headers": {"req_id": "r1"}, "body": {"errcode": 0}})
+    adapter._remember_reply_req_id("msg-typing", "req-typing")
+
+    # Open typing stream
+    await adapter.send_typing("chat-typing", metadata={"message_id": "msg-typing"})
+    typing_call = adapter._send_reply_request.await_args_list[0]
+    typing_stream_id = typing_call.args[1]["stream"]["id"]
+
+    # Send response reusing the typing stream_id
+    await adapter._send_reply_stream("req-typing", "Hello!", chat_id="chat-typing")
+    response_call = adapter._send_reply_request.await_args_list[1]
+    response_body = response_call.args[1]
+    assert response_body["stream"]["id"] == typing_stream_id
+    assert response_body["stream"]["finish"] is True
+    assert response_body["stream"]["content"] == "Hello!"
+    # Typing state should be consumed
+    assert "chat-typing" not in adapter._typing_stream_state_by_chat
+    # _send_reply_stream no longer manipulates _typing_paused; that is
+    # the responsibility of _keep_typing's caller (base platform).
+
+
+@pytest.mark.asyncio
+async def test_send_reply_stream_preserves_mismatched_typing_state():
+    """When reply_req_id doesn't match the typing stream (e.g. /approve inline
+    response), the original typing state must be preserved so the real response
+    can close it later."""
+    from gateway.config import PlatformConfig
+    from gateway.platforms.wecom import WeComAdapter
+
+    config = PlatformConfig(extra={"bot_id": "b", "secret": "s"})
+    adapter = WeComAdapter(config)
+    adapter._send_reply_request = AsyncMock(return_value={"headers": {"req_id": "r1"}, "body": {"errcode": 0}})
+    adapter._remember_reply_req_id("msg-typing", "req-typing")
+    adapter._remember_reply_req_id("msg-approve", "req-approve")
+
+    # Open typing stream for the original message
+    await adapter.send_typing("chat-typing", metadata={"message_id": "msg-typing"})
+    typing_stream_id = adapter._send_reply_request.await_args_list[0].args[1]["stream"]["id"]
+
+    # Simulate an inline /approve response with a different reply_req_id
+    await adapter._send_reply_stream("req-approve", "Approved!", chat_id="chat-typing")
+    approve_call = adapter._send_reply_request.await_args_list[1]
+    assert approve_call.args[1]["stream"]["id"] != typing_stream_id
+    assert approve_call.args[1]["stream"]["finish"] is True
+
+    # Original typing state should still be present
+    assert "chat-typing" in adapter._typing_stream_state_by_chat
+    assert adapter._typing_stream_state_by_chat["chat-typing"][1] == typing_stream_id
+
+    # Finally, the real response closes the original typing stream
+    await adapter._send_reply_stream("req-typing", "Hello!", chat_id="chat-typing")
+    final_call = adapter._send_reply_request.await_args_list[2]
+    assert final_call.args[1]["stream"]["id"] == typing_stream_id
+    assert final_call.args[1]["stream"]["finish"] is True
+    assert "chat-typing" not in adapter._typing_stream_state_by_chat
+
+
+@pytest.mark.asyncio
+async def test_send_typing_without_message_id_is_noop():
+    from gateway.config import PlatformConfig
+    from gateway.platforms.wecom import WeComAdapter
+
+    config = PlatformConfig(extra={"bot_id": "b", "secret": "s"})
+    adapter = WeComAdapter(config)
+    adapter._send_reply_request = AsyncMock(return_value={"headers": {"req_id": "r1"}, "body": {"errcode": 0}})
+
+    await adapter.send_typing("chat-typing", metadata=None)
+
+    adapter._send_reply_request.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_pause_typing_closes_stream_and_resume_reopens():
+    """pause_typing_for_chat schedules stream close; next send_typing drains it and opens fresh."""
+    from gateway.config import PlatformConfig
+    from gateway.platforms.wecom import WeComAdapter
+
+    config = PlatformConfig(extra={"bot_id": "b", "secret": "s"})
+    adapter = WeComAdapter(config)
+    adapter._send_reply_request = AsyncMock(return_value={"headers": {"req_id": "r1"}, "body": {"errcode": 0}})
+    adapter._remember_reply_req_id("msg-typing", "req-typing")
+
+    # Initial typing opens a stream
+    await adapter.send_typing("chat-typing", metadata={"message_id": "msg-typing"})
+    assert adapter._send_reply_request.await_count == 1
+    first_stream_id = adapter._send_reply_request.await_args_list[0].args[1]["stream"]["id"]
+
+    # Second call is a no-op (stream already open)
+    await adapter.send_typing("chat-typing", metadata={"message_id": "msg-typing"})
+    assert adapter._send_reply_request.await_count == 1
+
+    # Pause moves the stream to pending close
+    adapter.pause_typing_for_chat("chat-typing")
+    assert "chat-typing" not in adapter._typing_stream_state_by_chat
+    assert "chat-typing" in adapter._streams_pending_close
+
+    # Resume typing (remove from paused set)
+    adapter.resume_typing_for_chat("chat-typing")
+
+    # Next send_typing drains pending close (finish=True for old stream)
+    # then opens a fresh stream
+    await adapter.send_typing("chat-typing", metadata={"message_id": "msg-typing"})
+    # Call 2 = close old stream, Call 3 = open new stream
+    assert adapter._send_reply_request.await_count == 3
+
+    # Verify the close frame for the old stream
+    close_call = adapter._send_reply_request.await_args_list[1]
+    assert close_call.args[1]["stream"]["id"] == first_stream_id
+    assert close_call.args[1]["stream"]["finish"] is True
+    assert close_call.args[1]["stream"]["content"] == "\u200b"
+
+    # Verify the new stream has a different ID
+    new_open_call = adapter._send_reply_request.await_args_list[2]
+    assert new_open_call.args[1]["stream"]["finish"] is False
+    assert new_open_call.args[1]["stream"]["id"] != first_stream_id
+
+
+@pytest.mark.asyncio
+async def test_send_reply_stream_reuses_pending_stream_for_matching_req_id():
+    """When the real response arrives after pause_typing_for_chat, it should
+    reuse the original stream_id so the final text replaces the typing
+    placeholder instead of leaving it hanging forever."""
+    from gateway.config import PlatformConfig
+    from gateway.platforms.wecom import WeComAdapter
+
+    config = PlatformConfig(extra={"bot_id": "b", "secret": "s"})
+    adapter = WeComAdapter(config)
+    adapter._send_reply_request = AsyncMock(return_value={"headers": {"req_id": "r1"}, "body": {"errcode": 0}})
+    adapter._remember_reply_req_id("msg-typing", "req-typing")
+
+    # Open typing stream for the original message
+    await adapter.send_typing("chat-typing", metadata={"message_id": "msg-typing"})
+    assert adapter._send_reply_request.await_count == 1
+    typing_stream_id = adapter._send_reply_request.await_args_list[0].args[1]["stream"]["id"]
+
+    # Pause moves the stream to pending close
+    adapter.pause_typing_for_chat("chat-typing")
+    assert "chat-typing" in adapter._streams_pending_close
+
+    # Inline /approve response (different req_id) should NOT close the pending stream.
+    adapter._remember_reply_req_id("msg-approve", "req-approve")
+    await adapter._send_reply_stream("req-approve", "Approved!", chat_id="chat-typing")
+
+    # Only the inline response is sent; original stream is preserved.
+    assert adapter._send_reply_request.await_count == 2
+    inline_call = adapter._send_reply_request.await_args_list[1]
+    assert inline_call.args[1]["stream"]["finish"] is True
+    assert inline_call.args[1]["stream"]["content"] == "Approved!"
+    assert inline_call.args[1]["stream"]["id"] != typing_stream_id
+    assert "chat-typing" in adapter._streams_pending_close
+
+    # Real response arrives with matching req_id and reuses the original stream.
+    await adapter._send_reply_stream("req-typing", "Hello!", chat_id="chat-typing")
+    assert adapter._send_reply_request.await_count == 3
+    final_call = adapter._send_reply_request.await_args_list[2]
+    assert final_call.args[1]["stream"]["id"] == typing_stream_id
+    assert final_call.args[1]["stream"]["finish"] is True
+    assert final_call.args[1]["stream"]["content"] == "Hello!"
+    assert "chat-typing" not in adapter._streams_pending_close
+
+
+@pytest.mark.asyncio
+async def test_send_typing_skips_while_response_in_flight():
+    """While _send_reply_stream's HTTP request is in-flight, send_typing must
+    not open a new stream for the same req_id. Once the response is delivered,
+    typing is allowed to resume so multi-turn analysis shows an indicator."""
+    from gateway.config import PlatformConfig
+    from gateway.platforms.wecom import WeComAdapter
+
+    config = PlatformConfig(extra={"bot_id": "b", "secret": "s"})
+    adapter = WeComAdapter(config)
+    adapter._send_reply_request = AsyncMock(return_value={"headers": {"req_id": "r1"}, "body": {"errcode": 0}})
+    adapter._remember_reply_req_id("msg-typing", "req-typing")
+
+    # Open typing stream
+    await adapter.send_typing("chat-typing", metadata={"message_id": "msg-typing"})
+    assert adapter._send_reply_request.await_count == 1
+
+    # Simulate _send_reply_stream in-flight: typing state popped + flag set
+    adapter._typing_stream_state_by_chat.pop("chat-typing", None)
+    adapter._reply_req_ids_sending_response["req-typing"] = 1
+
+    # A racing send_typing (from _keep_typing) must skip during in-flight
+    await adapter.send_typing("chat-typing", metadata={"message_id": "msg-typing"})
+    assert adapter._send_reply_request.await_count == 1  # no new stream
+
+    # After response is fully delivered (removed from set), send_typing resumes
+    adapter._reply_req_ids_sending_response.pop("req-typing", None)
+    await adapter.send_typing("chat-typing", metadata={"message_id": "msg-typing"})
+    assert adapter._send_reply_request.await_count == 2  # new stream opened
+
+
+@pytest.mark.asyncio
+async def test_multiple_intermediate_responses_resume_typing_between():
+    """When an agent sends multiple responses for the same message (e.g.
+    interim analysis updates), typing must resume between each so the
+    user always sees the three-dot animation when work is ongoing."""
+    from gateway.config import PlatformConfig
+    from gateway.platforms.wecom import WeComAdapter
+
+    config = PlatformConfig(extra={"bot_id": "b", "secret": "s"})
+    adapter = WeComAdapter(config)
+    adapter._send_reply_request = AsyncMock(
+        return_value={"headers": {"req_id": "r1"}, "body": {"errcode": 0}}
+    )
+    adapter._remember_reply_req_id("msg-multi", "req-multi")
+
+    # Round 1: typing opens
+    await adapter.send_typing("chat-multi", metadata={"message_id": "msg-multi"})
+    assert adapter._send_reply_request.await_count == 1
+    first_stream_id = adapter._send_reply_request.await_args_list[0].args[1]["stream"]["id"]
+    assert adapter._typing_stream_state_by_chat["chat-multi"] == ("req-multi", first_stream_id)
+
+    # Round 1: first intermediate response (reuses typing stream)
+    result1 = await adapter.send(
+        chat_id="chat-multi", content="Interim 1", reply_to="msg-multi"
+    )
+    assert result1.success is True
+    assert adapter._send_reply_request.await_count == 2
+    assert adapter._typing_stream_state_by_chat.get("chat-multi") is None
+    assert "req-multi" not in adapter._reply_req_ids_sending_response
+
+    # Typing resumes for ongoing work
+    await adapter.send_typing("chat-multi", metadata={"message_id": "msg-multi"})
+    assert adapter._send_reply_request.await_count == 3
+    second_stream_id = adapter._send_reply_request.await_args_list[2].args[1]["stream"]["id"]
+    assert second_stream_id != first_stream_id
+    assert adapter._typing_stream_state_by_chat["chat-multi"] == ("req-multi", second_stream_id)
+
+    # Round 2: second intermediate response
+    result2 = await adapter.send(
+        chat_id="chat-multi", content="Interim 2", reply_to="msg-multi"
+    )
+    assert result2.success is True
+    assert adapter._send_reply_request.await_count == 4
+    assert adapter._typing_stream_state_by_chat.get("chat-multi") is None
+
+    # Typing resumes again
+    await adapter.send_typing("chat-multi", metadata={"message_id": "msg-multi"})
+    assert adapter._send_reply_request.await_count == 5
+    third_stream_id = adapter._send_reply_request.await_args_list[4].args[1]["stream"]["id"]
+    assert third_stream_id != second_stream_id
+    assert adapter._typing_stream_state_by_chat["chat-multi"] == ("req-multi", third_stream_id)
+
+    # Round 3: final response
+    result3 = await adapter.send(
+        chat_id="chat-multi", content="Final", reply_to="msg-multi"
+    )
+    assert result3.success is True
+    assert adapter._send_reply_request.await_count == 6
+    assert adapter._typing_stream_state_by_chat.get("chat-multi") is None
+
+
+@pytest.mark.asyncio
+async def test_send_reuses_typing_stream_when_reply_to_is_missing():
+    """When send() is called without reply_to (e.g. error handler) but a typing
+    stream is active, the message should reuse that stream so the placeholder
+    is replaced instead of hanging forever."""
+    from gateway.config import PlatformConfig
+    from gateway.platforms.wecom import WeComAdapter
+
+    config = PlatformConfig(extra={"bot_id": "b", "secret": "s"})
+    adapter = WeComAdapter(config)
+    adapter._send_reply_request = AsyncMock(return_value={"headers": {"req_id": "r1"}, "body": {"errcode": 0}})
+    adapter._remember_reply_req_id("msg-typing", "req-typing")
+
+    # Open typing stream
+    await adapter.send_typing("chat-typing", metadata={"message_id": "msg-typing"})
+    typing_stream_id = adapter._send_reply_request.await_args_list[0].args[1]["stream"]["id"]
+
+    # send() without reply_to should still reuse the active typing stream
+    result = await adapter.send(chat_id="chat-typing", content="Error message")
+    assert result.success is True
+    assert adapter._send_reply_request.await_count == 2
+    final_call = adapter._send_reply_request.await_args_list[1]
+    assert final_call.args[1]["stream"]["id"] == typing_stream_id
+    assert final_call.args[1]["stream"]["finish"] is True
+    assert final_call.args[1]["stream"]["content"] == "Error message"
+
+
+@pytest.mark.asyncio
+async def test_on_message_respects_group_disabled_policy():
+    from gateway.config import PlatformConfig
+    from gateway.platforms.wecom import WeComAdapter
+
+    adapter = WeComAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={"group_policy": "disabled"},
+        )
+    )
+    adapter.handle_message = AsyncMock()
+    adapter._extract_media = AsyncMock(return_value=([], []))
+
+    payload = {
+        "cmd": "aibot_msg_callback",
+        "headers": {"req_id": "req-1"},
+        "body": {
+            "msgid": "msg-1",
+            "chatid": "group-1",
+            "chattype": "group",
+            "from": {"userid": "user-1"},
+            "msgtype": "text",
+            "text": {"content": "hello"},
+        },
+    }
+
+    await adapter._on_message(payload)
+    adapter.handle_message.assert_not_awaited()
+
+
+def test_chunk_markdown_splits_at_limit():
+    from gateway.platforms.wecom import WeComAdapter
+
+    long_text = "A" * 5000 + "\n\n" + "B" * 5000
+    chunks = WeComAdapter._chunk_markdown_text(long_text, chunk_limit=4000)
+    assert len(chunks) >= 2
+    assert all(len(c) <= 4000 for c in chunks)
+    assert chunks[0].startswith("A" * 100)
+    assert chunks[-1].startswith("B" * 100)
+
+
+@pytest.mark.asyncio
+async def test_send_chunks_long_text():
+    from gateway.config import PlatformConfig
+    from gateway.platforms.wecom import WeComAdapter
+
+    config = PlatformConfig(extra={"bot_id": "b", "secret": "s"})
+    adapter = WeComAdapter(config)
+    adapter._send_request = AsyncMock(return_value={"headers": {"req_id": "r1"}, "body": {"errcode": 0}})
+
+    long_text = "A" * 5000 + "\n\n" + "B" * 5000
+    result = await adapter.send("chat-1", long_text)
+    assert result.success is True
+    assert adapter._send_request.await_count >= 2
+
+
+@pytest.mark.asyncio
+async def test_send_multi_chunk_with_reply_to_uses_proactive_only():
+    """Multi-chunk messages with reply_to send the first chunk as a stream
+    reply (replacing the typing bubble with real text) and the rest
+    proactively to avoid out-of-order delivery."""
+    from gateway.config import PlatformConfig
+    from gateway.platforms.wecom import WeComAdapter
+
+    config = PlatformConfig(extra={"bot_id": "b", "secret": "s"})
+    adapter = WeComAdapter(config)
+    adapter._send_request = AsyncMock(
+        return_value={"headers": {"req_id": "r1"}, "body": {"errcode": 0}}
+    )
+    adapter._send_reply_request = AsyncMock(
+        return_value={"headers": {"req_id": "r1"}, "body": {"errcode": 0}}
+    )
+    async def _mock_send_reply_stream(req_id, content, chat_id=""):
+        adapter._streams_pending_close.pop(chat_id, None)
+        adapter._typing_stream_state_by_chat.pop(chat_id, None)
+        return {"headers": {"req_id": "r1"}, "body": {"errcode": 0}}
+
+    adapter._send_reply_stream = AsyncMock(side_effect=_mock_send_reply_stream)
+    adapter._reply_req_ids = {"msg-1": "req-1"}
+    adapter._streams_pending_close = {"chat-1": ("req-1", "stream-1")}
+
+    long_text = "A" * 5000 + "\n\n" + "B" * 5000
+    result = await adapter.send("chat-1", long_text, reply_to="msg-1")
+    assert result.success is True
+    # First chunk goes through _send_reply_stream, remaining chunks proactive.
+    assert adapter._send_reply_stream.await_count == 1
+    assert adapter._send_request.await_count >= 1
+    # The pending typing stream should have been consumed by _send_reply_stream.
+    assert "chat-1" not in adapter._streams_pending_close
+
+
+@pytest.mark.asyncio
+async def test_send_extracts_and_sends_template_card():
+    from gateway.config import PlatformConfig
+    from gateway.platforms.wecom import WeComAdapter
+
+    config = PlatformConfig(extra={"bot_id": "b", "secret": "s"})
+    adapter = WeComAdapter(config)
+    adapter._send_request = AsyncMock(return_value={"headers": {"req_id": "r1"}, "body": {"errcode": 0}})
+
+    content = 'hello\n```json\n{"card_type":"text_notice","task_id":"t1"}\n```'
+    result = await adapter.send("chat-1", content)
+    assert result.success is True
+    # Should send markdown text first, then template card
+    assert adapter._send_request.await_count == 2
+    second_call = adapter._send_request.await_args_list[-1].args[1]
+    assert second_call["msgtype"] == "template_card"
+    assert second_call["template_card"]["card_type"] == "text_notice"
+
+
+@pytest.mark.asyncio
+async def test_template_card_event_is_handled_gracefully():
+    from gateway.config import PlatformConfig
+    from gateway.platforms.wecom import WeComAdapter
+
+    config = PlatformConfig(extra={"bot_id": "b", "secret": "s"})
+    adapter = WeComAdapter(config)
+    adapter.handle_message = AsyncMock()
+
+    payload = {
+        "cmd": "aibot_event_callback",
+        "headers": {"req_id": "req-1"},
+        "body": {
+            "msgid": "m1",
+            "msgtype": "event",
+            "event": "template_card_event",
+            "chatid": "c1",
+            "from": {"userid": "u1"},
+        },
+    }
+    await adapter._on_message(payload)
+    # Should not crash and should not dispatch as normal message
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_send_json_raises_timeout_when_ws_hangs(monkeypatch):
+    """_send_json must raise asyncio.TimeoutError if ws.send_json blocks forever."""
+    import asyncio
+    from gateway.config import PlatformConfig
+    from gateway.platforms import wecom
+    from gateway.platforms.wecom import WeComAdapter
+
+    monkeypatch.setattr(wecom, "REQUEST_TIMEOUT_SECONDS", 0.1)
+
+    async def _hang_forever(*args, **kwargs):
+        await asyncio.Event().wait()
+
+    adapter = WeComAdapter(PlatformConfig(enabled=True))
+    adapter._ws = AsyncMock()
+    adapter._ws.closed = False
+    adapter._ws.send_json = _hang_forever
+    with pytest.raises(asyncio.TimeoutError):
+        await adapter._send_json({"cmd": "test"})
+
+
+class TestWeComReconnectLogic:
+    @pytest.mark.asyncio
+    async def test_read_events_raises_when_ws_closed(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.wecom import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._running = True
+        adapter._ws = AsyncMock()
+        adapter._ws.closed = True
+
+        with pytest.raises(RuntimeError, match="WebSocket not connected"):
+            await adapter._read_events()
+
+    @pytest.mark.asyncio
+    async def test_read_events_raises_descriptive_timeout(self, monkeypatch):
+        import asyncio
+        import gateway.platforms.wecom.adapter as wecom_module
+        from gateway.config import PlatformConfig
+        from gateway.platforms.wecom import WeComAdapter
+
+        monkeypatch.setattr(wecom_module, "HEARTBEAT_INTERVAL_SECONDS", 0.05)
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._running = True
+        adapter._ws = AsyncMock()
+        adapter._ws.closed = False
+        adapter._ws.receive = AsyncMock(side_effect=asyncio.TimeoutError)
+
+        with pytest.raises(RuntimeError, match="read timeout"):
+            await adapter._read_events()
+
+    @pytest.mark.asyncio
+    async def test_listen_loop_reconnects_with_backoff_on_read_timeout(self, monkeypatch):
+        import asyncio
+        import gateway.platforms.wecom.adapter as wecom_module
+        from gateway.config import PlatformConfig
+        from gateway.platforms.wecom import WeComAdapter
+
+        monkeypatch.setattr(wecom_module, "RECONNECT_BACKOFF", [0.05, 0.1])
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._running = True
+        adapter._fail_pending_responses = lambda exc: None
+
+        read_calls = 0
+
+        async def _failing_read_events():
+            nonlocal read_calls
+            read_calls += 1
+            raise RuntimeError("WeCom websocket read timeout (0.15s)")
+
+        open_calls = 0
+
+        async def _failing_open_connection():
+            nonlocal open_calls
+            open_calls += 1
+            raise RuntimeError("auth failed")
+
+        adapter._read_events = _failing_read_events
+        adapter._open_connection = _failing_open_connection
+        adapter._cleanup_ws = AsyncMock()
+
+        task = asyncio.create_task(adapter._listen_loop())
+        await asyncio.sleep(0.35)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        assert read_calls >= 2
+        assert open_calls >= 1
+
+    @pytest.mark.asyncio
+    async def test_listen_loop_stops_after_sleep_if_running_false(self, monkeypatch):
+        import asyncio
+        import gateway.platforms.wecom.adapter as wecom_module
+        from gateway.config import PlatformConfig
+        from gateway.platforms.wecom import WeComAdapter
+
+        monkeypatch.setattr(wecom_module, "RECONNECT_BACKOFF", [0.1])
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._running = True
+        adapter._fail_pending_responses = lambda exc: None
+
+        async def _failing_read_events():
+            raise RuntimeError("WeCom websocket closed")
+
+        open_calls = 0
+
+        async def _open_connection():
+            nonlocal open_calls
+            open_calls += 1
+
+        adapter._read_events = _failing_read_events
+        adapter._open_connection = _open_connection
+        adapter._cleanup_ws = AsyncMock()
+
+        task = asyncio.create_task(adapter._listen_loop())
+        await asyncio.sleep(0.05)
+        adapter._running = False
+        await asyncio.sleep(0.2)
+
+        assert task.done()
+        assert open_calls == 0
+
+    @pytest.mark.asyncio
+    async def test_listen_loop_propagates_cancelled_error_during_reconnect(self, monkeypatch):
+        import asyncio
+        import gateway.platforms.wecom.adapter as wecom_module
+        from gateway.config import PlatformConfig
+        from gateway.platforms.wecom import WeComAdapter
+
+        monkeypatch.setattr(wecom_module, "RECONNECT_BACKOFF", [0.1])
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._running = True
+        adapter._fail_pending_responses = lambda exc: None
+
+        async def _failing_read_events():
+            raise RuntimeError("WeCom websocket closed")
+
+        async def _open_connection():
+            raise asyncio.CancelledError()
+
+        adapter._read_events = _failing_read_events
+        adapter._open_connection = _open_connection
+        adapter._cleanup_ws = AsyncMock()
+
+        task = asyncio.create_task(adapter._listen_loop())
+        await asyncio.sleep(0.05)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+class TestWeComHandshake:
+    @pytest.mark.asyncio
+    async def test_wait_for_handshake_ignores_pings_and_preauth_payloads(self):
+        import asyncio
+        import json
+        from gateway.config import PlatformConfig
+        from gateway.platforms.wecom import WeComAdapter, APP_CMD_PING
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._ws = AsyncMock()
+        adapter._ws.closed = False
+
+        # Simulate: ping, then pre-auth payload with different req_id, then matching response
+        responses = [
+            {"cmd": APP_CMD_PING, "headers": {"req_id": "ping-1"}, "body": {}},
+            {"cmd": "other", "headers": {"req_id": "other-1"}, "body": {}},
+            {"cmd": "aibot_subscribe", "headers": {"req_id": "sub-1"}, "body": {"errcode": 0}},
+        ]
+
+        async def _receive():
+            raw = responses.pop(0)
+            msg = AsyncMock()
+            msg.type = 1  # TEXT
+            msg.data = json.dumps(raw)
+            return msg
+
+        adapter._ws.receive = _receive
+        result = await adapter._wait_for_handshake("sub-1")
+        assert result["body"]["errcode"] == 0
+
+    @pytest.mark.asyncio
+    async def test_wait_for_handshake_raises_on_close_during_auth(self):
+        import asyncio
+        from gateway.config import PlatformConfig
+        from gateway.platforms.wecom import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._ws = AsyncMock()
+        adapter._ws.closed = False
+
+        async def _receive():
+            msg = AsyncMock()
+            msg.type = 258  # CLOSE
+            return msg
+
+        adapter._ws.receive = _receive
+        with pytest.raises(RuntimeError, match="closed during authentication"):
+            await adapter._wait_for_handshake("sub-1")
+
+    @pytest.mark.asyncio
+    async def test_wait_for_handshake_raises_on_timeout(self):
+        import asyncio
+        import gateway.platforms.wecom.adapter as wecom_module
+        from gateway.config import PlatformConfig
+        from gateway.platforms.wecom import WeComAdapter
+
+        # Temporarily shorten connect timeout for test speed
+        orig_timeout = wecom_module.CONNECT_TIMEOUT_SECONDS
+        wecom_module.CONNECT_TIMEOUT_SECONDS = 0.05
+        try:
+            adapter = WeComAdapter(PlatformConfig(enabled=True))
+            adapter._ws = AsyncMock()
+            adapter._ws.closed = False
+            adapter._ws.receive = AsyncMock(side_effect=asyncio.TimeoutError)
+            with pytest.raises(TimeoutError, match="Timed out waiting"):
+                await adapter._wait_for_handshake("sub-1")
+        finally:
+            wecom_module.CONNECT_TIMEOUT_SECONDS = orig_timeout
+
+
+class TestWeComHeartbeat:
+    @pytest.mark.asyncio
+    async def test_heartbeat_loop_sends_ping_and_skips_when_socket_closed(self, monkeypatch):
+        import asyncio
+        import gateway.platforms.wecom.adapter as wecom_module
+        from gateway.config import PlatformConfig
+        from gateway.platforms.wecom import WeComAdapter
+
+        monkeypatch.setattr(wecom_module, "HEARTBEAT_INTERVAL_SECONDS", 0.05)
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._running = True
+        adapter._ws = AsyncMock()
+        adapter._ws.closed = False
+
+        sent = []
+
+        async def _capture_send_json(payload):
+            sent.append(payload)
+
+        adapter._send_json = _capture_send_json
+
+        task = asyncio.create_task(adapter._heartbeat_loop())
+        await asyncio.sleep(0.12)
+        adapter._running = False
+        await asyncio.sleep(0.01)
+        if not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        # Should have sent at least one ping
+        assert any(p.get("cmd") == wecom_module.APP_CMD_PING for p in sent)
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_loop_skips_when_ws_is_none(self, monkeypatch):
+        import asyncio
+        import gateway.platforms.wecom.adapter as wecom_module
+        from gateway.config import PlatformConfig
+        from gateway.platforms.wecom import WeComAdapter
+
+        monkeypatch.setattr(wecom_module, "HEARTBEAT_INTERVAL_SECONDS", 0.05)
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._running = True
+        adapter._ws = None
+
+        task = asyncio.create_task(adapter._heartbeat_loop())
+        await asyncio.sleep(0.08)
+        adapter._running = False
+        await asyncio.sleep(0.01)
+        if not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        # No crash = pass
+        assert True
+
+
+class TestWeComSendRetry:
+    @pytest.mark.asyncio
+    async def test_send_with_retry_retries_transient_network_errors(self, monkeypatch):
+        import gateway.platforms.wecom.adapter as wecom_module
+        from gateway.config import PlatformConfig
+        from gateway.platforms.wecom import WeComAdapter
+
+        monkeypatch.setattr(wecom_module, "RECONNECT_BACKOFF", [0.05, 0.1])
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._running = True
+
+        calls = []
+
+        async def _flaky_send(chat_id, content, reply_to=None, metadata=None):
+            calls.append(content)
+            if len(calls) < 2:
+                return SendResult(success=False, error="Connection reset by peer", retryable=True)
+            return SendResult(success=True, message_id="ok")
+
+        adapter.send = _flaky_send
+        result = await adapter._send_with_retry("chat-1", "hello", max_retries=2, base_delay=0.01)
+        assert result.success is True
+        assert len(calls) == 2
+
+    @pytest.mark.asyncio
+    async def test_send_with_retry_falls_back_to_plain_text_on_permanent_error(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.wecom import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._running = True
+
+        calls = []
+
+        async def _failing_send(chat_id, content, reply_to=None, metadata=None):
+            calls.append(content)
+            # First call fails with formatting error; fallback also fails
+            return SendResult(success=False, error="Invalid markdown format")
+
+        adapter.send = _failing_send
+        result = await adapter._send_with_retry("chat-1", "hello", max_retries=1, base_delay=0.01)
+        assert result.success is False
+        # Verify fallback content was attempted
+        assert any("Response formatting failed" in c for c in calls)
+
+    @pytest.mark.asyncio
+    async def test_send_with_retry_returns_timeout_without_fallback(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.wecom import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._running = True
+
+        async def _timeout_send(chat_id, content, reply_to=None, metadata=None):
+            return SendResult(success=False, error="Timeout sending message to WeCom")
+
+        adapter.send = _timeout_send
+        result = await adapter._send_with_retry("chat-1", "hello", max_retries=1, base_delay=0.01)
+        assert result.success is False
+        assert "Timeout sending message to WeCom" in (result.error or "")
+        assert "Response formatting failed" not in (result.error or "")
+
+    @pytest.mark.asyncio
+    async def test_send_with_retry_sends_delivery_failure_notice_after_exhaustion(self, monkeypatch):
+        import gateway.platforms.wecom.adapter as wecom_module
+        from gateway.config import PlatformConfig
+        from gateway.platforms.wecom import WeComAdapter
+
+        monkeypatch.setattr(wecom_module, "RECONNECT_BACKOFF", [0.01])
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._running = True
+
+        calls = []
+
+        async def _always_fail(chat_id, content, reply_to=None, metadata=None):
+            calls.append(content)
+            return SendResult(success=False, error="Connection reset by peer", retryable=True)
+
+        adapter.send = _always_fail
+        result = await adapter._send_with_retry("chat-1", "hello", max_retries=1, base_delay=0.01)
+        assert result.success is False
+        # The final call should be the delivery-failure notice
+        assert any("delivery failed" in c or "could not be sent" in c for c in calls)
+
+
+class TestWeComSendGuards:
+    @pytest.mark.asyncio
+    async def test_send_json_raises_when_socket_closed(self):
+        import asyncio
+        from gateway.config import PlatformConfig
+        from gateway.platforms.wecom import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._ws = AsyncMock()
+        adapter._ws.closed = True
+        with pytest.raises(RuntimeError, match="WeCom websocket is not connected"):
+            await adapter._send_json({"cmd": "test"})
+
+    @pytest.mark.asyncio
+    async def test_send_request_raises_when_socket_closed(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.wecom import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._ws = AsyncMock()
+        adapter._ws.closed = True
+        with pytest.raises(RuntimeError, match="WeCom websocket is not connected"):
+            await adapter._send_request("cmd", {})
+
+    @pytest.mark.asyncio
+    async def test_send_request_propagates_cancelled_error(self):
+        import asyncio
+        from gateway.config import PlatformConfig
+        from gateway.platforms.wecom import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._ws = AsyncMock()
+        adapter._ws.closed = False
+        adapter._ws.send_json = AsyncMock(side_effect=asyncio.CancelledError())
+        with pytest.raises(asyncio.CancelledError):
+            await adapter._send_request("cmd", {})
+
+    @pytest.mark.asyncio
+    async def test_send_reply_request_propagates_cancelled_error(self):
+        import asyncio
+        from gateway.config import PlatformConfig
+        from gateway.platforms.wecom import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._ws = AsyncMock()
+        adapter._ws.closed = False
+        adapter._ws.send_json = AsyncMock(side_effect=asyncio.CancelledError())
+        with pytest.raises(asyncio.CancelledError):
+            await adapter._send_reply_request("req-1", {})
+
+
+class TestStreamExpiredError:
+    def test_raise_for_wecom_error_raises_stream_expired_for_846608(self):
+        from gateway.platforms.wecom import WeComAdapter, StreamExpiredError
+
+        with pytest.raises(StreamExpiredError) as exc_info:
+            WeComAdapter._raise_for_wecom_error({"errcode": 846608, "errmsg": "message expired"}, "send typing stream")
+        assert "846608" in str(exc_info.value)
+        assert "send typing stream" in str(exc_info.value)
+
+    def test_raise_for_wecom_error_raises_runtime_error_for_other_errors(self):
+        from gateway.platforms.wecom import WeComAdapter, StreamExpiredError
+
+        with pytest.raises(RuntimeError) as exc_info:
+            WeComAdapter._raise_for_wecom_error({"errcode": 40001, "errmsg": "bad request"}, "send message")
+        assert "40001" in str(exc_info.value)
+        assert not isinstance(exc_info.value, StreamExpiredError)
+
+    def test_stream_expired_error_is_runtime_error_subclass(self):
+        from gateway.platforms.wecom import StreamExpiredError
+
+        assert issubclass(StreamExpiredError, RuntimeError)
+
+
+class TestWeComTyping846608:
+    @pytest.mark.asyncio
+    async def test_send_typing_clears_reply_cache_on_846608(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.wecom import StreamExpiredError, WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._last_reply_req_id_per_chat["chat-1"] = "req-old"
+        adapter._reply_req_ids["msg-1"] = "req-old"
+        adapter._ws = AsyncMock()
+        adapter._ws.closed = False
+        adapter._ws.send_json = AsyncMock(
+            side_effect=StreamExpiredError("846608: message expired")
+        )
+
+        await adapter.send_typing("chat-1", metadata={"message_id": "msg-1"})
+        assert "chat-1" not in adapter._last_reply_req_id_per_chat
+        assert "msg-1" not in adapter._reply_req_ids
+
+    @pytest.mark.asyncio
+    async def test_stop_typing_moves_to_pending_no_send(self):
+        """stop_typing no longer sends finish=True; it moves state to pending."""
+        from gateway.config import PlatformConfig
+        from gateway.platforms.wecom import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._typing_stream_state_by_chat["chat-1"] = ("req-old", "stream-1")
+        adapter._reply_req_ids["req-old"] = "stream-1"
+        adapter._last_reply_req_id_per_chat["chat-1"] = "req-old"
+        adapter._ws = AsyncMock()
+        adapter._ws.closed = False
+        adapter._ws.send_json = AsyncMock(
+            side_effect=RuntimeError("846608: message expired")
+        )
+
+        await adapter.stop_typing("chat-1")
+        # State moved to pending_close; no WebSocket send attempted
+        assert "chat-1" not in adapter._typing_stream_state_by_chat
+        assert adapter._streams_pending_close["chat-1"] == ("req-old", "stream-1")
+        # Cache is preserved — _send_reply_stream will handle 846608 if needed
+        assert "req-old" in adapter._reply_req_ids
+        assert "chat-1" in adapter._last_reply_req_id_per_chat
+
+    @pytest.mark.asyncio
+    async def test_send_typing_clears_state_on_send_failure(self):
+        """If _send_reply_request raises (non-846608), typing state must not leak."""
+        from gateway.config import PlatformConfig
+        from gateway.platforms.wecom import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(extra={"bot_id": "b", "secret": "s"}))
+        adapter._remember_reply_req_id("msg-1", "req-1")
+        adapter._send_reply_request = AsyncMock(side_effect=RuntimeError("network error"))
+
+        await adapter.send_typing("chat-1", metadata={"message_id": "msg-1"})
+
+        # State should NOT remain assigned on failure
+        assert "chat-1" not in adapter._typing_stream_state_by_chat
+
+
+class TestWeComInboundEdgeCases:
+    @pytest.mark.asyncio
+    async def test_on_message_drops_duplicate_msgid(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.wecom import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter.handle_message = AsyncMock()
+        adapter._text_batcher._batch_delay = 0  # disable async batching for synchronous test
+
+        payload = {
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": "r1"},
+            "body": {
+                "msgid": "duplicate-msg",
+                "msgtype": "text",
+                "text": {"content": "hi"},
+                "from": {"userid": "u1"},
+                "chatid": "c1",
+            },
+        }
+        await adapter._on_message(payload)
+        await adapter._on_message(payload)
+        await adapter._chat_queue.drain("c1")
+        adapter.handle_message.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_on_message_voice_sets_message_type_voice(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.wecom import WeComAdapter, MessageType
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter.handle_message = AsyncMock()
+
+        payload = {
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": "r1"},
+            "body": {
+                "msgid": "m1",
+                "msgtype": "voice",
+                "voice": {"content": "transcribed voice"},
+                "from": {"userid": "u1"},
+                "chatid": "c1",
+            },
+        }
+        await adapter._on_message(payload)
+        await adapter._chat_queue.drain("c1")
+        event = adapter.handle_message.await_args.args[0]
+        assert event.message_type == MessageType.VOICE
+
+    @pytest.mark.asyncio
+    async def test_on_message_appmsg_sets_message_type_document(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.wecom import WeComAdapter, MessageType
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter.handle_message = AsyncMock()
+
+        payload = {
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": "r1"},
+            "body": {
+                "msgid": "m1",
+                "msgtype": "appmsg",
+                "appmsg": {
+                    "title": "report.pdf",
+                    "file": {"filename": "report.pdf", "base64": "JVBERi0xLjQKJcOkw7zDtsOfCjIgMCBvYmoKPDwvTGVuZ3RoIDMgMCBSL0ZpbHRlci9GbGF0ZURlY29kZT4+CnN0cmVhbQp4nDPQM1Qo5CpUMABCXUMFZXRhCwAVvAJhCmVuZHN0cmVhbQplbmRvYmoKCjMgMCBvYmoKMTQKZW5kb2JqCgo0IDAgb2JqCjw8L1R5cGUvUGFnZS9QYXJlbnQgMiAwIFIvUmVzb3VyY2VzPDwvRm9udDw8L0YxIDUgMCBSPj4+Pi9NZWRpYUJveFswIDAgNjEyIDc5Ml0+Pj4KZW5kb2JqCgo1IDAgb2JqCjw8L1R5cGUvRm9udC9TdWJ0eXBlL1R5cGUxL0Jhc2VGb250L0hlbHZldGljYT4+CmVuZG9iagoKeHJlZgowIDYKMDAwMDAwMDAwMCA2NTUzNSBmIAowMDAwMDAwMDE4IDAwMDAwIG4gCjAwMDAwMDAwNzcgMDAwMDAgbgAgCjAwMDAwMDAyMjggMDAwMDAgbgAgCjAwMDAwMDI0NyAwMDAwMCBuIAowMDAwMDAzNTggMDAwMDAgbiAKdHJhaWxlcgo8PC9TaXplIDYvUm9vdCA0IDAgUj4+CnN0YXJ0eHJlZgo0MzYKJSVFT0Y="},
+                },
+                "from": {"userid": "u1"},
+                "chatid": "c1",
+            },
+        }
+        await adapter._on_message(payload)
+        await adapter._chat_queue.drain("c1")
+        event = adapter.handle_message.await_args.args[0]
+        assert event.message_type == MessageType.DOCUMENT
+
+    @pytest.mark.asyncio
+    async def test_on_message_image_only_without_text_dispatches(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.wecom import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter.handle_message = AsyncMock()
+        adapter._cache_media = AsyncMock(return_value=("/tmp/img.jpg", "image/jpeg"))
+
+        payload = {
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": "r1"},
+            "body": {
+                "msgid": "m1",
+                "msgtype": "image",
+                "image": {"url": "https://example.com/img.jpg"},
+                "from": {"userid": "u1"},
+                "chatid": "c1",
+            },
+        }
+        await adapter._on_message(payload)
+        await adapter._chat_queue.drain("c1")
+        adapter.handle_message.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_on_message_quote_only_without_text_uses_quote(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.wecom import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter.handle_message = AsyncMock()
+        adapter._text_batcher._batch_delay = 0  # disable async batching for synchronous test
+
+        payload = {
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": "r1"},
+            "body": {
+                "msgid": "m1",
+                "msgtype": "text",
+                "text": {"content": ""},
+                "quote": {
+                    "msgtype": "text",
+                    "text": {"content": "original question"},
+                },
+                "from": {"userid": "u1"},
+                "chatid": "c1",
+            },
+        }
+        await adapter._on_message(payload)
+        await adapter._chat_queue.drain("c1")
+        event = adapter.handle_message.await_args.args[0]
+        assert event.text == "original question"
+
+
+@pytest.mark.asyncio
+async def test_close_pending_streams_preserves_unprocessed_on_exception():
+    """If _send_reply_request raises mid-loop, remaining items must stay in _streams_pending_close."""
+    from gateway.config import PlatformConfig
+    from gateway.platforms.wecom import WeComAdapter
+
+    adapter = WeComAdapter(PlatformConfig(extra={"bot_id": "b", "secret": "s"}))
+    adapter._streams_pending_close = {
+        "chat-1": ("req-1", "stream-1"),
+        "chat-2": ("req-2", "stream-2"),
+        "chat-3": ("req-3", "stream-3"),
+    }
+
+    call_count = 0
+    async def _failing_send(req_id, payload):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 2:
+            raise RuntimeError("boom")
+        return {"headers": {"req_id": "r1"}, "body": {"errcode": 0}}
+
+    adapter._send_reply_request = _failing_send
+
+    await adapter._close_pending_streams()
+
+    assert "chat-1" not in adapter._streams_pending_close  # succeeded
+    assert "chat-2" in adapter._streams_pending_close  # failed, must remain
+    assert "chat-3" in adapter._streams_pending_close  # never attempted, must remain
+
+
+@pytest.mark.asyncio
+async def test_close_pending_streams_does_not_retry_on_stream_expired():
+    """When 846608 (StreamExpiredError) occurs, the stream is gone — do not retry."""
+    from gateway.config import PlatformConfig
+    from gateway.platforms.wecom import WeComAdapter, StreamExpiredError
+
+    adapter = WeComAdapter(PlatformConfig(extra={"bot_id": "b", "secret": "s"}))
+    adapter._streams_pending_close["chat-1"] = ("req-1", "stream-1")
+    adapter._send_reply_request = AsyncMock(side_effect=StreamExpiredError("846608: expired"))
+
+    await adapter._close_pending_streams()
+
+    # Stream should be removed, NOT re-added for retry
+    assert "chat-1" not in adapter._streams_pending_close
+
+
+@pytest.mark.asyncio
+async def test_disconnect_clears_all_state():
+    """disconnect() must clear all reply/typing state."""
+    from gateway.platforms.wecom import WeComAdapter
+
+    adapter = WeComAdapter(PlatformConfig(extra={"bot_id": "b", "secret": "s"}))
+    adapter._reply_req_ids["msg-1"] = "req-1"
+    adapter._streams_pending_close["chat-1"] = ("req-1", "stream-1")
+    adapter._reply_req_ids_sending_response["req-1"] = 1
+    adapter._typing_stream_state_by_chat["chat-1"] = ("req-1", "stream-2")
+    adapter._last_reply_req_id_per_chat["chat-1"] = "req-1"
+
+    # Mock to avoid actual task cancellation issues
+    adapter._listen_task = None
+    adapter._heartbeat_task = None
+    adapter._watchdog_task = None
+    adapter._http_client = None
+    adapter._ws_client = AsyncMock()
+
+    await adapter.disconnect()
+
+    assert not adapter._reply_req_ids
+    assert not adapter._streams_pending_close
+    assert not adapter._reply_req_ids_sending_response
+    assert not adapter._typing_stream_state_by_chat
+    assert not adapter._last_reply_req_id_per_chat
+
+
+@pytest.mark.asyncio
+async def test_send_media_source_blocks_typing_during_upload():
+    """_send_media_source must set _reply_req_ids_sending_response during upload+send."""
+    from gateway.config import PlatformConfig
+    from gateway.platforms.wecom import WeComAdapter
+
+    adapter = WeComAdapter(PlatformConfig(extra={"bot_id": "b", "secret": "s"}))
+    adapter._reply_req_ids["msg-1"] = "req-1"
+    adapter._prepare_outbound_media = AsyncMock(return_value={
+        "data": b"image-bytes",
+        "content_type": "image/png",
+        "file_name": "demo.png",
+        "detected_type": "image",
+        "final_type": "image",
+        "rejected": False,
+        "downgraded": False,
+        "downgrade_note": None,
+    })
+
+    entered_upload = False
+    async def slow_upload(*args, **kwargs):
+        nonlocal entered_upload
+        entered_upload = True
+        # During upload, typing must be blocked
+        assert adapter._reply_req_ids_sending_response.get("req-1", 0) > 0
+        return {"media_id": "media-1", "type": "image"}
+
+    adapter._upload_media_bytes = slow_upload
+    adapter._send_reply_request = AsyncMock(return_value={"headers": {"req_id": "r1"}, "body": {"errcode": 0}})
+    adapter._send_media_message = AsyncMock(return_value={"headers": {"req_id": "r1"}})
+
+    result = await adapter.send_image_file("chat-1", "/tmp/demo.png", reply_to="msg-1")
+    assert result.success is True
+    assert entered_upload
+    # Refcount must be cleared after upload completes
+    assert "req-1" not in adapter._reply_req_ids_sending_response
+
+
+@pytest.mark.asyncio
+async def test_send_does_not_corrupt_pending_close_state():
+    """When send() reads from _streams_pending_close, it must not move it to active."""
+    from gateway.config import PlatformConfig
+    from gateway.platforms.wecom import WeComAdapter
+
+    adapter = WeComAdapter(PlatformConfig(extra={"bot_id": "b", "secret": "s"}))
+    adapter._remember_reply_req_id("msg-1", "req-1")
+    adapter._streams_pending_close["chat-1"] = ("req-1", "stream-pending-1")
+    adapter._send_reply_request = AsyncMock(return_value={"headers": {"req_id": "r1"}, "body": {"errcode": 0}})
+
+    # send() without reply_to should find req_id from pending_close
+    result = await adapter.send(chat_id="chat-1", content="Hello")
+    assert result.success is True
+
+    # After _send_reply_stream consumes the pending state, neither store should have it
+    assert "chat-1" not in adapter._typing_stream_state_by_chat
+    assert "chat-1" not in adapter._streams_pending_close
+
+
+@pytest.mark.asyncio
+async def test_on_message_uses_chat_queue_for_ordered_dispatch():
+    """_on_message should enqueue events into the chat queue, not call handle_message directly."""
+    from gateway.config import PlatformConfig
+    from gateway.platforms.wecom import WeComAdapter
+
+    adapter = WeComAdapter(PlatformConfig(extra={"bot_id": "b", "secret": "s"}))
+    adapter._dedup.is_duplicate = lambda _msg_id: False
+    adapter._is_dm_allowed = lambda _sender: (True, "")
+    adapter._text_batcher.is_enabled = lambda: False
+    adapter.handle_message = AsyncMock()
+
+    adapter._chat_queue = AsyncMock()
+    adapter._chat_queue.enqueue = AsyncMock()
+
+    payload = {
+        "cmd": "aibot_msg_callback",
+        "headers": {"req_id": "r1"},
+        "body": {
+            "msgid": "m1",
+            "msgtype": "text",
+            "text": {"content": "Hello"},
+            "chatid": "c1",
+            "from": {"userid": "bob"},
+        },
+    }
+    await adapter._on_message(payload)
+
+    adapter._chat_queue.enqueue.assert_awaited_once()
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_reqid_store_persists_across_disconnect():
+    """After disconnect(), req_ids must be written to disk and reloaded on connect."""
+    import tempfile
+    from pathlib import Path
+    from gateway.config import PlatformConfig
+    from gateway.platforms.wecom import WeComAdapter
+    from gateway.platforms.wecom.reqid_store import ReqIdStore
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        state_dir = Path(tmpdir)
+        config = PlatformConfig(extra={"bot_id": "b", "secret": "s", "state_dir": str(state_dir)})
+        adapter = WeComAdapter(config)
+        reqid_path = state_dir / "wecom_reqids.json"
+        adapter._reqid_store = ReqIdStore(reqid_path)
+        adapter._last_reply_req_id_per_chat["chat-1"] = "req-1"
+        adapter._last_reply_req_id_per_chat["chat-2"] = "req-2"
+
+        await adapter.disconnect()
+
+        # Simulate restart
+        adapter2 = WeComAdapter(config)
+        # Manually trigger the load that connect() would do
+        store2 = ReqIdStore(reqid_path)
+        assert store2.get("chat-1") == "req-1"
+        assert store2.get("chat-2") == "req-2"
+
+
+@pytest.mark.asyncio
+async def test_reqid_flush_is_debounced():
+    """Rapid _remember_reply_req_id calls should batch into one disk write."""
+    import tempfile
+    from pathlib import Path
+    from gateway.config import PlatformConfig
+    from gateway.platforms.wecom import WeComAdapter
+    from gateway.platforms.wecom.reqid_store import ReqIdStore
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        state_dir = Path(tmpdir)
+        config = PlatformConfig(extra={"bot_id": "b", "secret": "s", "state_dir": str(state_dir)})
+        adapter = WeComAdapter(config)
+        reqid_path = state_dir / "wecom_reqids.json"
+        store = ReqIdStore(reqid_path)
+        adapter._reqid_store = store
+
+        # Rapid calls should not write immediately
+        adapter._remember_reply_req_id("msg-1", "req-1")
+        adapter._remember_reply_req_id("msg-2", "req-2")
+        adapter._remember_reply_req_id("msg-3", "req-3")
+
+        assert store.is_dirty is True
+        assert not reqid_path.exists()  # debounced — not flushed yet
+
+        # Flush task should be scheduled
+        assert adapter._reqid_flush_task is not None
+        assert not adapter._reqid_flush_task.done()
+
+        # Cancel the debounced task and flush manually (simulating disconnect)
+        adapter._reqid_flush_task.cancel()
+        store.save()
+
+        store2 = ReqIdStore(reqid_path)
+        assert store2.get("msg-1") == "req-1"
+        assert store2.get("msg-2") == "req-2"
+        assert store2.get("msg-3") == "req-3"
+
+
+@pytest.mark.asyncio
+async def test_send_reply_stream_skips_frame_if_previous_not_acked():
+    """Non-blocking mode: if previous frame ack hasn't arrived, skip intermediate."""
+    from gateway.config import PlatformConfig
+    from gateway.platforms.wecom import WeComAdapter
+
+    adapter = WeComAdapter(PlatformConfig(extra={"bot_id": "b", "secret": "s"}))
+    adapter._reply_req_ids["msg-1"] = "req-1"
+    adapter._typing_stream_state_by_chat["chat-1"] = ("req-1", "stream-1")
+
+    # Track sends
+    sends = []
+
+    async def tracking_send(req_id, payload):
+        sends.append(payload)
+        return {"headers": {"req_id": "r1"}, "body": {"errcode": 0}}
+
+    adapter._send_reply_request = tracking_send
+
+    # First frame should send
+    await adapter._send_reply_stream("req-1", "Frame 1", chat_id="chat-1")
+    assert len(sends) == 1
+
+    # Mark previous as not yet acked
+    adapter._stream_acked["req-1"] = False
+
+    # Second frame should be skipped (non-blocking)
+    result = await adapter._send_reply_stream("req-1", "Frame 2", chat_id="chat-1")
+    assert result.get("_skipped") is True
+    assert len(sends) == 1  # no new send
+
+    # After ack, next frame should send
+    adapter._stream_acked["req-1"] = True
+    await adapter._send_reply_stream("req-1", "Frame 3", chat_id="chat-1")
+    assert len(sends) == 2
+
+
+@pytest.mark.asyncio
+async def test_send_masks_template_card_blocks_in_stream_chunks():
+    """Template card JSON should not appear in stream text chunks."""
+    from gateway.config import PlatformConfig
+    from gateway.platforms.wecom import WeComAdapter
+
+    adapter = WeComAdapter(PlatformConfig(extra={"bot_id": "b", "secret": "s"}))
+    adapter._reply_req_ids["msg-1"] = "req-1"
+    adapter._typing_stream_state_by_chat["chat-1"] = ("req-1", "stream-1")
+
+    sent_chunks = []
+
+    async def tracking_send(req_id, payload):
+        sent_chunks.append(payload)
+        return {"headers": {"req_id": "r1"}, "body": {"errcode": 0}}
+
+    adapter._send_reply_request = tracking_send
+
+    content = "Hello\n```json\n{\"card_type\": \"text_notice\"}\n```\nWorld"
+    await adapter.send(chat_id="chat-1", content=content, reply_to="msg-1")
+
+    # Stream chunks should NOT contain the JSON block
+    for chunk in sent_chunks:
+        if chunk.get("msgtype") == "stream":
+            assert "card_type" not in chunk["stream"]["content"]
+            assert "```json" not in chunk["stream"]["content"]
+
+
+@pytest.mark.asyncio
+async def test_webhook_stores_response_url_and_send_uses_it():
+    """Webhook callback should store response_url; send() should push via it."""
+    from gateway.config import PlatformConfig
+    from gateway.platforms.wecom import WeComAdapter
+
+    config = PlatformConfig(extra={"bot_id": "b", "secret": "s"})
+    adapter = WeComAdapter(config)
+    adapter._send_request = AsyncMock(return_value={"headers": {"req_id": "r1"}, "body": {"errcode": 0}})
+
+    # Simulate stream_store with active_reply_store
+    from gateway.platforms.wecom.stream_store import StreamStore
+
+    async def flush_handler(pending):
+        pass
+
+    adapter._stream_store = StreamStore(flush_handler=flush_handler)
+
+    # Simulate webhook callback storing response_url
+    await adapter._stream_store.active_reply_store.save(
+        "chat-1", "https://wecom.example.com/push/abc", policy="once"
+    )
+
+    # Mock http client to simulate successful push
+    mock_response = MagicMock()
+    mock_response.status = 200
+
+    class FakePostContext:
+        async def __aenter__(self):
+            return mock_response
+        async def __aexit__(self, *args):
+            pass
+
+    adapter._http_client = MagicMock()
+    adapter._http_client.post = MagicMock(return_value=FakePostContext())
+
+    result = await adapter.send("chat-1", "Hello from response_url")
+    assert result.success is True
+    adapter._http_client.post.assert_called_once()
+
+    # After once policy, the URL should be consumed
+    assert await adapter._stream_store.active_reply_store.retrieve("chat-1") is None
+
+
+@pytest.mark.asyncio
+async def test_push_via_response_url_posts_to_url():
+    """_push_via_response_url should POST payload to the stored URL."""
+    from gateway.config import PlatformConfig
+    from gateway.platforms.wecom import WeComAdapter
+
+    config = PlatformConfig(extra={"bot_id": "b", "secret": "s"})
+    adapter = WeComAdapter(config)
+
+    from gateway.platforms.wecom.stream_store import StreamStore
+
+    async def flush_handler(pending):
+        pass
+
+    adapter._stream_store = StreamStore(flush_handler=flush_handler)
+    await adapter._stream_store.active_reply_store.save(
+        "chat-1", "https://wecom.example.com/push/abc", policy="once"
+    )
+
+    # Mock the http client post
+    mock_response = MagicMock()
+    mock_response.status = 200
+
+    class FakePostContext:
+        async def __aenter__(self):
+            return mock_response
+        async def __aexit__(self, *args):
+            pass
+
+    adapter._http_client = MagicMock()
+    adapter._http_client.post = MagicMock(return_value=FakePostContext())
+
+    pushed = await adapter._push_via_response_url("chat-1", {"msgtype": "markdown", "markdown": {"content": "hello"}})
+    assert pushed is True
+    adapter._http_client.post.assert_called_once()
+    call_args = adapter._http_client.post.call_args
+    assert call_args[0][0] == "https://wecom.example.com/push/abc"
+    assert call_args[1]["json"]["msgtype"] == "markdown"
+
+
+@pytest.mark.asyncio
+async def test_push_via_response_url_falls_back_on_http_error():
+    """Non-200 response should return False and not crash."""
+    from gateway.config import PlatformConfig
+    from gateway.platforms.wecom import WeComAdapter
+    from gateway.platforms.wecom.stream_store import StreamStore
+
+    config = PlatformConfig(extra={"bot_id": "b", "secret": "s"})
+    adapter = WeComAdapter(config)
+
+    async def flush_handler(pending):
+        pass
+
+    adapter._stream_store = StreamStore(flush_handler=flush_handler)
+    await adapter._stream_store.active_reply_store.save(
+        "chat-1", "https://wecom.example.com/push/abc", policy="once"
+    )
+
+    mock_response = MagicMock()
+    mock_response.status = 500
+
+    class FakePostContext:
+        async def __aenter__(self):
+            return mock_response
+        async def __aexit__(self, *args):
+            pass
+
+    adapter._http_client = MagicMock()
+    adapter._http_client.post = MagicMock(return_value=FakePostContext())
+
+    pushed = await adapter._push_via_response_url("chat-1", {"msgtype": "markdown", "markdown": {"content": "hello"}})
+    assert pushed is False
+
+
+@pytest.mark.asyncio
+async def test_send_falls_back_to_proactive_when_response_url_fails():
+    """When response_url push fails, send() should fall back to aibot_send_msg."""
+    from gateway.config import PlatformConfig
+    from gateway.platforms.wecom import WeComAdapter
+    from gateway.platforms.wecom.stream_store import StreamStore
+
+    config = PlatformConfig(extra={"bot_id": "b", "secret": "s"})
+    adapter = WeComAdapter(config)
+    adapter._send_request = AsyncMock(return_value={"headers": {"req_id": "r1"}, "body": {"errcode": 0}})
+
+    async def flush_handler(pending):
+        pass
+
+    adapter._stream_store = StreamStore(flush_handler=flush_handler)
+    await adapter._stream_store.active_reply_store.save(
+        "chat-1", "https://wecom.example.com/push/abc", policy="once"
+    )
+
+    # Simulate response_url push failure (no http client)
+    adapter._http_client = None
+
+    result = await adapter.send("chat-1", "Hello fallback")
+    assert result.success is True
+    adapter._send_request.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_template_card_event_skips_ui_update_on_cache_miss():
+    """When no cached card exists, _update_template_card_ui should return early without calling _send_request."""
+    from gateway.config import PlatformConfig
+    from gateway.platforms.wecom import WeComAdapter
+
+    config = PlatformConfig(extra={"bot_id": "b", "secret": "s"})
+    adapter = WeComAdapter(config)
+    adapter._dedup.is_duplicate = lambda _msg_id: False
+    adapter._is_dm_allowed = lambda _sender: (True, "")
+    adapter._text_batcher.is_enabled = lambda: False
+    adapter.handle_message = AsyncMock()
+    adapter._send_request = AsyncMock(return_value={"body": {"errcode": 0}})
+
+    payload = {
+        "cmd": "aibot_msg_callback",
+        "headers": {"req_id": "r1"},
+        "body": {
+            "msgid": "m1",
+            "msgtype": "event",
+            "event": {
+                "event": "template_card_event",
+                "response_code": "nonexistent-task",
+                "selected_options": [{"key": "yes", "value": "Yes"}],
+                "button_replace_name": "",
+            },
+            "chatid": "c1",
+            "from": {"userid": "bob"},
+        },
+    }
+    await adapter._on_message(payload)
+    await adapter._chat_queue.drain("c1")
+
+    adapter.handle_message.assert_awaited_once()
+    # _send_request should NOT be called for aibot_update_template_card
+    # because there is no cached card
+    for call in adapter._send_request.call_args_list:
+        assert call[0][0] != "aibot_update_template_card"

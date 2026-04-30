@@ -1,0 +1,265 @@
+"""Tests for the WeCom callback-mode adapter."""
+
+import asyncio
+from xml.etree import ElementTree as ET
+
+import pytest
+
+from gateway.config import PlatformConfig
+from gateway.platforms.wecom.accounts import WeComAccount
+from gateway.platforms.wecom.callback import WecomCallbackAdapter
+from gateway.platforms.wecom.crypto import WXBizMsgCrypt
+
+
+def _account(account_id="test-app", corp_id="ww1234567890", agent_id=1000002):
+    return WeComAccount(
+        account_id=account_id,
+        corp_id=corp_id,
+        corp_secret="test-secret",
+        agent_id=agent_id,
+        token="test-callback-token",
+        encoding_aes_key="abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG",
+        connection_mode="webhook",
+    )
+
+
+def _config(accounts=None):
+    raw_accounts = []
+    for acct in (accounts or [_account()]):
+        raw_accounts.append({
+            "account_id": acct.account_id,
+            "corp_id": acct.corp_id,
+            "corp_secret": acct.corp_secret,
+            "agent_id": acct.agent_id,
+            "token": acct.token,
+            "encoding_aes_key": acct.encoding_aes_key,
+        })
+    return PlatformConfig(
+        enabled=True,
+        extra={"mode": "callback", "host": "127.0.0.1", "port": 0, "accounts": raw_accounts},
+    )
+
+
+class TestWecomCrypto:
+    def test_roundtrip_encrypt_decrypt(self):
+        account = _account()
+        crypt = WXBizMsgCrypt(account.token, account.encoding_aes_key, account.corp_id)
+        encrypted_xml = crypt.encrypt(
+            "<xml><Content>hello</Content></xml>", nonce="nonce123", timestamp="123456",
+        )
+        root = ET.fromstring(encrypted_xml)
+        decrypted = crypt.decrypt(
+            root.findtext("MsgSignature", default=""),
+            root.findtext("TimeStamp", default=""),
+            root.findtext("Nonce", default=""),
+            root.findtext("Encrypt", default=""),
+        )
+        assert b"<Content>hello</Content>" in decrypted
+
+    def test_signature_mismatch_raises(self):
+        account = _account()
+        crypt = WXBizMsgCrypt(account.token, account.encoding_aes_key, account.corp_id)
+        encrypted_xml = crypt.encrypt("<xml/>", nonce="n", timestamp="1")
+        root = ET.fromstring(encrypted_xml)
+        from gateway.platforms.wecom.crypto import SignatureError
+        with pytest.raises(SignatureError):
+            crypt.decrypt("bad-sig", "1", "n", root.findtext("Encrypt", default=""))
+
+
+class TestWecomCallbackEventConstruction:
+    def test_build_event_extracts_text_message(self):
+        adapter = WecomCallbackAdapter(_config())
+        xml_text = """
+        <xml>
+          <ToUserName>ww1234567890</ToUserName>
+          <FromUserName>zhangsan</FromUserName>
+          <CreateTime>1710000000</CreateTime>
+          <MsgType>text</MsgType>
+          <Content>\u4f60\u597d</Content>
+          <MsgId>123456789</MsgId>
+        </xml>
+        """
+        event = adapter._build_event(_account(), xml_text)
+        assert event is not None
+        assert event.source is not None
+        assert event.source.user_id == "zhangsan"
+        assert event.source.chat_id == "ww1234567890:zhangsan"
+        assert event.message_id == "123456789"
+        assert event.text == "\u4f60\u597d"
+
+    def test_build_event_returns_none_for_subscribe(self):
+        adapter = WecomCallbackAdapter(_config())
+        xml_text = """
+        <xml>
+          <ToUserName>ww1234567890</ToUserName>
+          <FromUserName>zhangsan</FromUserName>
+          <CreateTime>1710000000</CreateTime>
+          <MsgType>event</MsgType>
+          <Event>subscribe</Event>
+        </xml>
+        """
+        event = adapter._build_event(_account(), xml_text)
+        assert event is None
+
+
+class TestWecomCallbackRouting:
+    def test_user_account_key_scopes_across_corps(self):
+        adapter = WecomCallbackAdapter(_config())
+        assert adapter._user_account_key("corpA", "alice") == "corpA:alice"
+        assert adapter._user_account_key("corpB", "alice") == "corpB:alice"
+        assert adapter._user_account_key("corpA", "alice") != adapter._user_account_key("corpB", "alice")
+
+    @pytest.mark.asyncio
+    async def test_send_selects_correct_account_for_scoped_chat_id(self):
+        accounts = [
+            _account(account_id="corp-a", corp_id="corpA", agent_id=1001),
+            _account(account_id="corp-b", corp_id="corpB", agent_id=2002),
+        ]
+        adapter = WecomCallbackAdapter(_config(accounts=accounts))
+        adapter._user_account_map["corpB:alice"] = "corp-b"
+        adapter._access_tokens["corp-b"] = {"token": "tok-b", "expires_at": 9999999999}
+
+        calls = {}
+
+        class FakeResponse:
+            def json(self):
+                return {"errcode": 0, "msgid": "ok1"}
+
+        class FakeClient:
+            async def post(self, url, json):
+                calls["url"] = url
+                calls["json"] = json
+                return FakeResponse()
+
+        adapter._http_client = FakeClient()
+        result = await adapter.send("corpB:alice", "hello")
+
+        assert result.success is True
+        assert calls["json"]["touser"] == "alice"
+        assert calls["json"]["agentid"] == 2002
+        assert "tok-b" in calls["url"]
+
+    @pytest.mark.asyncio
+    async def test_send_falls_back_from_bare_user_id_when_unique(self):
+        accounts = [_account(account_id="corp-a", corp_id="corpA", agent_id=1001)]
+        adapter = WecomCallbackAdapter(_config(accounts=accounts))
+        adapter._user_account_map["corpA:alice"] = "corp-a"
+        adapter._access_tokens["corp-a"] = {"token": "tok-a", "expires_at": 9999999999}
+
+        calls = {}
+
+        class FakeResponse:
+            def json(self):
+                return {"errcode": 0, "msgid": "ok2"}
+
+        class FakeClient:
+            async def post(self, url, json):
+                calls["url"] = url
+                calls["json"] = json
+                return FakeResponse()
+
+        adapter._http_client = FakeClient()
+        result = await adapter.send("alice", "hello")
+
+        assert result.success is True
+        assert calls["json"]["agentid"] == 1001
+
+
+import logging
+
+
+def test_build_event_logs_agent_id_mismatch(caplog):
+    from gateway.config import PlatformConfig
+    from gateway.platforms.wecom.callback import WecomCallbackAdapter
+
+    config = PlatformConfig(
+        enabled=True,
+        extra={
+            "corp_id": "c1",
+            "corp_secret": "cs",
+            "agent_id": 100,
+            "token": "tok",
+            "encoding_aes_key": "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG",
+        },
+    )
+    adapter = WecomCallbackAdapter(config)
+    xml = """<xml><ToUserName>c1</ToUserName><FromUserName>user1</FromUserName><MsgType>text</MsgType><Content>hi</Content><MsgId>1</MsgId><AgentID>999</AgentID></xml>"""
+    account = adapter._accounts[0]
+    with caplog.at_level(logging.WARNING):
+        event = adapter._build_event(account, xml)
+        assert event is not None
+        assert "agent_id mismatch" in caplog.text
+
+
+class TestWecomCallbackPollLoop:
+    @pytest.mark.asyncio
+    async def test_poll_loop_dispatches_handle_message(self, monkeypatch):
+        adapter = WecomCallbackAdapter(_config())
+        calls = []
+
+        async def fake_handle_message(event):
+            calls.append(event.text)
+
+        monkeypatch.setattr(adapter, "handle_message", fake_handle_message)
+        event = adapter._build_event(
+            _account(),
+            """
+            <xml>
+              <ToUserName>ww1234567890</ToUserName>
+              <FromUserName>lisi</FromUserName>
+              <CreateTime>1710000000</CreateTime>
+              <MsgType>text</MsgType>
+              <Content>test</Content>
+              <MsgId>m2</MsgId>
+            </xml>
+            """,
+        )
+        task = asyncio.create_task(adapter._poll_loop())
+        await adapter._message_queue.put(event)
+        await asyncio.sleep(0.05)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert calls == ["test"]
+
+
+@pytest.mark.asyncio
+async def test_callback_adapter_send_document_flow():
+    from unittest.mock import AsyncMock, patch
+    from gateway.config import PlatformConfig
+    from gateway.platforms.wecom.callback import WecomCallbackAdapter
+    from gateway.platforms.base import SendResult
+
+    config = PlatformConfig(
+        enabled=True,
+        extra={
+            "corp_id": "c1",
+            "corp_secret": "cs1",
+            "agent_id": 100,
+            "token": "tok",
+            "encoding_aes_key": "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG",
+        }
+    )
+    adapter = WecomCallbackAdapter(config)
+    adapter._http_client = AsyncMock()
+
+    with patch("gateway.platforms.wecom.callback.MediaPreparer") as mock_prep_cls:
+        mock_prep = mock_prep_cls.return_value
+        mock_prep.prepare = AsyncMock(return_value={
+            "data": b"fakepdf",
+            "content_type": "application/pdf",
+            "file_name": "doc.pdf",
+            "detected_type": "file",
+            "final_type": "file",
+            "rejected": False,
+            "downgraded": False,
+            "downgrade_note": None,
+        })
+        with patch.object(adapter, "_upload_media_to_agent_api", new_callable=AsyncMock) as mock_upload:
+            mock_upload.return_value = "mid-1"
+            with patch.object(adapter, "send", new_callable=AsyncMock) as mock_send:
+                mock_send.return_value = SendResult(success=True, message_id="m1")
+                result = await adapter.send_document("c1:user-1", "/tmp/doc.pdf")
+                assert result.success is True
+                mock_upload.assert_awaited_once()
+                mock_prep.prepare.assert_awaited_once_with("/tmp/doc.pdf", None)
