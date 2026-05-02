@@ -2671,7 +2671,14 @@ def _client_cache_key(
     is_vision: bool = False,
 ) -> tuple:
     runtime = _normalize_main_runtime(main_runtime)
-    runtime_key = tuple(runtime.get(field, "") for field in _MAIN_RUNTIME_FIELDS) if provider == "auto" else ()
+    if provider == "auto":
+        runtime_key = tuple(runtime.get(field, "") for field in _MAIN_RUNTIME_FIELDS)
+        # When main_runtime is empty, read from config so cache invalidates
+        # when the user switches providers (#17800).
+        if not any(runtime_key):
+            runtime_key = (_read_main_provider(), _read_main_model(), "", "", "")
+    else:
+        runtime_key = ()
     return (provider, async_mode, base_url or "", api_key or "", api_mode or "", runtime_key, is_vision)
 
 

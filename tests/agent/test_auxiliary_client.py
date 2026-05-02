@@ -1738,3 +1738,69 @@ class TestVisionAutoSkipsKimiCoding:
             "kimi-coding",
             "kimi-coding-cn",
         })
+
+
+class TestClientCacheKey:
+    """Cache key must invalidate when provider config changes."""
+
+    def test_auto_cache_key_includes_main_provider_when_runtime_empty(self, monkeypatch):
+        """When main_runtime is empty, cache key includes config-derived
+        provider+model so switching providers evicts stale clients."""
+        from agent.auxiliary_client import _client_cache_key
+
+        monkeypatch.setattr(
+            "agent.auxiliary_client._read_main_provider", lambda: "minimax-cn",
+        )
+        monkeypatch.setattr(
+            "agent.auxiliary_client._read_main_model", lambda: "MiniMax-M2.7",
+        )
+
+        key = _client_cache_key("auto", async_mode=False, main_runtime=None)
+        assert key == (
+            "auto", False, "", "", "",
+            ("minimax-cn", "MiniMax-M2.7", "", "", ""),
+            False,
+        )
+
+    def test_auto_cache_key_uses_runtime_when_provided(self, monkeypatch):
+        """When main_runtime is provided, cache key uses it directly."""
+        from agent.auxiliary_client import _client_cache_key
+
+        key = _client_cache_key(
+            "auto",
+            async_mode=False,
+            main_runtime={
+                "provider": "openrouter",
+                "model": "anthropic/claude-sonnet-4-6",
+                "base_url": "",
+                "api_key": "",
+                "api_mode": "",
+            },
+        )
+        assert key == (
+            "auto", False, "", "", "",
+            ("openrouter", "anthropic/claude-sonnet-4-6", "", "", ""),
+            False,
+        )
+
+    def test_auto_cache_key_changes_when_provider_switches(self, monkeypatch):
+        """Switching providers must produce a different cache key."""
+        from agent.auxiliary_client import _client_cache_key
+
+        monkeypatch.setattr(
+            "agent.auxiliary_client._read_main_provider", lambda: "minimax-cn",
+        )
+        monkeypatch.setattr(
+            "agent.auxiliary_client._read_main_model", lambda: "MiniMax-M2.7",
+        )
+        key_old = _client_cache_key("auto", async_mode=False, main_runtime=None)
+
+        monkeypatch.setattr(
+            "agent.auxiliary_client._read_main_provider", lambda: "openrouter",
+        )
+        monkeypatch.setattr(
+            "agent.auxiliary_client._read_main_model", lambda: "gpt-4o",
+        )
+        key_new = _client_cache_key("auto", async_mode=False, main_runtime=None)
+
+        assert key_old != key_new
