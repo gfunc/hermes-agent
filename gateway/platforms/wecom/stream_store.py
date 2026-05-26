@@ -197,7 +197,6 @@ class StreamStore:
         batch.timer = loop.create_task(
             self._flush_after(batch, debounce_ms)
         )
-        self._evict_if_needed()
         return stream_id, "active_new"
 
     async def _flush_after(self, batch: PendingBatch, debounce_ms: float) -> None:

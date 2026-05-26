@@ -202,11 +202,17 @@ class TestPlatformDefaults:
 
         assert resolve_display_setting({}, "slack", "tool_progress") == "off"
 
+    def test_wecom_medium_tier(self):
+        """WeCom upgraded to medium tier — tool_progress defaults to 'new'."""
+        from gateway.display_config import resolve_display_setting
+
+        assert resolve_display_setting({}, "wecom", "tool_progress") == "new"
+
     def test_low_tier_platforms(self):
         """Signal, BlueBubbles, etc. default to 'off' tool progress."""
         from gateway.display_config import resolve_display_setting
 
-        for plat in ("signal", "bluebubbles", "weixin", "wecom", "dingtalk"):
+        for plat in ("signal", "bluebubbles", "weixin", "dingtalk"):
             assert resolve_display_setting({}, plat, "tool_progress") == "off", plat
 
     def test_minimal_tier_platforms(self):

@@ -21,6 +21,7 @@ import logging
 import queue
 import re
 import time
+import uuid
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
@@ -168,6 +169,15 @@ class GatewayStreamConsumer:
         self._in_think_block = False
         self._think_buffer = ""
 
+        # Native streaming state.  Resolved at the start of run() based on
+        # cfg.transport and the adapter's supports_native_streaming() probe.
+        # When True, mid-stream frames are delivered via
+        # adapter.send_stream_chunk (e.g. WeCom reply_stream).  The platform
+        # converts the final frame into a real message, so unlike drafts
+        # native streaming can handle finalize directly.
+        self._use_native_streaming = False
+        self._native_stream_id: Optional[str] = None
+
         # Native draft-streaming state.  Resolved at the start of run() based
         # on cfg.transport, cfg.chat_type, and the adapter's
         # supports_draft_streaming() probe.  When True, the consumer emits
@@ -260,6 +270,10 @@ class GatewayStreamConsumer:
         self._last_sent_text = ""
         self._fallback_final_send = False
         self._fallback_prefix = ""
+        # Native streaming: each segment gets its own stream_id so prior
+        # segments don't bleed into the next one.
+        if self._use_native_streaming:
+            self._native_stream_id = self._new_native_stream_id()
         # Native draft streaming: bump the draft_id so the next text segment
         # animates as a fresh preview below the tool-progress bubbles, not
         # over the prior segment's already-finalized draft.  This is how
@@ -407,6 +421,18 @@ class GatewayStreamConsumer:
         )
         _raw_limit = getattr(self.adapter, "MAX_MESSAGE_LENGTH", 4096)
         _safe_limit = max(500, _raw_limit - _len_fn(self.cfg.cursor) - 100)
+
+        # Resolve native streaming once per run.  When enabled the consumer
+        # routes frames through adapter.send_stream_chunk.  The platform
+        # converts the final frame into a real message, so no separate
+        # final-send path is needed.
+        self._use_native_streaming = self._resolve_native_streaming()
+        if self._use_native_streaming:
+            self._native_stream_id = self._new_native_stream_id()
+            logger.debug(
+                "Stream consumer using native streaming transport (chat=%s stream_id=%s)",
+                self.chat_id, self._native_stream_id,
+            )
 
         # Resolve native draft streaming once per run.  When enabled the
         # consumer routes mid-stream frames through adapter.send_draft and
@@ -865,6 +891,53 @@ class GatewayStreamConsumer:
         err_lower = err.lower()
         return "flood" in err_lower or "retry after" in err_lower or "rate" in err_lower
 
+    def _new_native_stream_id(self) -> str:
+        """Generate a fresh stream id for native streaming."""
+        return f"stream-{uuid.uuid4().hex}"
+
+    def _resolve_native_streaming(self) -> bool:
+        """Decide whether this run should use native streaming.
+
+        Honors ``cfg.transport``:
+          * ``"edit"``  → never use native streaming.
+          * ``"auto"``  → use native when the adapter supports it.
+          * ``"off"``   → handled upstream by the gateway; treat as edit defensively.
+
+        Adapter eligibility is checked via
+        :meth:`BasePlatformAdapter.supports_native_streaming`.
+        """
+        transport = (self.cfg.transport or "edit").lower()
+        if transport == "edit":
+            logger.debug("Native streaming disabled: transport=edit")
+            return False
+        if transport == "off":
+            logger.debug("Native streaming disabled: transport=off")
+            return False
+        # Test adapters are MagicMocks that don't subclass BasePlatformAdapter;
+        # default them to edit so existing test behaviour is preserved.
+        if not isinstance(self.adapter, _BasePlatformAdapter):
+            logger.debug(
+                "Native streaming skipped: adapter %s does not inherit BasePlatformAdapter",
+                type(self.adapter).__name__,
+            )
+            return False
+        try:
+            supported = self.adapter.supports_native_streaming()
+        except Exception:
+            logger.debug("supports_native_streaming probe raised", exc_info=True)
+            supported = False
+        if not supported:
+            logger.debug(
+                "Native streaming not supported by adapter %s",
+                type(self.adapter).__name__,
+            )
+            return False
+        logger.debug(
+            "Native streaming enabled for adapter %s",
+            type(self.adapter).__name__,
+        )
+        return True
+
     def _resolve_draft_streaming(self) -> bool:
         """Decide whether this run should use native draft streaming.
 
@@ -906,6 +979,44 @@ class GatewayStreamConsumer:
                     self.chat_id, self.cfg.chat_type,
                 )
             return False
+        return True
+
+    async def _send_native_chunk(self, text: str, *, finalize: bool = False) -> bool:
+        """Emit a single native streaming frame via adapter.send_stream_chunk.
+
+        Returns True when the frame landed.  On any failure, permanently
+        disables native streaming for the remainder of this run so subsequent
+        frames flow through the edit-based path.
+        """
+        if self._native_stream_id is None:
+            # Defensive: should never happen — _use_native_streaming gate is
+            # set in tandem with _native_stream_id in run().  Disable to be safe.
+            self._use_native_streaming = False
+            return False
+        try:
+            result = await self.adapter.send_stream_chunk(
+                stream_id=self._native_stream_id,
+                content=text,
+                finish=finalize,
+            )
+        except Exception as e:
+            logger.debug(
+                "send_stream_chunk raised, disabling native transport for this run: %s", e,
+            )
+            self._use_native_streaming = False
+            return False
+        if not getattr(result, "success", False):
+            logger.debug(
+                "send_stream_chunk returned success=False, disabling native transport: %s",
+                getattr(result, "error", "unknown"),
+            )
+            self._use_native_streaming = False
+            return False
+        # Frame delivered.  Track text for parity with edit-based no-op skip.
+        self._last_sent_text = text
+        self._already_sent = True
+        if finalize:
+            self._final_content_delivered = True
         return True
 
     async def _send_draft_frame(self, text: str) -> bool:
@@ -1141,6 +1252,23 @@ class GatewayStreamConsumer:
                 and self.cfg.cursor in text
                 and len(_visible_stripped) < _MIN_NEW_MSG_CHARS):
             return True  # too short for a standalone message — accumulate more
+
+        # Native streaming: route frames through adapter.send_stream_chunk.
+        # Unlike drafts, native streaming supports finalize — the platform
+        # converts the final frame into a real message in the chat history.
+        if (
+            self._use_native_streaming
+            and self._native_stream_id is not None
+        ):
+            # No-op skip: identical to the last frame we sent (and not finalizing).
+            if text == self._last_sent_text and not finalize:
+                return True
+            ok = await self._send_native_chunk(text, finalize=finalize)
+            if ok:
+                if finalize:
+                    self._final_response_sent = True
+                return True
+            # Failure already disabled native for this run; fall through.
 
         # Native draft streaming: route mid-stream frames through send_draft.
         # The final answer is delivered via the regular sendMessage path
