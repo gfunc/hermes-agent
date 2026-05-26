@@ -1629,6 +1629,14 @@ class BasePlatformAdapter(ABC):
             f"{type(self).__name__} does not implement send_draft"
         )
 
+    def supports_native_streaming(self) -> bool:
+        """Whether this adapter supports native in-place streaming.
+
+        When True, GatewayStreamConsumer routes stream deltas through
+        :meth:`send_stream_chunk` instead of edit-based progressive updates.
+        """
+        return False
+
     @property
     def has_fatal_error(self) -> bool:
         return self._fatal_error_message is not None
@@ -1882,6 +1890,23 @@ class BasePlatformAdapter(ABC):
         should set ``finalize=True`` on the final edit of a streamed
         response (typically when ``got_done`` fires in the stream
         consumer) and leave it ``False`` on intermediate edits.
+        """
+        return SendResult(success=False, error="Not supported")
+
+    async def send_stream_chunk(
+        self,
+        stream_id: str,
+        content: str,
+        *,
+        finish: bool = False,
+    ) -> "SendResult":
+        """Send a single native stream frame.
+
+        Platforms that support native streaming (e.g. WeCom via
+        ``reply_stream``) override this.  The *stream_id* is opaque to the
+        caller — adapters may map it to platform-specific identifiers.
+
+        ``finish=True`` signals the final frame of the stream.
         """
         return SendResult(success=False, error="Not supported")
 
