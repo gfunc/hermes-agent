@@ -64,6 +64,16 @@ except ImportError:
     HTTPX_AVAILABLE = False
     httpx = None  # type: ignore[assignment]
 
+try:
+    from aibot import WSClient, WSClientOptions
+    from aibot.types import WsCmd
+    _SDK_AVAILABLE = True
+except ImportError:
+    _SDK_AVAILABLE = False
+    WSClient = None  # type: ignore[assignment,misc]
+    WSClientOptions = None  # type: ignore[assignment,misc]
+    WsCmd = None  # type: ignore[assignment,misc]
+
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.helpers import MessageDeduplicator, TextBatchAggregator
 from gateway.platforms.wecom.accounts import resolve_wecom_accounts, WeComAccount
@@ -243,6 +253,10 @@ class WeComAdapter(BasePlatformAdapter):
         )
         self._kicked = False
 
+        # SDK client (wecom-aibot-python-sdk)
+        self._sdk_client: Optional[Any] = None
+        self._last_inbound_frame: Optional[Dict[str, Any]] = None
+
         # Webhook server (for bot webhook mode accounts)
         self._webhook_runner: Optional["web.AppRunner"] = None
         self._webhook_site: Optional["web.TCPSite"] = None
@@ -327,18 +341,35 @@ class WeComAdapter(BasePlatformAdapter):
                     logger.warning("[%s] %s", self.name, message)
                     return False
 
+                if not _SDK_AVAILABLE:
+                    message = "WeCom startup failed: wecom-aibot-python-sdk not installed"
+                    self._set_fatal_error("wecom_missing_dependency", message, retryable=True)
+                    logger.warning("[%s] %s. Run: pip install wecom-aibot-python-sdk", self.name, message)
+                    return False
+
                 self._bot_id = primary.bot_id
                 self._secret = primary.secret
                 self._ws_url = primary.websocket_url
-                await self._open_connection()
-                self._listen_task = asyncio.create_task(self._listen_loop())
-                self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
-                self._watchdog_task = asyncio.create_task(self._watchdog_loop())
-                self._last_frame_at = asyncio.get_running_loop().time()
+
+                options = WSClientOptions(
+                    bot_id=primary.bot_id,
+                    secret=primary.secret,
+                    ws_url=primary.websocket_url,
+                )
+                self._sdk_client = WSClient(options)
+
+                # Bridge SDK events
+                self._sdk_client.on_message = self._on_sdk_message
+                self._sdk_client.on_connected = lambda: logger.info("[%s] Connected", self.name)
+                self._sdk_client.on_authenticated = lambda: logger.info("[%s] Authenticated", self.name)
+                self._sdk_client.on_disconnected = lambda reason: logger.info("[%s] Disconnected: %s", self.name, reason)
+                self._sdk_client.on_error = lambda err: logger.error("[%s] SDK error: %s", self.name, err)
+
+                await self._sdk_client.connect()
                 self._mark_connected()
                 logger.info(
-                    "[%s] WebSocket connected for account '%s' to %s",
-                    self.name, primary.account_id, self._ws_url,
+                    "[%s] SDK WebSocket connected for account '%s'",
+                    self.name, primary.account_id,
                 )
                 connected_any = True
                 if len(ws_accounts) > 1:
@@ -410,6 +441,10 @@ class WeComAdapter(BasePlatformAdapter):
         """Disconnect from WeCom."""
         self._running = False
         self._mark_disconnected()
+
+        if self._sdk_client:
+            self._sdk_client.disconnect()
+            self._sdk_client = None
 
         if self._listen_task:
             self._listen_task.cancel()
@@ -1102,6 +1137,7 @@ class WeComAdapter(BasePlatformAdapter):
         commands are rejected immediately so they never enter the serial
         processing pipeline.
         """
+        self._last_inbound_frame = payload
         body = payload.get("body")
         if not isinstance(body, dict):
             await self._on_message(payload)
@@ -2612,6 +2648,31 @@ class WeComAdapter(BasePlatformAdapter):
             caption=caption,
             reply_to=reply_to,
         )
+
+    # ------------------------------------------------------------------
+    # Native streaming interface (SDK-backed)
+    # ------------------------------------------------------------------
+
+    def supports_native_streaming(self) -> bool:
+        return _SDK_AVAILABLE and self._sdk_client is not None
+
+    async def send_stream_chunk(
+        self, stream_id: str, content: str, *, finish: bool = False
+    ) -> SendResult:
+        if not self._sdk_client:
+            return SendResult(success=False, error="SDK client not connected")
+
+        try:
+            await self._sdk_client.reply_stream(
+                frame=self._last_inbound_frame or {"headers": {}},
+                stream_id=stream_id,
+                content=content,
+                finish=finish,
+            )
+            return SendResult(success=True, message_id=stream_id)
+        except Exception as exc:
+            logger.warning("[%s] send_stream_chunk failed: %s", self.name, exc)
+            return SendResult(success=False, error=str(exc))
 
     def pause_typing_for_chat(self, chat_id: str) -> None:
         """Pause typing and schedule the active WeCom stream for closing.
