@@ -94,9 +94,11 @@ class StreamStore:
         self,
         flush_handler: Callable[[PendingInbound], Any],
         ttl_seconds: float = 600,
+        max_active_streams: int = 1000,
     ):
         self._flush_handler = flush_handler
         self._ttl_seconds = ttl_seconds
+        self._max_active_streams = max_active_streams
         self._streams: Dict[str, StreamState] = {}
         self._msgid_to_stream: Dict[str, str] = {}
         self._batches: Dict[str, PendingBatch] = {}
@@ -194,6 +196,7 @@ class StreamStore:
         batch.timer = loop.create_task(
             self._flush_after(batch, debounce_ms)
         )
+        self._evict_if_needed()
         return stream_id, "active_new"
 
     async def _flush_after(self, batch: PendingBatch, debounce_ms: float) -> None:
@@ -240,10 +243,42 @@ class StreamStore:
             pass
 
     def _prune(self) -> None:
-        cutoff = time.time() - self._ttl_seconds
-        expired = [sid for sid, s in self._streams.items() if s.finished and s.created_at < cutoff]
+        now = time.time()
+        finished_cutoff = now - self._ttl_seconds
+        stale_cutoff = now - (self._ttl_seconds * 2)
+
+        expired = [
+            sid for sid, s in self._streams.items()
+            if (s.finished and s.created_at < finished_cutoff)
+            or (not s.finished and s.created_at < stale_cutoff)
+        ]
         for sid in expired:
             self._streams.pop(sid, None)
-        expired_msgids = [mid for mid, sid in self._msgid_to_stream.items() if sid in expired]
+
+        expired_msgids = [
+            mid for mid, sid in self._msgid_to_stream.items()
+            if sid in expired
+        ]
         for mid in expired_msgids:
             self._msgid_to_stream.pop(mid, None)
+
+    def _evict_if_needed(self) -> None:
+        """Evict oldest unfinished streams if over max limit."""
+        if len(self._streams) <= self._max_active_streams:
+            return
+
+        # Sort unfinished streams by created_at, evict oldest
+        unfinished = [
+            (sid, s) for sid, s in self._streams.items()
+            if not s.finished
+        ]
+        unfinished.sort(key=lambda x: x[1].created_at)
+
+        to_evict = len(self._streams) - self._max_active_streams
+        for sid, _ in unfinished[:to_evict]:
+            logger.warning("[stream_store] Evicting oldest unfinished stream %s", sid)
+            self._streams.pop(sid, None)
+            # Clean up msgid mapping
+            for mid, mapped_sid in list(self._msgid_to_stream.items()):
+                if mapped_sid == sid:
+                    self._msgid_to_stream.pop(mid, None)
