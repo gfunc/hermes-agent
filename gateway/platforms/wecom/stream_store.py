@@ -177,6 +177,7 @@ class StreamStore:
                 batch.msgids.append(str(msg["msgid"]))
             return batch.stream_id, "active_merged"
 
+        self._evict_if_needed()
         stream_id = self.create_stream(msgid=msg.get("msgid"))
         batch = PendingBatch(
             conversation_key=conversation_key,
@@ -264,7 +265,7 @@ class StreamStore:
 
     def _evict_if_needed(self) -> None:
         """Evict oldest unfinished streams if over max limit."""
-        if len(self._streams) <= self._max_active_streams:
+        if len(self._streams) < self._max_active_streams:
             return
 
         # Sort unfinished streams by created_at, evict oldest
@@ -274,7 +275,7 @@ class StreamStore:
         ]
         unfinished.sort(key=lambda x: x[1].created_at)
 
-        to_evict = len(self._streams) - self._max_active_streams
+        to_evict = len(self._streams) - self._max_active_streams + 1
         for sid, _ in unfinished[:to_evict]:
             logger.warning("[stream_store] Evicting oldest unfinished stream %s", sid)
             self._streams.pop(sid, None)
