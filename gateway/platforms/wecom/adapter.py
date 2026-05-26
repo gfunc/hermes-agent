@@ -74,6 +74,33 @@ except ImportError:
     WSClientOptions = None  # type: ignore[assignment,misc]
     WsCmd = None  # type: ignore[assignment,misc]
 
+
+def _ensure_wecom_sdk() -> bool:
+    """Lazy-install wecom-aibot-python-sdk if missing.
+
+    Calls ``tools.lazy_deps.ensure("platform.wecom")`` on first use.
+    After a successful install, re-imports the SDK and flips
+    ``_SDK_AVAILABLE`` to True.
+    """
+    global _SDK_AVAILABLE, WSClient, WSClientOptions, WsCmd
+    if _SDK_AVAILABLE:
+        return True
+    try:
+        from tools.lazy_deps import ensure as _lazy_ensure
+        _lazy_ensure("platform.wecom", prompt=False)
+    except Exception:
+        return False
+    try:
+        from aibot import WSClient as _WSClient, WSClientOptions as _WSClientOptions
+        from aibot.types import WsCmd as _WsCmd
+    except ImportError:
+        return False
+    WSClient = _WSClient
+    WSClientOptions = _WSClientOptions
+    WsCmd = _WsCmd
+    _SDK_AVAILABLE = True
+    return True
+
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.helpers import MessageDeduplicator, TextBatchAggregator
 from gateway.platforms.wecom.accounts import resolve_wecom_accounts, WeComAccount
@@ -341,7 +368,7 @@ class WeComAdapter(BasePlatformAdapter):
                     logger.warning("[%s] %s", self.name, message)
                     return False
 
-                if not _SDK_AVAILABLE:
+                if not _SDK_AVAILABLE and not _ensure_wecom_sdk():
                     message = "WeCom startup failed: wecom-aibot-python-sdk not installed"
                     self._set_fatal_error("wecom_missing_dependency", message, retryable=True)
                     logger.warning("[%s] %s. Run: pip install wecom-aibot-python-sdk", self.name, message)

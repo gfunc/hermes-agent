@@ -148,6 +148,9 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
         "lark-oapi==1.5.3",
         "qrcode==7.4.2",
     ),
+    # WeCom SDK-mode adapter — WebSocket connectivity and native streaming
+    # via the official wecom-aibot-python-sdk.
+    "platform.wecom": ("wecom-aibot-python-sdk==1.0.2",),
     # WeCom callback-mode adapter — parses untrusted XML POST bodies. Pulls
     # defusedxml only; aiohttp/httpx are core dependencies of every messaging
     # adapter and ship via `platform.discord` / `platform.slack` / etc.
