@@ -385,12 +385,13 @@ class WeComAdapter(BasePlatformAdapter):
                 )
                 self._sdk_client = WSClient(options)
 
-                # Bridge SDK events
-                self._sdk_client.on_message = self._on_sdk_message
-                self._sdk_client.on_connected = lambda: logger.info("[%s] Connected", self.name)
-                self._sdk_client.on_authenticated = lambda: logger.info("[%s] Authenticated", self.name)
-                self._sdk_client.on_disconnected = lambda reason: logger.info("[%s] Disconnected: %s", self.name, reason)
-                self._sdk_client.on_error = lambda err: logger.error("[%s] SDK error: %s", self.name, err)
+                # Bridge SDK events (pyee AsyncIOEventEmitter uses .on(), not
+                # attribute assignment, for event registration).
+                self._sdk_client.on("message", self._on_sdk_message)
+                self._sdk_client.on("connected", lambda: logger.info("[%s] Connected", self.name))
+                self._sdk_client.on("authenticated", lambda: logger.info("[%s] Authenticated", self.name))
+                self._sdk_client.on("disconnected", lambda reason: logger.info("[%s] Disconnected: %s", self.name, reason))
+                self._sdk_client.on("error", lambda err: logger.error("[%s] SDK error: %s", self.name, err))
 
                 await self._sdk_client.connect()
                 self._mark_connected()
