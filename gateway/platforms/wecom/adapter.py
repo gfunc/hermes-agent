@@ -1010,7 +1010,7 @@ class WeComAdapter(BasePlatformAdapter):
                 except Exception as exc:
                     logger.debug("[%s] Version handshake reply failed: %s", self.name, exc)
                 return
-            await self._on_message(payload)
+            await self._on_sdk_message(payload)
             return
         if cmd == APP_CMD_PING:
             return
@@ -1094,6 +1094,41 @@ class WeComAdapter(BasePlatformAdapter):
     # Inbound message parsing
     # ------------------------------------------------------------------
 
+    async def _on_sdk_message(self, payload: Dict[str, Any]) -> None:
+        """Auth-check wrapper for SDK inbound messages.
+
+        Mirrors the Webhook path: command authorization is evaluated BEFORE
+        the message is enqueued to ``ChatSerialQueue``.  Unauthorized
+        commands are rejected immediately so they never enter the serial
+        processing pipeline.
+        """
+        body = payload.get("body")
+        if not isinstance(body, dict):
+            await self._on_message(payload)
+            return
+
+        sender = body.get("from") if isinstance(body.get("from"), dict) else {}
+        sender_id = str(sender.get("userid") or "").strip()
+        chat_id = str(body.get("chatid") or sender_id).strip()
+        is_group = str(body.get("chattype") or "").lower() == "group"
+
+        text, _ = self._extract_text(body)
+        if is_group and text:
+            text = re.sub(r"^@\S+\s*", "", text).strip()
+
+        account = self._accounts[0] if self._accounts else None
+        if account:
+            chat_type = "group" if is_group else ""
+            auth = resolve_command_auth(account, text, sender_id, chat_id=chat_id, chat_type=chat_type)
+            if auth.should_compute_auth and not auth.command_authorized:
+                logger.info(
+                    "[%s] Dropping unauthorized command from %s in chat %s",
+                    self.name, sender_id, chat_id,
+                )
+                return
+
+        await self._on_message(payload)
+
     async def _on_message(self, payload: Dict[str, Any]) -> None:
         """Process an inbound WeCom message callback event."""
         body = payload.get("body")
@@ -1174,24 +1209,6 @@ class WeComAdapter(BasePlatformAdapter):
         if event_name == "auth_change_event":
             text = self._build_auth_change_text(body)
 
-        # Command authorization check
-        account = self._accounts[0] if self._accounts else WeComAccount(account_id="default")
-        chat_type = "group" if is_group else ""
-        auth = resolve_command_auth(account, text, sender_id, chat_id=chat_id, chat_type=chat_type)
-        if auth.should_compute_auth and not auth.command_authorized:
-            prompt = build_unauthorized_command_prompt(sender_id, auth.dm_policy)
-            try:
-                await self._send_request(
-                    APP_CMD_SEND,
-                    {
-                        "chatid": chat_id,
-                        "msgtype": "markdown",
-                        "markdown": {"content": prompt},
-                    },
-                )
-            except Exception as exc:
-                logger.warning("[%s] Failed to send command rejection: %s", self.name, exc)
-            return
         media_urls, media_types = await self._extract_media(body, chat_id=chat_id)
         message_type = self._derive_message_type(body, text, media_types)
         has_reply_context = bool(reply_text and (text or media_urls))
@@ -2645,10 +2662,18 @@ class WeComAdapter(BasePlatformAdapter):
             # instead of an expired or scrolled-out original message.
             reply_req_id = self._last_reply_req_id_per_chat.get(chat_id)
         if not reply_req_id:
+            # No passive-reply req_id available — fall back to proactive send.
             logger.debug(
-                "[%s] send_typing: chat=%s msg_id=%s no reply_req_id, returning",
+                "[%s] send_typing: chat=%s msg_id=%s no reply_req_id, trying proactive",
                 self.name, chat_id, message_id,
             )
+            try:
+                await self._send_proactive_typing(chat_id)
+            except Exception as exc:
+                logger.info(
+                    "[%s] send_typing: no reply req_id for msg_id=%s, proactive typing unavailable: %s",
+                    self.name, message_id, exc,
+                )
             return
 
         # If a response is currently being sent for this req_id (HTTP in
@@ -2697,6 +2722,31 @@ class WeComAdapter(BasePlatformAdapter):
                 logger.debug("[%s] Failed to send typing placeholder to %s: %s", self.name, chat_id, exc)
         except Exception as exc:
             logger.debug("[%s] Failed to send typing placeholder to %s: %s", self.name, chat_id, exc)
+
+    async def _send_proactive_typing(self, chat_id: str) -> None:
+        """Send a proactive typing indicator via ``aibot_send_msg``.
+
+        WeCom does not support a native proactive typing API, so we send a
+        minimal markdown message that the client may render as an ephemeral
+        indicator.  This is a best-effort fallback when no ``reply_req_id``
+        is available for the passive-reply stream path.
+        """
+        try:
+            response = await self._send_request(
+                APP_CMD_SEND,
+                {
+                    "chatid": chat_id,
+                    "msgtype": "markdown",
+                    "markdown": {"content": "<think></think>"},
+                },
+            )
+            self._raise_for_wecom_error(response, "send proactive typing")
+            logger.debug(
+                "[%s] _send_proactive_typing: chat=%s sent successfully",
+                self.name, chat_id,
+            )
+        except Exception as exc:
+            logger.debug("[%s] _send_proactive_typing failed for %s: %s", self.name, chat_id, exc)
 
     async def stop_typing(self, chat_id: str) -> None:
         """Move the active WeCom typing stream to pending-close.
