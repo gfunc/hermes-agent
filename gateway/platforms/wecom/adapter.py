@@ -1097,6 +1097,21 @@ class WeComAdapter(BasePlatformAdapter):
 
     async def _send_request(self, cmd: str, body: Dict[str, Any], timeout: float = REQUEST_TIMEOUT_SECONDS) -> Dict[str, Any]:
         """Send a JSON request and await the correlated response."""
+        # SDK path: use the SDK's managed send/reply mechanism
+        if self._sdk_client and self._sdk_client.is_connected:
+            req_id = self._new_req_id(cmd)
+            try:
+                frame = await asyncio.wait_for(
+                    self._sdk_client._ws_manager.send_reply(req_id, body, cmd),
+                    timeout=timeout,
+                )
+                return frame
+            except RuntimeError as exc:
+                return {"errcode": -1, "errmsg": str(exc)}
+            except asyncio.TimeoutError:
+                return {"errcode": -1, "errmsg": f"Request timeout after {timeout}s"}
+
+        # Legacy WebSocket path
         if not self._ws or self._ws.closed:
             raise RuntimeError("WeCom websocket is not connected")
 
@@ -1118,6 +1133,23 @@ class WeComAdapter(BasePlatformAdapter):
         timeout: float = REQUEST_TIMEOUT_SECONDS,
     ) -> Dict[str, Any]:
         """Send a reply frame correlated to an inbound callback req_id."""
+        # SDK path: the SDK handles reply queuing internally
+        if self._sdk_client and self._sdk_client.is_connected:
+            normalized_req_id = str(reply_req_id or "").strip()
+            if not normalized_req_id:
+                raise ValueError("reply_req_id is required")
+            try:
+                frame = await asyncio.wait_for(
+                    self._sdk_client._ws_manager.send_reply(normalized_req_id, body, cmd),
+                    timeout=timeout,
+                )
+                return frame
+            except RuntimeError as exc:
+                return {"errcode": -1, "errmsg": str(exc)}
+            except asyncio.TimeoutError:
+                return {"errcode": -1, "errmsg": f"Request timeout after {timeout}s"}
+
+        # Legacy WebSocket path
         if not self._ws or self._ws.closed:
             raise RuntimeError("WeCom websocket is not connected")
 
