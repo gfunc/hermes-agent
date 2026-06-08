@@ -154,6 +154,7 @@ TCP_KEEPALIVE_INTERVAL = 10  # seconds between probes
 TCP_KEEPALIVE_COUNT = 3   # probes before declaring dead
 
 WATCHDOG_TIMEOUT_SECONDS = 45.0  # must be > HEARTBEAT_INTERVAL_SECONDS (30s)
+SDK_WATCHDOG_TIMEOUT_SECONDS = 90.0  # idle threshold for SDK-mode reconnect
 
 MAX_MISSED_PONGS = 2  # force-close on the 3rd miss
 REPLY_QUEUE_MAX_SIZE = 500
@@ -283,6 +284,7 @@ class WeComAdapter(BasePlatformAdapter):
         # SDK client (wecom-aibot-python-sdk)
         self._sdk_client: Optional[Any] = None
         self._last_inbound_frame: Optional[Dict[str, Any]] = None
+        self._last_sdk_message_at: float = 0.0
 
         # Webhook server (for bot webhook mode accounts)
         self._webhook_runner: Optional["web.AppRunner"] = None
@@ -382,19 +384,33 @@ class WeComAdapter(BasePlatformAdapter):
                     bot_id=primary.bot_id,
                     secret=primary.secret,
                     ws_url=primary.websocket_url,
+                    heartbeat_interval=20000,  # 20s instead of default 30s
                 )
                 self._sdk_client = WSClient(options)
 
                 # Bridge SDK events (pyee AsyncIOEventEmitter uses .on(), not
                 # attribute assignment, for event registration).
                 self._sdk_client.on("message", self._on_sdk_message)
-                self._sdk_client.on("connected", lambda: logger.info("[%s] Connected", self.name))
-                self._sdk_client.on("authenticated", lambda: logger.info("[%s] Authenticated", self.name))
+
+                def _on_sdk_connected() -> None:
+                    self._last_sdk_message_at = asyncio.get_running_loop().time()
+                    logger.info("[%s] Connected", self.name)
+
+                def _on_sdk_authenticated() -> None:
+                    self._last_sdk_message_at = asyncio.get_running_loop().time()
+                    self._apply_sdk_tcp_keepalive()
+                    logger.info("[%s] Authenticated", self.name)
+
+                self._sdk_client.on("connected", _on_sdk_connected)
+                self._sdk_client.on("authenticated", _on_sdk_authenticated)
                 self._sdk_client.on("disconnected", lambda reason: logger.info("[%s] Disconnected: %s", self.name, reason))
                 self._sdk_client.on("error", lambda err: logger.error("[%s] SDK error: %s", self.name, err))
 
                 await self._sdk_client.connect()
                 self._mark_connected()
+                self._last_sdk_message_at = asyncio.get_running_loop().time()
+                self._apply_sdk_tcp_keepalive()
+                self._watchdog_task = asyncio.create_task(self._sdk_watchdog_loop())
                 logger.info(
                     "[%s] SDK WebSocket connected for account '%s'",
                     self.name, primary.account_id,
@@ -825,7 +841,11 @@ class WeComAdapter(BasePlatformAdapter):
         return json.loads(decrypted_bytes.decode("utf-8"))
 
     async def _open_connection(self) -> None:
-        """Open and authenticate a websocket connection."""
+        """Open and authenticate a websocket connection.
+
+        .. deprecated::
+            Legacy aiohttp path; not used in SDK mode. Kept for fallback.
+        """
         await self._cleanup_ws()
         self._session = aiohttp.ClientSession(trust_env=True)
         self._ws = await self._session.ws_connect(
@@ -856,7 +876,11 @@ class WeComAdapter(BasePlatformAdapter):
         self._last_frame_at = asyncio.get_running_loop().time()
 
     async def _wait_for_handshake(self, req_id: str) -> Dict[str, Any]:
-        """Wait for the subscribe acknowledgement."""
+        """Wait for the subscribe acknowledgement.
+
+        .. deprecated::
+            Legacy aiohttp path; not used in SDK mode. Kept for fallback.
+        """
         if not self._ws:
             raise RuntimeError("WebSocket not initialized")
 
@@ -883,7 +907,11 @@ class WeComAdapter(BasePlatformAdapter):
                 raise RuntimeError("WeCom websocket closed during authentication")
 
     async def _listen_loop(self) -> None:
-        """Read websocket events forever, reconnecting on errors."""
+        """Read websocket events forever, reconnecting on errors.
+
+        .. deprecated::
+            Legacy aiohttp path; not used in SDK mode. Kept for fallback.
+        """
         backoff_idx = 0
         while self._running:
             logger.debug("[%s] Listen loop iteration (backoff_idx=%s)", self.name, backoff_idx)
@@ -936,7 +964,11 @@ class WeComAdapter(BasePlatformAdapter):
                     await self._cleanup_ws()
 
     async def _read_events(self) -> None:
-        """Read websocket frames until the connection closes."""
+        """Read websocket frames until the connection closes.
+
+        .. deprecated::
+            Legacy aiohttp path; not used in SDK mode. Kept for fallback.
+        """
         if not self._ws or self._ws.closed:
             raise RuntimeError("WebSocket not connected")
 
@@ -965,7 +997,11 @@ class WeComAdapter(BasePlatformAdapter):
         )
 
     async def _watchdog_loop(self) -> None:
-        """Monitor websocket activity and force reconnect if traffic stalls."""
+        """Monitor websocket activity and force reconnect if traffic stalls.
+
+        .. deprecated::
+            Legacy aiohttp path; not used in SDK mode. Kept for fallback.
+        """
         try:
             while self._running:
                 await asyncio.sleep(WATCHDOG_TIMEOUT_SECONDS)
@@ -987,7 +1023,11 @@ class WeComAdapter(BasePlatformAdapter):
             pass
 
     async def _heartbeat_loop(self) -> None:
-        """Send lightweight application-level pings."""
+        """Send lightweight application-level pings.
+
+        .. deprecated::
+            Legacy aiohttp path; not used in SDK mode. Kept for fallback.
+        """
         try:
             while self._running:
                 await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
@@ -1026,6 +1066,78 @@ class WeComAdapter(BasePlatformAdapter):
                     logger.debug("[%s] Heartbeat send failed: %s", self.name, exc)
         except asyncio.CancelledError:
             pass
+
+    async def _sdk_watchdog_loop(self) -> None:
+        """Monitor SDK websocket activity and force reconnect if traffic stalls."""
+        try:
+            while self._running:
+                await asyncio.sleep(SDK_WATCHDOG_TIMEOUT_SECONDS / 2)
+                if not self._running:
+                    return
+                if not self._sdk_client or not self._sdk_client.is_connected:
+                    continue
+                idle = asyncio.get_running_loop().time() - self._last_sdk_message_at
+                if idle >= SDK_WATCHDOG_TIMEOUT_SECONDS:
+                    logger.warning(
+                        "[%s] SDK watchdog timeout (idle %.1fs), forcing reconnect",
+                        self.name, idle,
+                    )
+                    try:
+                        self._sdk_client.disconnect()
+                    except Exception:
+                        pass
+                    await asyncio.sleep(1)
+                    if not self._running:
+                        return
+                    try:
+                        await self._sdk_client.connect()
+                        self._last_sdk_message_at = asyncio.get_running_loop().time()
+                        self._apply_sdk_tcp_keepalive()
+                        logger.info("[%s] SDK watchdog reconnect succeeded", self.name)
+                    except Exception as exc:
+                        logger.warning("[%s] SDK watchdog reconnect failed: %s", self.name, exc)
+        except asyncio.CancelledError:
+            pass
+
+    def _apply_sdk_tcp_keepalive(self) -> None:
+        """Set TCP keepalive socket options on the SDK-managed websocket."""
+        import socket
+
+        if not TCP_KEEPALIVE_ENABLED:
+            return
+        if not self._sdk_client:
+            return
+
+        ws = getattr(self._sdk_client, "_ws_manager", None)
+        if ws is None:
+            return
+        ws_proto = getattr(ws, "_ws", None)
+        if ws_proto is None:
+            return
+
+        # websockets >= 14: transport is an asyncio.Transport
+        # websockets < 14: writer is an asyncio.StreamWriter
+        sock = None
+        if hasattr(ws_proto, "transport"):
+            sock = ws_proto.transport.get_extra_info("socket")
+        elif hasattr(ws_proto, "writer"):
+            sock = ws_proto.writer.get_extra_info("socket")
+        elif hasattr(ws_proto, "socket"):
+            sock = ws_proto.socket
+        if sock is None:
+            return
+
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, TCP_KEEPALIVE_IDLE)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, TCP_KEEPALIVE_INTERVAL)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, TCP_KEEPALIVE_COUNT)
+        except (OSError, AttributeError):
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                sock.setsockopt(socket.IPPROTO_TCP, getattr(socket, "TCP_KEEPALIVE", 0x10), TCP_KEEPALIVE_IDLE)
+            except (OSError, AttributeError):
+                logger.debug("[%s] Could not apply TCP keepalive socket options", self.name)
 
     async def _dispatch_payload(self, payload: Dict[str, Any]) -> None:
         """Route inbound websocket payloads."""
@@ -1198,6 +1310,7 @@ class WeComAdapter(BasePlatformAdapter):
         processing pipeline.
         """
         self._last_inbound_frame = payload
+        self._last_sdk_message_at = asyncio.get_running_loop().time()
         body = payload.get("body")
         if not isinstance(body, dict):
             await self._on_message(payload)
