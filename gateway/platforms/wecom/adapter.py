@@ -1074,7 +1074,13 @@ class WeComAdapter(BasePlatformAdapter):
                 await asyncio.sleep(SDK_WATCHDOG_TIMEOUT_SECONDS / 2)
                 if not self._running:
                     return
-                if not self._sdk_client or not self._sdk_client.is_connected:
+                if not self._sdk_client:
+                    continue
+                if not self._sdk_client.is_connected:
+                    # SDK has marked its own connection dead (e.g. missed heartbeats).
+                    # The SDK does not always auto-reconnect in this state, so force it.
+                    logger.warning("[%s] SDK connection dropped, forcing reconnect", self.name)
+                    await self._sdk_reconnect()
                     continue
                 idle = asyncio.get_running_loop().time() - self._last_sdk_message_at
                 if idle >= SDK_WATCHDOG_TIMEOUT_SECONDS:
@@ -1082,22 +1088,32 @@ class WeComAdapter(BasePlatformAdapter):
                         "[%s] SDK watchdog timeout (idle %.1fs), forcing reconnect",
                         self.name, idle,
                     )
-                    try:
-                        self._sdk_client.disconnect()
-                    except Exception:
-                        pass
-                    await asyncio.sleep(1)
-                    if not self._running:
-                        return
-                    try:
-                        await self._sdk_client.connect()
-                        self._last_sdk_message_at = asyncio.get_running_loop().time()
-                        self._apply_sdk_tcp_keepalive()
-                        logger.info("[%s] SDK watchdog reconnect succeeded", self.name)
-                    except Exception as exc:
-                        logger.warning("[%s] SDK watchdog reconnect failed: %s", self.name, exc)
+                    await self._sdk_reconnect()
         except asyncio.CancelledError:
             pass
+
+    async def _sdk_reconnect(self) -> None:
+        """Force the SDK client to reconnect.
+
+        Best-effort: swallows disconnect/connect errors so the watchdog keeps
+        retrying on the next cycle instead of crashing the adapter.
+        """
+        if not self._sdk_client:
+            return
+        try:
+            self._sdk_client.disconnect()
+        except Exception:
+            pass
+        await asyncio.sleep(1)
+        if not self._running:
+            return
+        try:
+            await self._sdk_client.connect()
+            self._last_sdk_message_at = asyncio.get_running_loop().time()
+            self._apply_sdk_tcp_keepalive()
+            logger.info("[%s] SDK watchdog reconnect succeeded", self.name)
+        except Exception as exc:
+            logger.warning("[%s] SDK watchdog reconnect failed: %s", self.name, exc)
 
     def _apply_sdk_tcp_keepalive(self) -> None:
         """Set TCP keepalive socket options on the SDK-managed websocket."""
